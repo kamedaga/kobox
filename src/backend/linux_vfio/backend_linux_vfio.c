@@ -1,0 +1,729 @@
+#if !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
+#include "backend/backend_internal.h"
+#include "kobox/backend_linux_vfio.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <linux/vfio.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+enum {
+    KB_VFIO_PATH_MAX = 4096,
+    KB_VFIO_PCI_CONFIG_SIZE = 4096,
+};
+
+typedef struct kb_linux_vfio_backend kb_linux_vfio_backend_t;
+
+struct kb_device {
+    kb_linux_vfio_backend_t *backend;
+    int device_fd;
+    char bdf[32];
+    char sysfs_path[KB_VFIO_PATH_MAX];
+    kb_pci_id_t pci_id;
+    kb_pci_location_t location;
+};
+
+struct kb_irq {
+    int unused;
+};
+
+struct kb_linux_vfio_backend {
+    kb_backend_t base;
+    int container_fd;
+    int group_fd;
+    int device_fd;
+    int group_id;
+    struct kb_device device;
+};
+
+static kb_linux_vfio_backend_t *vfio_from_backend(kb_backend_t *backend)
+{
+    return (kb_linux_vfio_backend_t *)backend;
+}
+
+static int path_join(char *dst, size_t dst_size, const char *a, const char *b)
+{
+    int written = snprintf(dst, dst_size, "%s/%s", a, b);
+    return written >= 0 && (size_t)written < dst_size;
+}
+
+static uint64_t page_size(void)
+{
+    long value = sysconf(_SC_PAGESIZE);
+    return value > 0 ? (uint64_t)value : 4096;
+}
+
+static uint64_t align_down_u64(uint64_t value, uint64_t alignment)
+{
+    return value & ~(alignment - 1u);
+}
+
+static uint64_t align_up_u64(uint64_t value, uint64_t alignment)
+{
+    const uint64_t mask = alignment - 1u;
+    return (value + mask) & ~mask;
+}
+
+static kb_status_t errno_status(void)
+{
+    if (errno == EACCES || errno == EPERM) {
+        return KB_ERR_DENIED;
+    }
+    if (errno == ENOENT || errno == ENODEV) {
+        return KB_ERR_NOT_FOUND;
+    }
+    return KB_ERR_IO;
+}
+
+static kb_status_t read_text_file(const char *path, char *dst, size_t dst_size)
+{
+    if (path == NULL || dst == NULL || dst_size == 0) {
+        return KB_ERR_INVALID;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return errno_status();
+    }
+
+    size_t read_size = fread(dst, 1, dst_size - 1, file);
+    if (ferror(file)) {
+        fclose(file);
+        return KB_ERR_IO;
+    }
+    dst[read_size] = '\0';
+    fclose(file);
+    return KB_OK;
+}
+
+static kb_status_t read_hex_file(const char *path, unsigned long *out_value)
+{
+    char text[64];
+    kb_status_t status = read_text_file(path, text, sizeof(text));
+    if (status != KB_OK) {
+        return status;
+    }
+
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 0);
+    if (end == text) {
+        return KB_ERR_INVALID;
+    }
+    *out_value = value;
+    return KB_OK;
+}
+
+static kb_status_t read_device_hex(const char *device_path, const char *file_name, unsigned long *out_value)
+{
+    char path[KB_VFIO_PATH_MAX];
+    if (!path_join(path, sizeof(path), device_path, file_name)) {
+        return KB_ERR_INVALID;
+    }
+    return read_hex_file(path, out_value);
+}
+
+static int parse_location(const char *name, kb_pci_location_t *out_location)
+{
+    unsigned segment = 0;
+    unsigned bus = 0;
+    unsigned device = 0;
+    unsigned function = 0;
+    if (sscanf(name, "%x:%x:%x.%x", &segment, &bus, &device, &function) != 4) {
+        return 0;
+    }
+    if (segment > UINT16_MAX || bus > UINT8_MAX || device > UINT8_MAX || function > UINT8_MAX) {
+        return 0;
+    }
+
+    out_location->segment = (uint16_t)segment;
+    out_location->bus = (uint8_t)bus;
+    out_location->device = (uint8_t)device;
+    out_location->function = (uint8_t)function;
+    return 1;
+}
+
+static kb_status_t read_device_metadata(struct kb_device *device)
+{
+    unsigned long value = 0;
+    kb_status_t status = read_device_hex(device->sysfs_path, "vendor", &value);
+    if (status != KB_OK || value > UINT16_MAX) {
+        return status == KB_OK ? KB_ERR_INVALID : status;
+    }
+    device->pci_id.vendor_id = (uint16_t)value;
+
+    status = read_device_hex(device->sysfs_path, "device", &value);
+    if (status != KB_OK || value > UINT16_MAX) {
+        return status == KB_OK ? KB_ERR_INVALID : status;
+    }
+    device->pci_id.device_id = (uint16_t)value;
+
+    status = read_device_hex(device->sysfs_path, "subsystem_vendor", &value);
+    if (status == KB_OK && value <= UINT16_MAX) {
+        device->pci_id.subsystem_vendor_id = (uint16_t)value;
+    }
+
+    status = read_device_hex(device->sysfs_path, "subsystem_device", &value);
+    if (status == KB_OK && value <= UINT16_MAX) {
+        device->pci_id.subsystem_device_id = (uint16_t)value;
+    }
+
+    status = read_device_hex(device->sysfs_path, "class", &value);
+    if (status == KB_OK) {
+        device->pci_id.class_code = (uint8_t)((value >> 16) & 0xffu);
+        device->pci_id.subclass = (uint8_t)((value >> 8) & 0xffu);
+        device->pci_id.prog_if = (uint8_t)(value & 0xffu);
+    }
+
+    if (!parse_location(device->bdf, &device->location)) {
+        return KB_ERR_INVALID;
+    }
+    return KB_OK;
+}
+
+static kb_status_t read_group_id(const char *sysfs_path, int *out_group_id)
+{
+    char link_path[KB_VFIO_PATH_MAX];
+    if (!path_join(link_path, sizeof(link_path), sysfs_path, "iommu_group")) {
+        return KB_ERR_INVALID;
+    }
+
+    char target[KB_VFIO_PATH_MAX];
+    ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+    if (len < 0) {
+        return errno_status();
+    }
+    target[len] = '\0';
+
+    const char *name = strrchr(target, '/');
+    name = name == NULL ? target : name + 1;
+    char *end = NULL;
+    long group = strtol(name, &end, 10);
+    if (end == name || *end != '\0' || group < 0 || group > INT_MAX) {
+        return KB_ERR_INVALID;
+    }
+
+    *out_group_id = (int)group;
+    return KB_OK;
+}
+
+static kb_status_t vfio_region_info(kb_device_t *device, uint32_t index, struct vfio_region_info *out_info)
+{
+    if (device == NULL || out_info == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->argsz = sizeof(*out_info);
+    out_info->index = index;
+    if (ioctl(device->device_fd, VFIO_DEVICE_GET_REGION_INFO, out_info) != 0) {
+        return errno_status();
+    }
+    return KB_OK;
+}
+
+static kb_status_t read_resource_bar(kb_device_t *device, unsigned bar_index, kb_pci_bar_info_t *out_info)
+{
+    char path[KB_VFIO_PATH_MAX];
+    if (!path_join(path, sizeof(path), device->sysfs_path, "resource")) {
+        return KB_ERR_INVALID;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return errno_status();
+    }
+
+    char line[256];
+    unsigned current = 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (current == bar_index) {
+            unsigned long long start = 0;
+            unsigned long long end = 0;
+            unsigned long long flags = 0;
+            fclose(file);
+            if (sscanf(line, "%llx %llx %llx", &start, &end, &flags) != 3) {
+                return KB_ERR_INVALID;
+            }
+            out_info->start = (uint64_t)start;
+            out_info->end = (uint64_t)end;
+            out_info->flags = (uint64_t)flags;
+            out_info->present = end >= start && start != 0;
+            out_info->size = out_info->present ? ((uint64_t)end - (uint64_t)start + 1) : 0;
+            return out_info->present ? KB_OK : KB_ERR_NOT_FOUND;
+        }
+        current++;
+    }
+
+    fclose(file);
+    return KB_ERR_NOT_FOUND;
+}
+
+static void vfio_destroy(kb_backend_t *backend)
+{
+    kb_linux_vfio_backend_t *vfio = vfio_from_backend(backend);
+    if (vfio->device_fd >= 0) {
+        close(vfio->device_fd);
+    }
+    if (vfio->group_fd >= 0) {
+        close(vfio->group_fd);
+    }
+    if (vfio->container_fd >= 0) {
+        close(vfio->container_fd);
+    }
+    free(vfio);
+}
+
+static kb_status_t vfio_device_count(kb_backend_t *backend, size_t *out_count)
+{
+    if (backend == NULL || out_count == NULL) {
+        return KB_ERR_INVALID;
+    }
+    *out_count = 1;
+    return KB_OK;
+}
+
+static kb_status_t vfio_device_at(kb_backend_t *backend, size_t index, kb_device_t **out_device)
+{
+    if (backend == NULL || out_device == NULL) {
+        return KB_ERR_INVALID;
+    }
+    if (index != 0) {
+        return KB_ERR_NOT_FOUND;
+    }
+    *out_device = &vfio_from_backend(backend)->device;
+    return KB_OK;
+}
+
+static kb_status_t vfio_device_pci_id(kb_device_t *device, kb_pci_id_t *out_id)
+{
+    if (device == NULL || out_id == NULL) {
+        return KB_ERR_INVALID;
+    }
+    *out_id = device->pci_id;
+    return KB_OK;
+}
+
+static kb_status_t vfio_device_pci_location(kb_device_t *device, kb_pci_location_t *out_location)
+{
+    if (device == NULL || out_location == NULL) {
+        return KB_ERR_INVALID;
+    }
+    *out_location = device->location;
+    return KB_OK;
+}
+
+static kb_status_t vfio_pci_config_read(kb_device_t *device, uint16_t offset, void *dst, size_t len)
+{
+    if (device == NULL || dst == NULL || len == 0 || offset > KB_VFIO_PCI_CONFIG_SIZE ||
+        len > KB_VFIO_PCI_CONFIG_SIZE || offset + len > KB_VFIO_PCI_CONFIG_SIZE)
+    {
+        return KB_ERR_INVALID;
+    }
+
+    struct vfio_region_info info;
+    kb_status_t status = vfio_region_info(device, VFIO_PCI_CONFIG_REGION_INDEX, &info);
+    if (status != KB_OK) {
+        return status;
+    }
+    if ((uint64_t)offset + (uint64_t)len > info.size) {
+        return KB_ERR_INVALID;
+    }
+
+    ssize_t read_size = pread(device->device_fd, dst, len, (off_t)(info.offset + offset));
+    if (read_size < 0) {
+        return errno_status();
+    }
+    return (size_t)read_size == len ? KB_OK : KB_ERR_IO;
+}
+
+static kb_status_t vfio_pci_config_write(kb_device_t *device, uint16_t offset, const void *src, size_t len)
+{
+    if (device == NULL || src == NULL || len == 0 || offset > KB_VFIO_PCI_CONFIG_SIZE ||
+        len > KB_VFIO_PCI_CONFIG_SIZE || offset + len > KB_VFIO_PCI_CONFIG_SIZE)
+    {
+        return KB_ERR_INVALID;
+    }
+
+    struct vfio_region_info info;
+    kb_status_t status = vfio_region_info(device, VFIO_PCI_CONFIG_REGION_INDEX, &info);
+    if (status != KB_OK) {
+        return status;
+    }
+    if ((uint64_t)offset + (uint64_t)len > info.size) {
+        return KB_ERR_INVALID;
+    }
+
+    ssize_t write_size = pwrite(device->device_fd, src, len, (off_t)(info.offset + offset));
+    if (write_size < 0) {
+        return errno_status();
+    }
+    return (size_t)write_size == len ? KB_OK : KB_ERR_IO;
+}
+
+static kb_status_t vfio_pci_bar_info(kb_device_t *device, unsigned bar_index, kb_pci_bar_info_t *out_info)
+{
+    if (device == NULL || out_info == NULL) {
+        return KB_ERR_INVALID;
+    }
+    if (bar_index >= 6) {
+        return KB_ERR_NOT_FOUND;
+    }
+
+    kb_status_t status = read_resource_bar(device, bar_index, out_info);
+    if (status != KB_OK) {
+        return status;
+    }
+
+    struct vfio_region_info region;
+    status = vfio_region_info(device, VFIO_PCI_BAR0_REGION_INDEX + bar_index, &region);
+    if (status == KB_OK && region.size != 0) {
+        out_info->size = region.size;
+    }
+    return KB_OK;
+}
+
+static kb_status_t vfio_map_bar(kb_device_t *device, unsigned bar_index, kb_mmio_region_t *out_region)
+{
+    if (device == NULL || out_region == NULL) {
+        return KB_ERR_INVALID;
+    }
+    if (bar_index >= 6) {
+        return KB_ERR_NOT_FOUND;
+    }
+
+    struct vfio_region_info region;
+    kb_status_t status = vfio_region_info(device, VFIO_PCI_BAR0_REGION_INDEX + bar_index, &region);
+    if (status != KB_OK) {
+        return status;
+    }
+    if (region.size == 0) {
+        return KB_ERR_NOT_FOUND;
+    }
+    if ((region.flags & VFIO_REGION_INFO_FLAG_MMAP) == 0) {
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    void *addr = mmap(NULL, (size_t)region.size, PROT_READ | PROT_WRITE, MAP_SHARED, device->device_fd, (off_t)region.offset);
+    if (addr == MAP_FAILED) {
+        return errno_status();
+    }
+
+    kb_pci_bar_info_t info;
+    memset(&info, 0, sizeof(info));
+    (void)read_resource_bar(device, bar_index, &info);
+
+    out_region->addr = addr;
+    out_region->size = region.size;
+    out_region->backend_phys = info.start;
+    out_region->flags = region.flags;
+    return KB_OK;
+}
+
+static void vfio_unmap_bar(kb_device_t *device, kb_mmio_region_t *region)
+{
+    (void)device;
+    if (region != NULL && region->addr != NULL && region->size != 0) {
+        munmap(region->addr, (size_t)region->size);
+        memset(region, 0, sizeof(*region));
+    }
+}
+
+static kb_status_t vfio_dma_map(
+    kb_device_t *device,
+    void *cpu_addr,
+    uint64_t size,
+    kb_dma_dir_t direction,
+    uint64_t *out_dma_addr);
+
+static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction);
+
+static kb_status_t vfio_dma_alloc(
+    kb_device_t *device,
+    uint64_t size,
+    uint64_t alignment,
+    kb_dma_dir_t direction,
+    kb_dma_buffer_t *out_buffer)
+{
+    if (device == NULL || out_buffer == NULL || size == 0 || size > (uint64_t)SIZE_MAX) {
+        return KB_ERR_INVALID;
+    }
+
+    uint64_t effective_alignment = alignment;
+    const uint64_t ps = page_size();
+    if (effective_alignment < ps) {
+        effective_alignment = ps;
+    }
+    if ((effective_alignment & (effective_alignment - 1u)) != 0 || effective_alignment > (uint64_t)SIZE_MAX) {
+        return KB_ERR_INVALID;
+    }
+
+    const uint64_t alloc_size = align_up_u64(size, ps);
+    if (alloc_size > (uint64_t)SIZE_MAX) {
+        return KB_ERR_INVALID;
+    }
+
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, (size_t)effective_alignment, (size_t)alloc_size) != 0) {
+        return KB_ERR_NOMEM;
+    }
+    memset(ptr, 0, (size_t)alloc_size);
+
+    uint64_t dma_addr = 0;
+    kb_status_t status = vfio_dma_map(device, ptr, alloc_size, direction, &dma_addr);
+    if (status != KB_OK) {
+        free(ptr);
+        return status;
+    }
+
+    out_buffer->cpu_addr = ptr;
+    out_buffer->dma_addr = dma_addr;
+    out_buffer->size = alloc_size;
+    out_buffer->flags = 0;
+    return KB_OK;
+}
+
+static void vfio_dma_free(kb_device_t *device, kb_dma_buffer_t *buffer)
+{
+    if (device != NULL && buffer != NULL && buffer->cpu_addr != NULL && buffer->size != 0) {
+        vfio_dma_unmap(device, buffer->dma_addr, buffer->size, KB_DMA_BIDIRECTIONAL);
+        free(buffer->cpu_addr);
+        memset(buffer, 0, sizeof(*buffer));
+    }
+}
+
+static kb_status_t vfio_dma_map(
+    kb_device_t *device,
+    void *cpu_addr,
+    uint64_t size,
+    kb_dma_dir_t direction,
+    uint64_t *out_dma_addr)
+{
+    if (device == NULL || device->backend == NULL || cpu_addr == NULL || size == 0 || out_dma_addr == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    const uint64_t ps = page_size();
+    const uint64_t start = (uint64_t)(uintptr_t)cpu_addr;
+    const uint64_t aligned_start = align_down_u64(start, ps);
+    const uint64_t offset = start - aligned_start;
+    const uint64_t map_size = align_up_u64(offset + size, ps);
+
+    struct vfio_iommu_type1_dma_map map;
+    memset(&map, 0, sizeof(map));
+    map.argsz = sizeof(map);
+    map.vaddr = aligned_start;
+    map.iova = aligned_start;
+    map.size = map_size;
+    if (direction == KB_DMA_TO_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
+        map.flags |= VFIO_DMA_MAP_FLAG_READ;
+    }
+    if (direction == KB_DMA_FROM_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
+        map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
+    }
+    if (map.flags == 0) {
+        return KB_ERR_INVALID;
+    }
+
+    if (ioctl(device->backend->container_fd, VFIO_IOMMU_MAP_DMA, &map) != 0) {
+        return errno_status();
+    }
+
+    *out_dma_addr = aligned_start + offset;
+    return KB_OK;
+}
+
+static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction)
+{
+    (void)direction;
+    if (device == NULL || device->backend == NULL || dma_addr == 0 || size == 0) {
+        return;
+    }
+
+    const uint64_t ps = page_size();
+    const uint64_t aligned_start = align_down_u64(dma_addr, ps);
+    const uint64_t offset = dma_addr - aligned_start;
+    const uint64_t map_size = align_up_u64(offset + size, ps);
+
+    struct vfio_iommu_type1_dma_unmap unmap;
+    memset(&unmap, 0, sizeof(unmap));
+    unmap.argsz = sizeof(unmap);
+    unmap.iova = aligned_start;
+    unmap.size = map_size;
+    (void)ioctl(device->backend->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
+}
+
+static kb_status_t vfio_irq_register(
+    kb_device_t *device,
+    unsigned vector,
+    kb_irq_handler_t handler,
+    void *ctx,
+    kb_irq_t **out_irq)
+{
+    (void)device;
+    (void)vector;
+    (void)handler;
+    (void)ctx;
+    (void)out_irq;
+    return KB_ERR_UNSUPPORTED;
+}
+
+static void vfio_irq_unregister(kb_device_t *device, kb_irq_t *irq)
+{
+    (void)device;
+    (void)irq;
+}
+
+static kb_status_t vfio_irq_wait(kb_device_t *device, kb_irq_t *irq, uint64_t timeout_ns)
+{
+    (void)device;
+    (void)irq;
+    (void)timeout_ns;
+    return KB_ERR_UNSUPPORTED;
+}
+
+static uint64_t vfio_monotonic_ns(kb_backend_t *backend)
+{
+    (void)backend;
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) == 0) {
+        return 0;
+    }
+    return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+}
+
+static void vfio_log(kb_backend_t *backend, int level, const char *message)
+{
+    (void)backend;
+    (void)level;
+    (void)message;
+}
+
+static const kb_backend_ops_t vfio_ops = {
+    .destroy = vfio_destroy,
+    .device_count = vfio_device_count,
+    .device_at = vfio_device_at,
+    .device_pci_id = vfio_device_pci_id,
+    .device_pci_location = vfio_device_pci_location,
+    .pci_config_read = vfio_pci_config_read,
+    .pci_config_write = vfio_pci_config_write,
+    .pci_bar_info = vfio_pci_bar_info,
+    .map_bar = vfio_map_bar,
+    .unmap_bar = vfio_unmap_bar,
+    .dma_alloc = vfio_dma_alloc,
+    .dma_free = vfio_dma_free,
+    .dma_map = vfio_dma_map,
+    .dma_unmap = vfio_dma_unmap,
+    .irq_register = vfio_irq_register,
+    .irq_unregister = vfio_irq_unregister,
+    .irq_wait = vfio_irq_wait,
+    .monotonic_ns = vfio_monotonic_ns,
+    .log = vfio_log,
+};
+
+static kb_status_t setup_vfio(kb_linux_vfio_backend_t *backend)
+{
+    backend->container_fd = open("/dev/vfio/vfio", O_RDWR | O_CLOEXEC);
+    if (backend->container_fd < 0) {
+        return errno_status();
+    }
+    if (ioctl(backend->container_fd, VFIO_GET_API_VERSION) != VFIO_API_VERSION) {
+        return KB_ERR_UNSUPPORTED;
+    }
+    if (ioctl(backend->container_fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) == 0) {
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    char group_path[64];
+    int written = snprintf(group_path, sizeof(group_path), "/dev/vfio/%d", backend->group_id);
+    if (written < 0 || (size_t)written >= sizeof(group_path)) {
+        return KB_ERR_INVALID;
+    }
+
+    backend->group_fd = open(group_path, O_RDWR | O_CLOEXEC);
+    if (backend->group_fd < 0) {
+        return errno_status();
+    }
+
+    struct vfio_group_status group_status;
+    memset(&group_status, 0, sizeof(group_status));
+    group_status.argsz = sizeof(group_status);
+    if (ioctl(backend->group_fd, VFIO_GROUP_GET_STATUS, &group_status) != 0) {
+        return errno_status();
+    }
+    if ((group_status.flags & VFIO_GROUP_FLAGS_VIABLE) == 0) {
+        return KB_ERR_DENIED;
+    }
+    if (ioctl(backend->group_fd, VFIO_GROUP_SET_CONTAINER, &backend->container_fd) != 0) {
+        return errno_status();
+    }
+    if (ioctl(backend->container_fd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) != 0) {
+        return errno_status();
+    }
+
+    backend->device_fd = ioctl(backend->group_fd, VFIO_GROUP_GET_DEVICE_FD, backend->device.bdf);
+    if (backend->device_fd < 0) {
+        return errno_status();
+    }
+    backend->device.backend = backend;
+    backend->device.device_fd = backend->device_fd;
+    return KB_OK;
+}
+
+kb_status_t kb_linux_vfio_create(const char *pci_bdf, kb_backend_t **out_backend)
+{
+    if (pci_bdf == NULL || out_backend == NULL) {
+        return KB_ERR_INVALID;
+    }
+    *out_backend = NULL;
+
+    kb_linux_vfio_backend_t *backend = calloc(1, sizeof(*backend));
+    if (backend == NULL) {
+        return KB_ERR_NOMEM;
+    }
+    backend->base.ops = &vfio_ops;
+    backend->container_fd = -1;
+    backend->group_fd = -1;
+    backend->device_fd = -1;
+    backend->device.device_fd = -1;
+
+    int written = snprintf(backend->device.bdf, sizeof(backend->device.bdf), "%s", pci_bdf);
+    if (written < 0 || (size_t)written >= sizeof(backend->device.bdf)) {
+        vfio_destroy(&backend->base);
+        return KB_ERR_INVALID;
+    }
+    written = snprintf(backend->device.sysfs_path, sizeof(backend->device.sysfs_path), "/sys/bus/pci/devices/%s", pci_bdf);
+    if (written < 0 || (size_t)written >= sizeof(backend->device.sysfs_path)) {
+        vfio_destroy(&backend->base);
+        return KB_ERR_INVALID;
+    }
+
+    kb_status_t status = read_device_metadata(&backend->device);
+    if (status != KB_OK) {
+        vfio_destroy(&backend->base);
+        return status;
+    }
+    status = read_group_id(backend->device.sysfs_path, &backend->group_id);
+    if (status != KB_OK) {
+        vfio_destroy(&backend->base);
+        return status;
+    }
+    status = setup_vfio(backend);
+    if (status != KB_OK) {
+        vfio_destroy(&backend->base);
+        return status;
+    }
+
+    *out_backend = &backend->base;
+    return KB_OK;
+}

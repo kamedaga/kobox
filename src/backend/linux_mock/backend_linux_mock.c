@@ -91,6 +91,22 @@ static kb_status_t mock_pci_config_write(kb_device_t *device, uint16_t offset, c
     return KB_OK;
 }
 
+static kb_status_t mock_pci_bar_info(kb_device_t *device, unsigned bar_index, kb_pci_bar_info_t *out_info)
+{
+    if (device == 0 || out_info == 0) {
+        return KB_ERR_INVALID;
+    }
+    if (bar_index != 0) {
+        return KB_ERR_NOT_FOUND;
+    }
+    out_info->start = 0;
+    out_info->end = sizeof(device->bar0) - 1;
+    out_info->size = sizeof(device->bar0);
+    out_info->flags = 0;
+    out_info->present = 1;
+    return KB_OK;
+}
+
 static kb_status_t mock_map_bar(kb_device_t *device, unsigned bar_index, kb_mmio_region_t *out_region)
 {
     if (device == 0 || out_region == 0) {
@@ -235,6 +251,7 @@ static const kb_backend_ops_t mock_ops = {
     .device_pci_location = mock_device_pci_location,
     .pci_config_read = mock_pci_config_read,
     .pci_config_write = mock_pci_config_write,
+    .pci_bar_info = mock_pci_bar_info,
     .map_bar = mock_map_bar,
     .unmap_bar = mock_unmap_bar,
     .dma_alloc = mock_dma_alloc,

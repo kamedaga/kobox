@@ -52,6 +52,14 @@ typedef struct kb_mmio_region {
     uint32_t flags;
 } kb_mmio_region_t;
 
+typedef struct kb_pci_bar_info {
+    uint64_t start;
+    uint64_t end;
+    uint64_t size;
+    uint64_t flags;
+    int present;
+} kb_pci_bar_info_t;
+
 typedef struct kb_dma_buffer {
     void *cpu_addr;
     uint64_t dma_addr;
@@ -72,6 +80,7 @@ typedef struct kb_backend_ops {
 
     kb_status_t (*pci_config_read)(kb_device_t *device, uint16_t offset, void *dst, size_t len);
     kb_status_t (*pci_config_write)(kb_device_t *device, uint16_t offset, const void *src, size_t len);
+    kb_status_t (*pci_bar_info)(kb_device_t *device, unsigned bar_index, kb_pci_bar_info_t *out_info);
 
     kb_status_t (*map_bar)(kb_device_t *device, unsigned bar_index, kb_mmio_region_t *out_region);
     void (*unmap_bar)(kb_device_t *device, kb_mmio_region_t *region);

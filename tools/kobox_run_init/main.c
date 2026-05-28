@@ -1,9 +1,11 @@
 #include "kobox/backend.h"
 #include "kobox/backend_linux_mock.h"
+#include "kobox/backend_linux_vfio.h"
 #include "kobox/module.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static const char *status_name(kb_status_t status)
 {
@@ -67,12 +69,30 @@ static kb_status_t read_file(const char *path, void **out_data, size_t *out_size
 int main(int argc, char **argv)
 {
     const char *path = NULL;
-    if (argc == 2) {
-        path = argv[1];
-    } else if (argc == 3 && argv[1][0] == 'r' && argv[1][1] == 'u' && argv[1][2] == 'n' && argv[1][3] == '\0') {
-        path = argv[2];
+    const char *backend_name = "mock";
+    const char *pci_bdf = NULL;
+    int argi = 1;
+    while (argi < argc && argv[argi][0] == '-') {
+        if (strncmp(argv[argi], "--backend=", 10) == 0) {
+            backend_name = argv[argi] + 10;
+            argi++;
+            continue;
+        }
+        if (strncmp(argv[argi], "--pci=", 6) == 0) {
+            pci_bdf = argv[argi] + 6;
+            argi++;
+            continue;
+        }
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF>] run <module.ko>\n");
+        return 1;
+    }
+
+    if (argi + 1 == argc) {
+        path = argv[argi];
+    } else if (argi + 2 == argc && strcmp(argv[argi], "run") == 0) {
+        path = argv[argi + 1];
     } else {
-        fprintf(stderr, "usage: kobox-run run <module.ko>\n");
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF>] run <module.ko>\n");
         return 1;
     }
 
@@ -85,10 +105,23 @@ int main(int argc, char **argv)
     }
 
     kb_backend_t *backend = NULL;
-    status = kb_linux_mock_create(&backend);
+    if (strcmp(backend_name, "mock") == 0) {
+        status = kb_linux_mock_create(&backend);
+    } else if (strcmp(backend_name, "vfio") == 0) {
+        if (pci_bdf == NULL) {
+            free(data);
+            fprintf(stderr, "vfio backend requires --pci=<BDF>\n");
+            return 3;
+        }
+        status = kb_linux_vfio_create(pci_bdf, &backend);
+    } else {
+        free(data);
+        fprintf(stderr, "unknown backend: %s\n", backend_name);
+        return 3;
+    }
     if (status != KB_OK) {
         free(data);
-        fprintf(stderr, "backend failed: %s (%d)\n", status_name(status), status);
+        fprintf(stderr, "%s backend failed: %s (%d)\n", backend_name, status_name(status), status);
         return 3;
     }
 

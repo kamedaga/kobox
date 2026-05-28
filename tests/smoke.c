@@ -165,6 +165,17 @@ int main(void)
         return 4;
     }
 
+    kb_pci_bar_info_t bar_info;
+    memset(&bar_info, 0, sizeof(bar_info));
+    if (ops->pci_bar_info == 0 || ops->pci_bar_info(device, 0, &bar_info) != KB_OK) {
+        kb_backend_destroy(backend);
+        return 30;
+    }
+    if (!bar_info.present || bar_info.size != 4096) {
+        kb_backend_destroy(backend);
+        return 31;
+    }
+
     kb_dma_buffer_t dma;
     memset(&dma, 0, sizeof(dma));
     if (ops->dma_alloc(device, 4096, 4096, KB_DMA_BIDIRECTIONAL, &dma) != KB_OK) {

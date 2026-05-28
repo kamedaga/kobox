@@ -14,13 +14,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(kobox_runtime STATIC
     src/backend/backend.c
     src/backend/linux_mock/backend_linux_mock.c
+    src/backend/linux_sysfs/backend_linux_sysfs.c
+    src/backend/linux_vfio/backend_linux_vfio.c
     src/loader/elf_reader.c
     src/loader/module_loader.c
     src/shim/linux_context.c
     src/shim/linux_dma.c
     src/shim/linux_irq.c
     src/shim/linux_memory.c
+    src/shim/linux_mmio.c
+    src/shim/linux_netdev.c
+    src/shim/linux_pci.c
+    src/shim/linux_platform.c
     src/shim/linux_printk.c
+    src/shim/linux_virtio_input.c
 )
 
 target_include_directories(kobox_runtime
@@ -73,6 +80,18 @@ target_compile_options(kobox-run PRIVATE
     -Werror
 )
 
+add_executable(kobox-ls-devices
+    tools/kobox_ls_devices/main.c
+)
+
+target_link_libraries(kobox-ls-devices PRIVATE kobox_runtime)
+target_compile_options(kobox-ls-devices PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
 enable_testing()
 
 add_executable(kobox-smoke
@@ -88,3 +107,24 @@ target_compile_options(kobox-smoke PRIVATE
 )
 
 add_test(NAME kobox-smoke COMMAND kobox-smoke)
+
+add_test(
+    NAME kobox-linux-sysfs
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_linux_sysfs_smoke.sh
+        $<TARGET_FILE:kobox-ls-devices>
+)
+
+add_test(
+    NAME kobox-fixture-modules
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_fixture_modules.sh
+        $<TARGET_FILE:kobox-run>
+        tests/fixtures/linux_module/kobox_empty.ko
+        tests/fixtures/linux_module/kobox_probe.ko
+        tests/fixtures/linux_module/kobox_driverish.ko
+        tests/fixtures/linux_module/kobox_pci_minimal.ko
+)
+set_tests_properties(kobox-fixture-modules PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
