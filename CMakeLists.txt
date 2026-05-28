@@ -92,6 +92,18 @@ target_compile_options(kobox-ls-devices PRIVATE
     -Werror
 )
 
+add_executable(kobox-vfio-edu-smoke
+    tools/kobox_vfio_edu_smoke/main.c
+)
+
+target_link_libraries(kobox-vfio-edu-smoke PRIVATE kobox_runtime)
+target_compile_options(kobox-vfio-edu-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
 enable_testing()
 
 add_executable(kobox-smoke

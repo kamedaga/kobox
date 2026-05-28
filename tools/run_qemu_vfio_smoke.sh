@@ -48,7 +48,7 @@ kernel="$work_dir/kernel-root/boot/vmlinuz-$kernel_version"
 cpio_bin="$work_dir/cpio-root/usr/bin/cpio"
 zstd_bin="$work_dir/zstd-root/usr/bin/zstd"
 
-if [ ! -x "$build_dir/kobox-ls-devices" ] || [ ! -x "$build_dir/kobox-run" ]; then
+if [ ! -x "$build_dir/kobox-ls-devices" ] || [ ! -x "$build_dir/kobox-run" ] || [ ! -x "$build_dir/kobox-vfio-edu-smoke" ]; then
     echo "missing kobox tools in $build_dir" >&2
     exit 1
 fi
@@ -67,8 +67,9 @@ ln -s busybox "$root_dir/bin/insmod"
 ln -s busybox "$root_dir/bin/poweroff"
 cp "$build_dir/kobox-ls-devices" "$root_dir/usr/bin/kobox-ls-devices"
 cp "$build_dir/kobox-run" "$root_dir/usr/bin/kobox-run"
+cp "$build_dir/kobox-vfio-edu-smoke" "$root_dir/usr/bin/kobox-vfio-edu-smoke"
 
-for tool in "$build_dir/kobox-ls-devices" "$build_dir/kobox-run"; do
+for tool in "$build_dir/kobox-ls-devices" "$build_dir/kobox-run" "$build_dir/kobox-vfio-edu-smoke"; do
     ldd "$tool" | awk '
         $1 ~ /^\// { print $1 }
         $3 ~ /^\// { print $3 }
@@ -104,7 +105,9 @@ copy_module kernel/drivers/vfio/pci/vfio-pci-core.ko
 copy_module kernel/drivers/vfio/pci/vfio-pci.ko
 copy_module kernel/drivers/iommu/iommufd/iommufd.ko
 copy_module kernel/virt/lib/irqbypass.ko
+copy_module kernel/drivers/misc/pvpanic/pvpanic.ko
 copy_module kernel/drivers/misc/pvpanic/pvpanic-pci.ko
+cp "$root_dir/lib/modules/$kernel_version/kernel/drivers/misc/pvpanic/pvpanic.ko" "$root_dir/usr/lib/kobox/pvpanic.ko"
 cp "$root_dir/lib/modules/$kernel_version/kernel/drivers/misc/pvpanic/pvpanic-pci.ko" "$root_dir/usr/lib/kobox/pvpanic-pci.ko"
 
 cat >"$root_dir/init" <<'INIT'
@@ -128,6 +131,39 @@ insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/vfio/vfio.ko
 insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/vfio/vfio_iommu_type1.ko
 insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/vfio/pci/vfio-pci-core.ko
 insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/vfio/pci/vfio-pci.ko
+
+edu_bdf=""
+for dev in /sys/bus/pci/devices/*; do
+    [ -f "$dev/vendor" ] || continue
+    vendor=$(cat "$dev/vendor")
+    device=$(cat "$dev/device")
+    if [ "$vendor" = "0x1234" ] && [ "$device" = "0x11e8" ]; then
+        edu_bdf=${dev##*/}
+        break
+    fi
+done
+
+if [ -z "$edu_bdf" ]; then
+    echo "kobox-qemu-vfio: edu device not found"
+    poweroff -f
+fi
+
+echo "kobox-qemu-vfio: edu=$edu_bdf"
+echo 1234 11e8 >/sys/bus/pci/drivers/vfio-pci/new_id || true
+if [ -e "/sys/bus/pci/devices/$edu_bdf/driver/unbind" ]; then
+    echo "$edu_bdf" >"/sys/bus/pci/devices/$edu_bdf/driver/unbind" || true
+fi
+echo "$edu_bdf" >/sys/bus/pci/drivers/vfio-pci/bind || true
+
+edu_group=$(basename "$(readlink "/sys/bus/pci/devices/$edu_bdf/iommu_group")")
+if [ ! -e "/dev/vfio/$edu_group" ]; then
+    devno=$(cat "/sys/class/vfio/$edu_group/dev")
+    major=${devno%:*}
+    minor=${devno#*:}
+    mknod "/dev/vfio/$edu_group" c "$major" "$minor"
+fi
+echo "kobox-qemu-vfio: edu-group=$edu_group"
+/usr/bin/kobox-vfio-edu-smoke "$edu_bdf"
 
 pvpanic_bdf=""
 for dev in /sys/bus/pci/devices/*; do
@@ -162,7 +198,7 @@ fi
 
 echo "kobox-qemu-vfio: group=$group"
 /usr/bin/kobox-ls-devices vfio "$pvpanic_bdf"
-/usr/bin/kobox-run --backend=vfio --pci="$pvpanic_bdf" run /usr/lib/kobox/pvpanic-pci.ko
+/usr/bin/kobox-run --backend=vfio --pci="$pvpanic_bdf" --dep=/usr/lib/kobox/pvpanic.ko run /usr/lib/kobox/pvpanic-pci.ko
 status=$?
 echo "kobox-qemu-vfio: status=$status"
 poweroff -f
@@ -183,6 +219,7 @@ qemu-system-x86_64 \
     -initrd "$initramfs" \
     -append "console=ttyS0 panic=-1 quiet intel_iommu=on iommu=pt" \
     -device intel-iommu,intremap=on \
+    -device edu,dma_mask=0xffffffffffffffff \
     -device pvpanic-pci \
     -no-reboot \
     -display none \

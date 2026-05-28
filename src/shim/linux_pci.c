@@ -1,7 +1,6 @@
 #include "kobox/shim.h"
 
 #include <stddef.h>
-#include <stdint.h>
 
 kb_backend_t *kb_shim_current_backend(void);
 
@@ -130,16 +129,6 @@ void kb_pci_iounmap(void *dev, void *addr)
     (void)addr;
 }
 
-int kb_devm_pvpanic_probe(void *dev, void *base)
-{
-    (void)dev;
-    if (base == NULL) {
-        return -12;
-    }
-    (void)*(volatile uint8_t *)base;
-    return 0;
-}
-
 int __pci_register_driver(void *driver, void *owner, const char *mod_name)
 {
     return kb_pci_register_driver(driver, owner, mod_name);
@@ -183,9 +172,4 @@ void *pcim_iomap(void *dev, int bar, unsigned long max)
 void pci_iounmap(void *dev, void *addr)
 {
     kb_pci_iounmap(dev, addr);
-}
-
-int devm_pvpanic_probe(void *dev, void *base)
-{
-    return kb_devm_pvpanic_probe(dev, base);
 }

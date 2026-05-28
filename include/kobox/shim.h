@@ -37,9 +37,10 @@ void kb_pci_set_master(void *dev);
 void *kb_pci_iomap(void *dev, int bar, unsigned long max);
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max);
 void kb_pci_iounmap(void *dev, void *addr);
+uint8_t kb_ioread8(const void *addr);
+void kb_iowrite8(uint8_t value, void *addr);
 uint32_t kb_ioread32(const void *addr);
 void kb_iowrite32(uint32_t value, void *addr);
-int kb_devm_pvpanic_probe(void *dev, void *base);
 
 void kb_stack_chk_fail(void);
 
@@ -62,9 +63,15 @@ void kb_enable_irq(unsigned int irq);
 void *kb_irq_get_irq_data(unsigned int irq);
 void kb_irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set);
 void kb_raw_spin_lock(void *lock);
+int kb_raw_spin_trylock(void *lock);
 unsigned long kb_raw_spin_lock_irqsave(void *lock);
 void kb_raw_spin_unlock(void *lock);
 void kb_raw_spin_unlock_irqrestore(void *lock, unsigned long flags);
+int kb_atomic_notifier_chain_register(void *list, void *notifier);
+int kb_atomic_notifier_chain_unregister(void *list, void *notifier);
+int kb_kexec_crash_loaded(void);
+int kb_kstrtouint(const char *s, unsigned int base, unsigned int *res);
+int kb_sysfs_emit(char *buf, const char *fmt, ...);
 
 void *kb_kmalloc_alias(size_t size, unsigned int flags);
 void kb_might_resched(void);

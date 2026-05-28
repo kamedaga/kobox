@@ -13,14 +13,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
 
 enum {
     KB_VFIO_PATH_MAX = 4096,
     KB_VFIO_PCI_CONFIG_SIZE = 4096,
+    KB_VFIO_DMA_MAPPING_MAX = 128,
+    KB_VFIO_DMA_IOVA_BASE = 0x01000000,
 };
 
 typedef struct kb_linux_vfio_backend kb_linux_vfio_backend_t;
@@ -35,8 +39,18 @@ struct kb_device {
 };
 
 struct kb_irq {
-    int unused;
+    int event_fd;
+    uint32_t index;
+    uint32_t start;
+    kb_irq_handler_t handler;
+    void *ctx;
 };
+
+typedef struct kb_vfio_dma_mapping {
+    uint64_t iova;
+    uint64_t vaddr;
+    uint64_t size;
+} kb_vfio_dma_mapping_t;
 
 struct kb_linux_vfio_backend {
     kb_backend_t base;
@@ -44,6 +58,8 @@ struct kb_linux_vfio_backend {
     int group_fd;
     int device_fd;
     int group_id;
+    uint64_t next_iova;
+    kb_vfio_dma_mapping_t dma_mappings[KB_VFIO_DMA_MAPPING_MAX];
     struct kb_device device;
 };
 
@@ -73,6 +89,30 @@ static uint64_t align_up_u64(uint64_t value, uint64_t alignment)
 {
     const uint64_t mask = alignment - 1u;
     return (value + mask) & ~mask;
+}
+
+static kb_status_t remember_dma_mapping(kb_linux_vfio_backend_t *backend, uint64_t iova, uint64_t vaddr, uint64_t size)
+{
+    for (size_t i = 0; i < KB_VFIO_DMA_MAPPING_MAX; i++) {
+        if (backend->dma_mappings[i].size == 0) {
+            backend->dma_mappings[i].iova = iova;
+            backend->dma_mappings[i].vaddr = vaddr;
+            backend->dma_mappings[i].size = size;
+            return KB_OK;
+        }
+    }
+    return KB_ERR_NOMEM;
+}
+
+static kb_vfio_dma_mapping_t *find_dma_mapping(kb_linux_vfio_backend_t *backend, uint64_t dma_addr)
+{
+    for (size_t i = 0; i < KB_VFIO_DMA_MAPPING_MAX; i++) {
+        kb_vfio_dma_mapping_t *mapping = &backend->dma_mappings[i];
+        if (mapping->size != 0 && dma_addr >= mapping->iova && dma_addr < mapping->iova + mapping->size) {
+            return mapping;
+        }
+    }
+    return NULL;
 }
 
 static kb_status_t errno_status(void)
@@ -518,12 +558,14 @@ static kb_status_t vfio_dma_map(
     const uint64_t aligned_start = align_down_u64(start, ps);
     const uint64_t offset = start - aligned_start;
     const uint64_t map_size = align_up_u64(offset + size, ps);
+    kb_linux_vfio_backend_t *backend = device->backend;
+    const uint64_t iova = align_up_u64(backend->next_iova, ps);
 
     struct vfio_iommu_type1_dma_map map;
     memset(&map, 0, sizeof(map));
     map.argsz = sizeof(map);
     map.vaddr = aligned_start;
-    map.iova = aligned_start;
+    map.iova = iova;
     map.size = map_size;
     if (direction == KB_DMA_TO_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
         map.flags |= VFIO_DMA_MAP_FLAG_READ;
@@ -539,7 +581,18 @@ static kb_status_t vfio_dma_map(
         return errno_status();
     }
 
-    *out_dma_addr = aligned_start + offset;
+    kb_status_t status = remember_dma_mapping(backend, iova, aligned_start, map_size);
+    if (status != KB_OK) {
+        struct vfio_iommu_type1_dma_unmap unmap;
+        memset(&unmap, 0, sizeof(unmap));
+        unmap.argsz = sizeof(unmap);
+        unmap.iova = iova;
+        unmap.size = map_size;
+        (void)ioctl(device->backend->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
+        return status;
+    }
+    backend->next_iova = iova + map_size + ps;
+    *out_dma_addr = iova + offset;
     return KB_OK;
 }
 
@@ -550,17 +603,18 @@ static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size
         return;
     }
 
-    const uint64_t ps = page_size();
-    const uint64_t aligned_start = align_down_u64(dma_addr, ps);
-    const uint64_t offset = dma_addr - aligned_start;
-    const uint64_t map_size = align_up_u64(offset + size, ps);
+    kb_vfio_dma_mapping_t *mapping = find_dma_mapping(device->backend, dma_addr);
+    if (mapping == NULL) {
+        return;
+    }
 
     struct vfio_iommu_type1_dma_unmap unmap;
     memset(&unmap, 0, sizeof(unmap));
     unmap.argsz = sizeof(unmap);
-    unmap.iova = aligned_start;
-    unmap.size = map_size;
+    unmap.iova = mapping->iova;
+    unmap.size = mapping->size;
     (void)ioctl(device->backend->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
+    memset(mapping, 0, sizeof(*mapping));
 }
 
 static kb_status_t vfio_irq_register(
@@ -570,26 +624,103 @@ static kb_status_t vfio_irq_register(
     void *ctx,
     kb_irq_t **out_irq)
 {
-    (void)device;
-    (void)vector;
-    (void)handler;
-    (void)ctx;
-    (void)out_irq;
-    return KB_ERR_UNSUPPORTED;
+    if (device == NULL || handler == NULL || out_irq == NULL) {
+        return KB_ERR_INVALID;
+    }
+    if (vector != 0) {
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    kb_irq_t *irq = calloc(1, sizeof(*irq));
+    if (irq == NULL) {
+        return KB_ERR_NOMEM;
+    }
+    irq->event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (irq->event_fd < 0) {
+        free(irq);
+        return errno_status();
+    }
+    irq->index = VFIO_PCI_INTX_IRQ_INDEX;
+    irq->start = 0;
+    irq->handler = handler;
+    irq->ctx = ctx;
+
+    unsigned char request_storage[sizeof(struct vfio_irq_set) + sizeof(int32_t)];
+    memset(request_storage, 0, sizeof(request_storage));
+    struct vfio_irq_set *request = (struct vfio_irq_set *)request_storage;
+    request->argsz = sizeof(request_storage);
+    request->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
+    request->index = irq->index;
+    request->start = irq->start;
+    request->count = 1;
+    memcpy(request->data, &irq->event_fd, sizeof(irq->event_fd));
+
+    if (ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, request) != 0) {
+        kb_status_t status = errno_status();
+        close(irq->event_fd);
+        free(irq);
+        return status;
+    }
+
+    *out_irq = irq;
+    return KB_OK;
 }
 
 static void vfio_irq_unregister(kb_device_t *device, kb_irq_t *irq)
 {
-    (void)device;
-    (void)irq;
+    if (device == NULL || irq == NULL) {
+        return;
+    }
+
+    struct vfio_irq_set request;
+    memset(&request, 0, sizeof(request));
+    request.argsz = sizeof(request);
+    request.flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER;
+    request.index = irq->index;
+    request.start = irq->start;
+    request.count = 0;
+    (void)ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, &request);
+    close(irq->event_fd);
+    free(irq);
 }
 
 static kb_status_t vfio_irq_wait(kb_device_t *device, kb_irq_t *irq, uint64_t timeout_ns)
 {
     (void)device;
-    (void)irq;
-    (void)timeout_ns;
-    return KB_ERR_UNSUPPORTED;
+    if (irq == NULL || irq->event_fd < 0) {
+        return KB_ERR_INVALID;
+    }
+
+    int timeout_ms = -1;
+    if (timeout_ns != UINT64_MAX) {
+        uint64_t rounded_ms = (timeout_ns + 999999ull) / 1000000ull;
+        timeout_ms = rounded_ms > (uint64_t)INT_MAX ? INT_MAX : (int)rounded_ms;
+    }
+
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = irq->event_fd;
+    pfd.events = POLLIN;
+    int result = poll(&pfd, 1, timeout_ms);
+    if (result < 0) {
+        return errno_status();
+    }
+    if (result == 0) {
+        return KB_ERR_NOT_FOUND;
+    }
+
+    uint64_t count = 0;
+    ssize_t read_size = read(irq->event_fd, &count, sizeof(count));
+    if (read_size < 0) {
+        return errno_status();
+    }
+    if ((size_t)read_size != sizeof(count)) {
+        return KB_ERR_IO;
+    }
+    if (irq->handler != NULL) {
+        irq->handler(irq->ctx);
+    }
+    return KB_OK;
 }
 
 static uint64_t vfio_monotonic_ns(kb_backend_t *backend)
@@ -695,6 +826,7 @@ kb_status_t kb_linux_vfio_create(const char *pci_bdf, kb_backend_t **out_backend
     backend->container_fd = -1;
     backend->group_fd = -1;
     backend->device_fd = -1;
+    backend->next_iova = KB_VFIO_DMA_IOVA_BASE;
     backend->device.device_fd = -1;
 
     int written = snprintf(backend->device.bdf, sizeof(backend->device.bdf), "%s", pci_bdf);

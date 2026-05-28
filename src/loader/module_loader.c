@@ -73,7 +73,7 @@ struct kb_module {
     void *shim_nr_cpu_ids;
     void *shim_this_cpu_off;
     void *shim_pernet_ops_rwsem;
-    void *shim_pvpanic_dev_groups;
+    void *shim_panic_notifier_list;
     loaded_section_t *sections;
     size_t section_count;
     int (*init_module)(void);
@@ -87,6 +87,18 @@ typedef struct shim_symbol {
     const char *name;
     void *address;
 } shim_symbol_t;
+
+typedef struct exported_symbol {
+    const char *name;
+    uint64_t address;
+    const kb_module_t *owner;
+} exported_symbol_t;
+
+enum {
+    KB_EXPORTED_SYMBOL_MAX = 1024,
+};
+
+static exported_symbol_t exported_symbols[KB_EXPORTED_SYMBOL_MAX];
 
 static void kb_noop(void)
 {
@@ -115,6 +127,8 @@ static const shim_symbol_t shim_symbols[] = {
     {"pci_iomap", (void *)(uintptr_t)&kb_pci_iomap},
     {"pcim_iomap", (void *)(uintptr_t)&kb_pcim_iomap},
     {"pci_iounmap", (void *)(uintptr_t)&kb_pci_iounmap},
+    {"ioread8", (void *)(uintptr_t)&kb_ioread8},
+    {"iowrite8", (void *)(uintptr_t)&kb_iowrite8},
     {"ioread32", (void *)(uintptr_t)&kb_ioread32},
     {"iowrite32", (void *)(uintptr_t)&kb_iowrite32},
     {"__platform_driver_register", (void *)(uintptr_t)&kb_platform_driver_register},
@@ -136,9 +150,15 @@ static const shim_symbol_t shim_symbols[] = {
     {"irq_get_irq_data", (void *)(uintptr_t)&kb_irq_get_irq_data},
     {"irq_modify_status", (void *)(uintptr_t)&kb_irq_modify_status},
     {"_raw_spin_lock", (void *)(uintptr_t)&kb_raw_spin_lock},
+    {"_raw_spin_trylock", (void *)(uintptr_t)&kb_raw_spin_trylock},
     {"_raw_spin_lock_irqsave", (void *)(uintptr_t)&kb_raw_spin_lock_irqsave},
     {"_raw_spin_unlock", (void *)(uintptr_t)&kb_raw_spin_unlock},
     {"_raw_spin_unlock_irqrestore", (void *)(uintptr_t)&kb_raw_spin_unlock_irqrestore},
+    {"atomic_notifier_chain_register", (void *)(uintptr_t)&kb_atomic_notifier_chain_register},
+    {"atomic_notifier_chain_unregister", (void *)(uintptr_t)&kb_atomic_notifier_chain_unregister},
+    {"kexec_crash_loaded", (void *)(uintptr_t)&kb_kexec_crash_loaded},
+    {"kstrtouint", (void *)(uintptr_t)&kb_kstrtouint},
+    {"sysfs_emit", (void *)(uintptr_t)&kb_sysfs_emit},
     {"__kmalloc", (void *)(uintptr_t)&kb_kmalloc_alias},
     {"__SCT__might_resched", (void *)(uintptr_t)&kb_might_resched},
     {"__ubsan_handle_load_invalid_value", (void *)(uintptr_t)&kb_ubsan_handle_load_invalid_value},
@@ -188,7 +208,6 @@ static const shim_symbol_t shim_symbols[] = {
     {"down_write", (void *)(uintptr_t)&kb_down_write},
     {"up_write", (void *)(uintptr_t)&kb_up_write},
     {"_find_next_bit", (void *)(uintptr_t)&kb_find_next_bit},
-    {"devm_pvpanic_probe", (void *)(uintptr_t)&kb_devm_pvpanic_probe},
 };
 
 _Static_assert(
@@ -315,6 +334,28 @@ static void *lookup_shim_symbol(const char *name)
     return 0;
 }
 
+static void *lookup_exported_symbol(const char *name)
+{
+    if (name == 0 || name[0] == '\0') {
+        return 0;
+    }
+    for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
+        if (exported_symbols[i].name != 0 && strcmp(exported_symbols[i].name, name) == 0) {
+            return (void *)(uintptr_t)exported_symbols[i].address;
+        }
+    }
+    return 0;
+}
+
+static void unregister_module_exports(const kb_module_t *module)
+{
+    for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
+        if (exported_symbols[i].owner == module) {
+            memset(&exported_symbols[i], 0, sizeof(exported_symbols[i]));
+        }
+    }
+}
+
 static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
 {
     for (size_t i = 0; i < sizeof(shim_symbols) / sizeof(shim_symbols[0]); i++) {
@@ -406,8 +447,8 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     if (strcmp(name, "pernet_ops_rwsem") == 0) {
         return module->shim_pernet_ops_rwsem;
     }
-    if (strcmp(name, "pvpanic_dev_groups") == 0) {
-        return module->shim_pvpanic_dev_groups;
+    if (strcmp(name, "panic_notifier_list") == 0) {
+        return module->shim_panic_notifier_list;
     }
     return lookup_shim_symbol(name);
 }
@@ -481,6 +522,71 @@ static kb_status_t find_symbol_address(const kb_module_t *module, const char *na
     return KB_ERR_NOT_FOUND;
 }
 
+static kb_status_t register_module_exports(kb_module_t *module)
+{
+    const size_t section_count = kb_elf_section_count(&module->elf);
+    for (size_t section_index = 0; section_index < section_count; section_index++) {
+        kb_elf_section_t section;
+        kb_status_t status = kb_elf_section(&module->elf, section_index, &section);
+        if (status != KB_OK) {
+            return status;
+        }
+        if (section.type != KB_ELF_SHT_SYMTAB && section.type != KB_ELF_SHT_DYNSYM) {
+            continue;
+        }
+
+        size_t symbol_count = 0;
+        status = kb_elf_symbol_count(&module->elf, section_index, &symbol_count);
+        if (status != KB_OK) {
+            return status;
+        }
+        for (size_t symbol_index = 0; symbol_index < symbol_count; symbol_index++) {
+            kb_elf_symbol_t symbol;
+            status = kb_elf_symbol(&module->elf, section_index, symbol_index, &symbol);
+            if (status != KB_OK) {
+                return status;
+            }
+            if (symbol.binding != KB_ELF_STB_GLOBAL || symbol.section_index == KB_ELF_SHN_UNDEF ||
+                symbol.name == 0 || symbol.name[0] == '\0')
+            {
+                continue;
+            }
+
+            uint64_t address = 0;
+            status = loaded_section_address(module, symbol.section_index, symbol.value, &address);
+            if (status != KB_OK) {
+                continue;
+            }
+
+            int already_registered = 0;
+            for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
+                if (exported_symbols[i].name != 0 && strcmp(exported_symbols[i].name, symbol.name) == 0) {
+                    already_registered = 1;
+                    break;
+                }
+            }
+            if (already_registered) {
+                continue;
+            }
+
+            size_t slot = KB_EXPORTED_SYMBOL_MAX;
+            for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
+                if (exported_symbols[i].name == 0) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == KB_EXPORTED_SYMBOL_MAX) {
+                return KB_ERR_NOMEM;
+            }
+            exported_symbols[slot].name = symbol.name;
+            exported_symbols[slot].address = address;
+            exported_symbols[slot].owner = module;
+        }
+    }
+    return KB_OK;
+}
+
 static kb_status_t load_sections(kb_module_t *module)
 {
     uint64_t image_size = 0;
@@ -546,7 +652,7 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_nr_cpu_ids = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3280;
     module->shim_this_cpu_off = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3296;
     module->shim_pernet_ops_rwsem = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3312;
-    module->shim_pvpanic_dev_groups = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3376;
+    module->shim_panic_notifier_list = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3376;
     write_u64le((uint8_t *)module->shim_cpu_possible_mask, 1);
     write_u32le((uint8_t *)module->shim_nr_cpu_ids, 1);
     write_u64le((uint8_t *)module->shim_this_cpu_off, 0);
@@ -722,7 +828,10 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
             return KB_OK;
         }
 
-        void *address = lookup_module_shim_symbol(module, symbol.name);
+        void *address = lookup_exported_symbol(symbol.name);
+        if (address == 0) {
+            address = lookup_module_shim_symbol(module, symbol.name);
+        }
         if (address == 0) {
             return KB_ERR_UNSUPPORTED;
         }
@@ -834,6 +943,7 @@ static void destroy_module(kb_module_t *module)
     if (module == 0) {
         return;
     }
+    unregister_module_exports(module);
     free_loaded_sections(module);
     free(module->sections);
     free(module);
@@ -877,6 +987,10 @@ static kb_status_t prepare_module(kb_module_t *module)
         return status;
     }
     status = apply_relocations(module);
+    if (status != KB_OK) {
+        return status;
+    }
+    status = register_module_exports(module);
     if (status != KB_OK) {
         return status;
     }

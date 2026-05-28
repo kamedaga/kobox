@@ -7,6 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+enum {
+    KB_RUN_DEPS_MAX = 16,
+};
+
+typedef struct loaded_input_module {
+    const char *path;
+    void *data;
+    size_t size;
+    kb_module_t *module;
+} loaded_input_module_t;
+
 static const char *status_name(kb_status_t status)
 {
     switch (status) {
@@ -71,6 +82,8 @@ int main(int argc, char **argv)
     const char *path = NULL;
     const char *backend_name = "mock";
     const char *pci_bdf = NULL;
+    const char *dep_paths[KB_RUN_DEPS_MAX];
+    size_t dep_count = 0;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-') {
         if (strncmp(argv[argi], "--backend=", 10) == 0) {
@@ -83,7 +96,16 @@ int main(int argc, char **argv)
             argi++;
             continue;
         }
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF>] run <module.ko>\n");
+        if (strncmp(argv[argi], "--dep=", 6) == 0) {
+            if (dep_count >= KB_RUN_DEPS_MAX) {
+                fprintf(stderr, "too many dependencies\n");
+                return 1;
+            }
+            dep_paths[dep_count++] = argv[argi] + 6;
+            argi++;
+            continue;
+        }
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko>] run <module.ko>\n");
         return 1;
     }
 
@@ -92,7 +114,7 @@ int main(int argc, char **argv)
     } else if (argi + 2 == argc && strcmp(argv[argi], "run") == 0) {
         path = argv[argi + 1];
     } else {
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF>] run <module.ko>\n");
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko>] run <module.ko>\n");
         return 1;
     }
 
@@ -125,6 +147,49 @@ int main(int argc, char **argv)
         return 3;
     }
 
+    loaded_input_module_t deps[KB_RUN_DEPS_MAX];
+    memset(deps, 0, sizeof(deps));
+    for (size_t i = 0; i < dep_count; i++) {
+        deps[i].path = dep_paths[i];
+        status = read_file(deps[i].path, &deps[i].data, &deps[i].size);
+        if (status != KB_OK) {
+            fprintf(stderr, "dependency read failed: %s: %s (%d)\n", deps[i].path, status_name(status), status);
+            kb_backend_destroy(backend);
+            free(data);
+            return 4;
+        }
+        kb_module_image_t dep_image = {
+            .data = deps[i].data,
+            .size = deps[i].size,
+            .name = deps[i].path,
+        };
+        status = kb_module_open_image(&dep_image, backend, &deps[i].module);
+        if (status != KB_OK) {
+            fprintf(stderr, "dependency open failed: %s: %s (%d)\n", deps[i].path, status_name(status), status);
+            for (size_t j = 0; j <= i; j++) {
+                free(deps[j].data);
+            }
+            kb_backend_destroy(backend);
+            free(data);
+            return 4;
+        }
+        int dep_result = 0;
+        status = kb_module_call_init(deps[i].module, &dep_result);
+        if (status != KB_OK) {
+            fprintf(stderr, "dependency init failed: %s: %s (%d)\n", deps[i].path, status_name(status), status);
+            for (size_t j = 0; j <= i; j++) {
+                if (deps[j].module != NULL) {
+                    kb_module_close(deps[j].module);
+                }
+                free(deps[j].data);
+            }
+            kb_backend_destroy(backend);
+            free(data);
+            return 4;
+        }
+        printf("dependency %s init_module returned %d\n", deps[i].path, dep_result);
+    }
+
     kb_module_image_t image = {
         .data = data,
         .size = size,
@@ -133,6 +198,11 @@ int main(int argc, char **argv)
     kb_module_t *module = NULL;
     status = kb_module_open_image(&image, backend, &module);
     if (status != KB_OK) {
+        for (size_t i = dep_count; i > 0; i--) {
+            (void)kb_module_call_cleanup(deps[i - 1].module);
+            kb_module_close(deps[i - 1].module);
+            free(deps[i - 1].data);
+        }
         kb_backend_destroy(backend);
         free(data);
         fprintf(stderr, "open failed: %s (%d)\n", status_name(status), status);
@@ -143,6 +213,11 @@ int main(int argc, char **argv)
     status = kb_module_call_init(module, &result);
     if (status != KB_OK) {
         kb_module_close(module);
+        for (size_t i = dep_count; i > 0; i--) {
+            (void)kb_module_call_cleanup(deps[i - 1].module);
+            kb_module_close(deps[i - 1].module);
+            free(deps[i - 1].data);
+        }
         kb_backend_destroy(backend);
         free(data);
         fprintf(stderr, "init failed: %s (%d)\n", status_name(status), status);
@@ -162,6 +237,21 @@ int main(int argc, char **argv)
     }
 
     kb_module_close(module);
+    for (size_t i = dep_count; i > 0; i--) {
+        status = kb_module_call_cleanup(deps[i - 1].module);
+        if (status == KB_OK) {
+            printf("dependency %s cleanup_module returned\n", deps[i - 1].path);
+        } else if (status != KB_ERR_NOT_FOUND) {
+            fprintf(stderr, "dependency cleanup failed: %s: %s (%d)\n", deps[i - 1].path, status_name(status), status);
+            kb_module_close(deps[i - 1].module);
+            free(deps[i - 1].data);
+            kb_backend_destroy(backend);
+            free(data);
+            return 7;
+        }
+        kb_module_close(deps[i - 1].module);
+        free(deps[i - 1].data);
+    }
     kb_backend_destroy(backend);
     free(data);
     return 0;
