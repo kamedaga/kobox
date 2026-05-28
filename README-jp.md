@@ -1,55 +1,81 @@
 # kobox
 
-Linux の .ko カーネルモジュールを、ユーザー空間で、任意の OS 上でバイナリレベルで動かす 
+Linux の `.ko` カーネルモジュールを、libc ベースの shim と OS ごとの backend によって userspace で動かす runtime です。
 
 ## kobox とは？
 
-kobox はプリコンパイル済みの Linux カーネルモジュール (.ko) をロードし、
-カーネルシンボルを自前の shim 実装で解決することでユーザー空間で実行します。
-カーネルソース不要。再コンパイル不要。.ko バイナリだけあれば動きます。
+kobox はプリコンパイル済みの Linux カーネルモジュール (`.ko`) を userspace process にロードします。Linux kernel symbol は互換 shim が解決し、実際の device access は Linux VFIO、PachaOS、OpenBSD などの backend に委譲します。
 
-## なぜ kobox？
+最初の開発ターゲットは Linux です。Linux なら native kernel driver との挙動比較と性能計測がしやすいため、loader / shim / backend の正しさを Linux 上で固めてから他 OS に移植します。
 
-・ドライババイナリのみを実行するため、軽量シンプル。
-・バイナリレベルで実行するため、クローズドドライバにも対応。
-・Linuxの豊富な資源をユーザー空間で安全に実行可能
+## 設計目標
+
+- 既存の `.ko` binary を再コンパイルなしで動かす。
+- Linux 互換 shim は portable に保ち、libc ベースで実装する。
+- OS 固有の device access は backend API の内側に閉じ込める。
+- Linux、PachaOS、OpenBSD の対応を shim の書き換えではなく backend 実装にする。
+- portable backend を増やす前に、Linux native driver との差分と overhead を測る。
 
 ## アーキテクチャ
 
+```text
+Linux Driver (.ko binary)
+        |
+        | Linux kernel symbols
+        v
+libc-based Linux shim layer
+  kmalloc, mutex, workqueue, pci_*, dma_*, request_irq, ...
+        |
+        | kobox backend API only
+        v
+OS backend
+  linux_mock / linux_vfio / pachaos / openbsd
 ```
-┌─────────────────────────────────┐
-│     Linux Driver (.ko binary)    │
-├─────────────────────────────────┤
-│     kobox shim layer             │
-│  (kmalloc, dma_*, pci_*, ...)   │
-├─────────────────────────────────┤
-│     Backend (OS 固有)            │
-│  linux_vfio / pachaos / freebsd │
-└─────────────────────────────────┘
+
+shim 層はあえて libc と標準的な userspace primitive を使います。`malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics などを使うことで実装量を減らし、libc が使える target OS に広げやすくします。
+
+backend は OS 固有の device access だけを担当します。
+
+- device enumeration
+- PCI config access
+- BAR/MMIO mapping
+- DMA allocation / mapping
+- IRQ delivery
+- time, logging, event integration
+
+## 現在のステータス
+
+初期設計段階です。次の milestone は以下です。
+
+1. architecture と backend API を固定する
+2. ELF header/section 表示まで入った `kobox-inspect` を symbol / relocation 解析へ広げる
+3. `linux_mock` backend を実装する
+4. 最小 userspace module loader を実装する
+5. 実 hardware 用に `linux_vfio` backend を追加する
+
+この段階では versioning や release は意識しません。loader、shim の境界、backend API が固まるまでは、kobox は versioned runtime ではなく design/prototype project として扱います。
+
+## Build
+
+kobox は C11 で書き、CMake と clang で build します。
+
+```sh
+cmake -S . -B .artifacts/build -DCMAKE_C_COMPILER=clang
+cmake --build .artifacts/build
+ctest --test-dir .artifacts/build
 ```
 
 ## ロードマップ
 
-1. NVMe — 単体 .ko、PCI + DMA + IRQ の shim 基盤構築
-2. USB (xHCI) — 複数 .ko 同時ロード、サブシステム対応
-3. Network (e1000e / r8169) — PCI + DMA shim を流用
-4. SATA (AHCI) — NVMe とストレージ shim を共通化
-5. NVIDIA GPU — 最終目標
+公開ロードマップは Linux-first です。
 
-## 設計思想
-
-- **再発明しない — 再利用して隔離する**
-- libc ベースの shim で最大限のポータビリティ
-- バックエンド抽象化: shim 層は共通、OS ごとにバックエンドを差し替え
-- Capability 対応: サンドボックス内でのドライバ実行を前提に設計
-
-## 関連プロジェクト
-
-- [PachaOS](https://github.com/kamerv/os) — Capability-based microkernel OS。kobox の主要ターゲット。
-
-## ステータス
-
-開発初期段階。ELF ローダーと shim アーキテクチャを設計中。
+1. **Module introspection**: ELF section、relocation、`modinfo`、`vermagic`、undefined symbol、dependency を解析する。
+2. **Userspace loader**: `.text`, `.data`, `.bss` を配置し、x86_64 relocation を適用して `init_module` / `cleanup_module` を呼ぶ。
+3. **libc-based shim core**: memory、logging、sync、timer、workqueue、common Linux helper API を実装する。
+4. **linux_mock backend**: 実 hardware なしで loader と shim を検証する。
+5. **linux_vfio backend**: VFIO 経由で PCI device、BAR、DMA、IRQ を扱う。
+6. **Performance track**: `perf`, `ftrace`, `fio` などで native Linux driver と比較する。
+7. **Portable backends**: Linux runtime が計測可能で安定してから PachaOS / OpenBSD backend を追加する。
 
 ## ライセンス
 

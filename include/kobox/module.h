@@ -1,0 +1,31 @@
+#pragma once
+
+#include <stddef.h>
+#include "kobox/backend.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct kb_module kb_module_t;
+
+typedef struct kb_module_image {
+    const void *data;
+    size_t size;
+    const char *name;
+} kb_module_image_t;
+
+const char *kb_module_loader_version(void);
+
+kb_status_t kb_module_open_image(
+    const kb_module_image_t *image,
+    kb_backend_t *backend,
+    kb_module_t **out_module);
+
+kb_status_t kb_module_call_init(kb_module_t *module, int *out_result);
+kb_status_t kb_module_call_cleanup(kb_module_t *module);
+void kb_module_close(kb_module_t *module);
+
+#ifdef __cplusplus
+}
+#endif

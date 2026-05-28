@@ -1,0 +1,16 @@
+docs/
+.artifacts/
+build/
+out/
+*.o
+*.obj
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+.tmp_versions/
+*.so
+*.dll
+*.exe
