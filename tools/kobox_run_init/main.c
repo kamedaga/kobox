@@ -41,12 +41,19 @@ static void crash_handler(int signo, siginfo_t *info, void *ucontext)
 #if defined(__x86_64__)
     ucontext_t *context = (ucontext_t *)ucontext;
     if (context != NULL) {
+        uintptr_t *sp = (uintptr_t *)context->uc_mcontext.gregs[REG_RSP];
         dprintf(
             STDERR_FILENO,
-            "kobox-run: signal=%d addr=%p rip=%p\n",
+            "kobox-run: signal=%d addr=%p rip=%p rsp=%p\n",
             signo,
             info != NULL ? info->si_addr : NULL,
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RIP]);
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RIP],
+            (void *)sp);
+        if (sp != NULL && getenv("KOBOX_CRASH_STACK") != NULL) {
+            for (int i = 0; i < 8; i++) {
+                dprintf(STDERR_FILENO, "kobox-run: stack[%d]=%p\n", i, (void *)sp[i]);
+            }
+        }
     }
 #else
     if (info != NULL) {

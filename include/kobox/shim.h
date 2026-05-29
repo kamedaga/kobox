@@ -11,6 +11,8 @@ extern "C" {
 void *kb_kmalloc(size_t size, unsigned int flags);
 void *kb_kzalloc(size_t size, unsigned int flags);
 void *kb_kmalloc_trace(void *cache, unsigned int flags, size_t size);
+void *kb_kmem_cache_alloc(void *cache, unsigned int flags);
+void kb_kmem_cache_free(void *cache, void *ptr);
 void kb_kfree(void *ptr);
 int kb_printk(const char *fmt, ...);
 

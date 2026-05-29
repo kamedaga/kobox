@@ -1,6 +1,7 @@
 #include "backend/backend_internal.h"
 #include "kobox/backend_linux_mock.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -243,6 +244,32 @@ static void mock_log(kb_backend_t *backend, int level, const char *message)
     (void)message;
 }
 
+static void configure_mock_pci_id_from_env(kb_linux_mock_backend_t *backend)
+{
+    const char *pci_id = getenv("KOBOX_MOCK_PCI_ID");
+    if (pci_id == NULL || pci_id[0] == '\0') {
+        return;
+    }
+
+    unsigned vendor = 0;
+    unsigned device = 0;
+    unsigned class_code = 0;
+    unsigned subclass = 0;
+    unsigned prog_if = 0;
+    const int fields = sscanf(pci_id, "%x:%x:%x:%x:%x", &vendor, &device, &class_code, &subclass, &prog_if);
+    if (fields < 2) {
+        return;
+    }
+
+    backend->device.pci_id.vendor_id = (uint16_t)vendor;
+    backend->device.pci_id.device_id = (uint16_t)device;
+    if (fields >= 5) {
+        backend->device.pci_id.class_code = (uint8_t)class_code;
+        backend->device.pci_id.subclass = (uint8_t)subclass;
+        backend->device.pci_id.prog_if = (uint8_t)prog_if;
+    }
+}
+
 static const kb_backend_ops_t mock_ops = {
     .destroy = mock_destroy,
     .device_count = mock_device_count,
@@ -279,10 +306,14 @@ kb_status_t kb_linux_mock_create(kb_backend_t **out_backend)
     backend->base.ops = &mock_ops;
     backend->device.pci_id.vendor_id = 0x1d6b;
     backend->device.pci_id.device_id = 0x0001;
+    backend->device.pci_id.class_code = 0x00;
+    backend->device.pci_id.subclass = 0x00;
+    backend->device.pci_id.prog_if = 0x00;
     backend->device.location.segment = 0;
     backend->device.location.bus = 0;
     backend->device.location.device = 1;
     backend->device.location.function = 0;
+    configure_mock_pci_id_from_env(backend);
 
     *out_backend = &backend->base;
     return KB_OK;

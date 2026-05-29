@@ -15,6 +15,18 @@ typedef struct shim_pci_driver {
     void (*remove)(void *dev);
 } shim_pci_driver_t;
 
+typedef struct linux_pci_device_id {
+    uint32_t vendor;
+    uint32_t device;
+    uint32_t subvendor;
+    uint32_t subdevice;
+    uint32_t class;
+    uint32_t class_mask;
+    uintptr_t driver_data;
+} linux_pci_device_id_t;
+
+#define KB_PCI_ANY_ID UINT32_C(0xffffffff)
+
 typedef struct shim_pci_binding {
     shim_pci_driver_t *driver;
     kb_device_t *device;
@@ -82,6 +94,48 @@ static int trace_pci_enabled(void)
 static void write_u32(void *ptr, uint32_t value)
 {
     memcpy(ptr, &value, sizeof(value));
+}
+
+static int pci_id_field_matches(uint32_t expected, uint32_t actual)
+{
+    return expected == KB_PCI_ANY_ID || expected == actual;
+}
+
+static const linux_pci_device_id_t *match_pci_id_table(const void *id_table, const kb_pci_id_t *device_id)
+{
+    if (id_table == NULL || device_id == NULL) {
+        return NULL;
+    }
+
+    const uint32_t class_value =
+        ((uint32_t)device_id->class_code << 16) |
+        ((uint32_t)device_id->subclass << 8) |
+        (uint32_t)device_id->prog_if;
+    const linux_pci_device_id_t *entry = id_table;
+    for (size_t i = 0; i < 4096; i++, entry++) {
+        if (entry->vendor == 0 && entry->device == 0 && entry->subvendor == 0 &&
+            entry->subdevice == 0 && entry->class == 0 && entry->class_mask == 0)
+        {
+            return NULL;
+        }
+        if (!pci_id_field_matches(entry->vendor, device_id->vendor_id) ||
+            !pci_id_field_matches(entry->device, device_id->device_id) ||
+            !pci_id_field_matches(entry->subvendor, device_id->subsystem_vendor_id) ||
+            !pci_id_field_matches(entry->subdevice, device_id->subsystem_device_id))
+        {
+            continue;
+        }
+        if (((class_value ^ entry->class) & entry->class_mask) != 0) {
+            continue;
+        }
+        return entry;
+    }
+    return NULL;
+}
+
+static int is_nvidia_driver_name(const char *name)
+{
+    return name != NULL && strncmp(name, "nvidia", 6) == 0;
 }
 
 static uint32_t mmio_read32(void *base, size_t offset)
@@ -157,7 +211,35 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
         return -19;
     }
 
+    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    if (ops == NULL || ops->device_pci_id == NULL) {
+        return -19;
+    }
+    kb_pci_id_t device_id;
+    memset(&device_id, 0, sizeof(device_id));
+    if (ops->device_pci_id(device, &device_id) != KB_OK) {
+        return -19;
+    }
+
     shim_pci_driver_t *pci_driver = driver;
+    const linux_pci_device_id_t *matched_id = match_pci_id_table(pci_driver->id_table, &device_id);
+    if (matched_id == NULL) {
+        if (trace_pci_enabled()) {
+            fprintf(
+                stderr,
+                "kobox pci: pci_register_driver no match driver=%s vendor=0x%x device=0x%x class=0x%x%02x%02x\n",
+                pci_driver->name == NULL ? "" : pci_driver->name,
+                device_id.vendor_id,
+                device_id.device_id,
+                device_id.class_code,
+                device_id.subclass,
+                device_id.prog_if);
+        }
+        if (is_nvidia_driver_name(pci_driver->name)) {
+            return 0;
+        }
+        matched_id = pci_driver->id_table;
+    }
     binding.driver = pci_driver;
     binding.device = device;
     binding.probed = 0;
@@ -169,7 +251,6 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
         &dma_mask_ptr,
         sizeof(dma_mask_ptr));
 
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
     if (ops != NULL && ops->pci_bar_info != NULL) {
         kb_pci_bar_info_t bar;
         if (ops->pci_bar_info(device, 0, &bar) == KB_OK && bar.present) {
@@ -188,7 +269,7 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
         return 0;
     }
 
-    int result = pci_driver->probe(binding.pci_dev_storage, pci_driver->id_table);
+    int result = pci_driver->probe(binding.pci_dev_storage, matched_id);
     if (result != 0) {
         binding.driver = NULL;
         binding.device = NULL;

@@ -37,6 +37,18 @@ void *kb_kmalloc_trace(void *cache, unsigned int flags, size_t size)
     return kb_kmalloc(size, flags);
 }
 
+void *kb_kmem_cache_alloc(void *cache, unsigned int flags)
+{
+    (void)cache;
+    return kb_kmalloc(4096, flags);
+}
+
+void kb_kmem_cache_free(void *cache, void *ptr)
+{
+    (void)cache;
+    kb_kfree(ptr);
+}
+
 void kb_kfree(void *ptr)
 {
     free(ptr);
@@ -55,6 +67,16 @@ void *kzalloc(size_t size, unsigned int flags)
 void *kmalloc_trace(void *cache, unsigned int flags, size_t size)
 {
     return kb_kmalloc_trace(cache, flags, size);
+}
+
+void *kmem_cache_alloc(void *cache, unsigned int flags)
+{
+    return kb_kmem_cache_alloc(cache, flags);
+}
+
+void kmem_cache_free(void *cache, void *ptr)
+{
+    kb_kmem_cache_free(cache, ptr);
 }
 
 void kfree(void *ptr)
