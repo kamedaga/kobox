@@ -24,9 +24,12 @@ int kb_request_threaded_irq(
     const char *name,
     void *dev_id);
 void kb_free_irq(unsigned int irq, void *dev_id);
+void kb_free_all_irqs(void);
+int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
 
 void *kb_dma_alloc_attrs(void *dev, size_t size, uint64_t *dma_handle, unsigned int flags, unsigned long attrs);
 void kb_dma_free_attrs(void *dev, size_t size, void *cpu_addr, uint64_t dma_handle, unsigned long attrs);
+void *kb_dma_cpu_addr(uint64_t dma_addr, size_t *out_available);
 
 int kb_pci_register_driver(void *driver, void *owner, const char *mod_name);
 void kb_pci_unregister_driver(void *driver);
@@ -37,6 +40,8 @@ void kb_pci_set_master(void *dev);
 void *kb_pci_iomap(void *dev, int bar, unsigned long max);
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max);
 void kb_pci_iounmap(void *dev, void *addr);
+void *kb_ioremap(uint64_t phys_addr, size_t size);
+void kb_iounmap(void *addr);
 uint8_t kb_ioread8(const void *addr);
 void kb_iowrite8(uint8_t value, void *addr);
 uint32_t kb_ioread32(const void *addr);
@@ -121,6 +126,52 @@ int kb_ethtool_op_get_ts_info(void *dev, void *info);
 void kb_down_write(void *sem);
 void kb_up_write(void *sem);
 unsigned long kb_find_next_bit(const unsigned long *addr, unsigned long size, unsigned long offset);
+unsigned int kb_bitmap_weight(const unsigned long *addr, unsigned int bits);
+
+void *kb_kmalloc_node(size_t size, unsigned int flags, int node);
+void *kb_kmalloc_node_trace(void *cache, unsigned int flags, int node, size_t size);
+void *kb_kmemdup(const void *src, size_t len, unsigned int flags);
+void kb_kfree_sensitive(const void *ptr);
+void *kb_dma_pool_create(const char *name, void *dev, size_t size, size_t align, size_t allocation);
+void *kb_dma_pool_alloc(void *pool, unsigned int flags, uint64_t *dma_handle);
+void kb_dma_pool_free(void *pool, void *vaddr, uint64_t dma_addr);
+void kb_dma_pool_destroy(void *pool);
+int kb_dma_set_mask(void *dev, uint64_t mask);
+int kb_dma_set_coherent_mask(void *dev, uint64_t mask);
+int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags);
+int kb_pci_alloc_irq_vectors_affinity(void *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags, void *affd);
+void kb_pci_free_irq_vectors(void *dev);
+int kb_pci_irq_vector(void *dev, unsigned int nr);
+int kb_pci_request_irq(void *dev, unsigned int nr, int (*handler)(int, void *), int (*thread_fn)(int, void *), void *dev_id, const char *fmt, ...);
+void kb_pci_free_irq(void *dev, unsigned int nr, void *dev_id);
+int kb_pci_enable_device_mem(void *dev);
+int kb_pci_request_selected_regions(void *dev, int bars, const char *name);
+void kb_pci_release_selected_regions(void *dev, int bars);
+int kb_pci_select_bars(void *dev, unsigned long flags);
+int kb_pci_device_is_present(void *dev);
+void kb_mutex_init(void *lock);
+void kb_mutex_lock(void *lock);
+void kb_mutex_unlock(void *lock);
+int kb_mutex_trylock(void *lock);
+void kb_complete(void *completion);
+void kb_init_completion(void *completion);
+void kb_init_waitqueue_head(void *wq_head);
+void kb_init_swait_queue_head(void *wq_head);
+unsigned long kb_wait_for_completion(void *completion);
+unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long timeout);
+void kb_trace_noop(void);
+int kb_return_zero(void);
+int kb_return_one(void);
+void *kb_alloc_stub(void);
+void *kb_identity_ptr(void *ptr);
+const char *kb_empty_string(void);
+void *kb_blk_mq_init_queue(void *tag_set);
+void *kb_blk_mq_alloc_request(void *queue, unsigned int op, unsigned int flags);
+int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int length, unsigned int gfp);
+int kb_blk_execute_rq(void *request, int at_head);
+void kb_blk_mq_free_request(void *request);
+int kb_nvme_io_smoke(void);
+void *kb_hwmon_device_register_with_info(void *dev, const char *name, void *data, const void *chip, const void *groups);
 
 #ifdef __cplusplus
 }

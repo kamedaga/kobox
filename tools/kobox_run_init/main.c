@@ -1,11 +1,24 @@
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "kobox/backend.h"
 #include "kobox/backend_linux_mock.h"
 #include "kobox/backend_linux_vfio.h"
 #include "kobox/module.h"
+#include "kobox/shim.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if !defined(_WIN32)
+#include <execinfo.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
 
 enum {
     KB_RUN_DEPS_MAX = 16,
@@ -17,6 +30,51 @@ typedef struct loaded_input_module {
     size_t size;
     kb_module_t *module;
 } loaded_input_module_t;
+
+#if !defined(_WIN32)
+static void crash_handler(int signo, siginfo_t *info, void *ucontext)
+{
+    void *frames[64];
+    int count = backtrace(frames, 64);
+    const char message[] = "kobox-run: crash while executing module\n";
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+#if defined(__x86_64__)
+    ucontext_t *context = (ucontext_t *)ucontext;
+    if (context != NULL) {
+        dprintf(
+            STDERR_FILENO,
+            "kobox-run: signal=%d addr=%p rip=%p\n",
+            signo,
+            info != NULL ? info->si_addr : NULL,
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RIP]);
+    }
+#else
+    if (info != NULL) {
+        dprintf(STDERR_FILENO, "kobox-run: signal=%d addr=%p\n", signo, info->si_addr);
+    }
+#endif
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    signal(signo, SIG_DFL);
+    raise(signo);
+}
+
+static void install_crash_handler(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = crash_handler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV, &action, NULL);
+    sigaction(SIGBUS, &action, NULL);
+    sigaction(SIGILL, &action, NULL);
+    sigaction(SIGABRT, &action, NULL);
+}
+#else
+static void install_crash_handler(void)
+{
+}
+#endif
 
 static const char *status_name(kb_status_t status)
 {
@@ -79,6 +137,8 @@ static kb_status_t read_file(const char *path, void **out_data, size_t *out_size
 
 int main(int argc, char **argv)
 {
+    install_crash_handler();
+
     const char *path = NULL;
     const char *backend_name = "mock";
     const char *pci_bdf = NULL;
@@ -175,6 +235,10 @@ int main(int argc, char **argv)
         }
         int dep_result = 0;
         status = kb_module_call_init(deps[i].module, &dep_result);
+        if (status == KB_ERR_NOT_FOUND) {
+            printf("dependency %s has no init_module\n", deps[i].path);
+            continue;
+        }
         if (status != KB_OK) {
             fprintf(stderr, "dependency init failed: %s: %s (%d)\n", deps[i].path, status_name(status), status);
             for (size_t j = 0; j <= i; j++) {
@@ -225,6 +289,25 @@ int main(int argc, char **argv)
     }
 
     printf("init_module returned %d\n", result);
+    if (getenv("KOBOX_NVME_IO_SMOKE") != NULL) {
+        kb_shim_set_backend(backend);
+        int io_result = kb_nvme_io_smoke();
+        kb_shim_set_backend(NULL);
+        if (io_result != 0) {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            kb_backend_destroy(backend);
+            free(data);
+            fprintf(stderr, "nvme io smoke failed: %d\n", io_result);
+            return 8;
+        }
+    }
+
     status = kb_module_call_cleanup(module);
     if (status == KB_OK) {
         printf("cleanup_module returned\n");
@@ -252,6 +335,7 @@ int main(int argc, char **argv)
         kb_module_close(deps[i - 1].module);
         free(deps[i - 1].data);
     }
+    kb_free_all_irqs();
     kb_backend_destroy(backend);
     free(data);
     return 0;

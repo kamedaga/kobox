@@ -89,6 +89,26 @@ void kb_dma_free_attrs(void *dev, size_t size, void *cpu_addr, uint64_t dma_hand
     }
 }
 
+void *kb_dma_cpu_addr(uint64_t dma_addr, size_t *out_available)
+{
+    for (shim_dma_t *entry = dma_list; entry != NULL; entry = entry->next) {
+        if (dma_addr < entry->dma_addr || dma_addr >= entry->dma_addr + entry->size) {
+            continue;
+        }
+
+        uint64_t offset = dma_addr - entry->dma_addr;
+        if (out_available != NULL) {
+            *out_available = (size_t)(entry->size - offset);
+        }
+        return (unsigned char *)entry->cpu_addr + offset;
+    }
+
+    if (out_available != NULL) {
+        *out_available = 0;
+    }
+    return NULL;
+}
+
 void *dma_alloc_attrs(void *dev, size_t size, uint64_t *dma_handle, unsigned int flags, unsigned long attrs)
 {
     return kb_dma_alloc_attrs(dev, size, dma_handle, flags, attrs);

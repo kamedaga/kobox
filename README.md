@@ -64,18 +64,14 @@ cmake -S . -B .artifacts/build -DCMAKE_C_COMPILER=clang
 cmake --build .artifacts/build
 ctest --test-dir .artifacts/build
 ```
-
 ## Roadmap
 
-The public roadmap is Linux-first:
+1. NVMe — single .ko, PCI + DMA + IRQ shim foundation
+2. USB (xHCI) — multi .ko loading, subsystem support
+3. Network (e1000e / r8169) — reuse PCI + DMA shim
+4. SATA (AHCI) — storage shim shared with NVMe
+5. NVIDIA GPU — the final boss
 
-1. **Module introspection**: parse ELF sections, relocations, `modinfo`, `vermagic`, undefined symbols, and dependencies.
-2. **Userspace loader**: place `.text`, `.data`, `.bss`, apply x86_64 relocations, and call `init_module` / `cleanup_module`.
-3. **libc-based shim core**: implement memory, logging, synchronization, timers, workqueues, and common Linux helper APIs.
-4. **linux_mock backend**: test loader and shim behavior without real hardware.
-5. **linux_vfio backend**: map PCI devices, BARs, DMA, and IRQs through VFIO.
-6. **Performance track**: compare with native Linux drivers using `perf`, `ftrace`, `fio`, and workload-specific benchmarks.
-7. **Portable backends**: add PachaOS and OpenBSD backends after the Linux runtime is measurable and stable.
 
 ## License
 

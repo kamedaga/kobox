@@ -29,7 +29,7 @@ libc-based Linux shim layer
         | kobox backend API only
         v
 OS backend
-  linux_mock / linux_vfio / pachaos / openbsd
+  linux_vfio / pachaos / OpenBSD / FreeBSD...
 ```
 
 shim 層はあえて libc と標準的な userspace primitive を使います。`malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics などを使うことで実装量を減らし、libc が使える target OS に広げやすくします。
@@ -67,15 +67,12 @@ ctest --test-dir .artifacts/build
 
 ## ロードマップ
 
-公開ロードマップは Linux-first です。
+1. NVMe — 単体 .ko、PCI + DMA + IRQ の shim 基盤構築
+2. USB (xHCI) — 複数 .ko 同時ロード、サブシステム対応
+3. Network (e1000e / r8169) — PCI + DMA shim を流用
+4. SATA (AHCI) — NVMe とストレージ shim を共通化
+5. NVIDIA GPU — 最終目標
 
-1. **Module introspection**: ELF section、relocation、`modinfo`、`vermagic`、undefined symbol、dependency を解析する。
-2. **Userspace loader**: `.text`, `.data`, `.bss` を配置し、x86_64 relocation を適用して `init_module` / `cleanup_module` を呼ぶ。
-3. **libc-based shim core**: memory、logging、sync、timer、workqueue、common Linux helper API を実装する。
-4. **linux_mock backend**: 実 hardware なしで loader と shim を検証する。
-5. **linux_vfio backend**: VFIO 経由で PCI device、BAR、DMA、IRQ を扱う。
-6. **Performance track**: `perf`, `ftrace`, `fio` などで native Linux driver と比較する。
-7. **Portable backends**: Linux runtime が計測可能で安定してから PachaOS / OpenBSD backend を追加する。
 
 ## ライセンス
 

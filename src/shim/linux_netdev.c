@@ -252,6 +252,22 @@ unsigned long kb_find_next_bit(const unsigned long *addr, unsigned long size, un
     return size;
 }
 
+unsigned int kb_bitmap_weight(const unsigned long *addr, unsigned int bits)
+{
+    if (addr == NULL || bits == 0) {
+        return 0;
+    }
+
+    unsigned int count = 0;
+    for (unsigned int bit = 0; bit < bits; bit++) {
+        unsigned long word = addr[bit / (sizeof(unsigned long) * 8u)];
+        if ((word & (1ul << (bit % (sizeof(unsigned long) * 8u)))) != 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
 void __SCT__cond_resched(void)
 {
     kb_cond_resched();
@@ -386,4 +402,9 @@ void up_write(void *sem)
 unsigned long _find_next_bit(const unsigned long *addr, unsigned long size, unsigned long offset)
 {
     return kb_find_next_bit(addr, size, offset);
+}
+
+unsigned int __bitmap_weight(const unsigned long *addr, unsigned int bits)
+{
+    return kb_bitmap_weight(addr, bits);
 }

@@ -1,9 +1,15 @@
 #include "kobox/shim.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 kb_backend_t *kb_shim_current_backend(void);
+
+static int trace_irq_enabled(void)
+{
+    return getenv("KOBOX_TRACE_IRQ") != NULL;
+}
 
 typedef struct shim_irq {
     unsigned int irq;
@@ -78,6 +84,9 @@ int kb_request_threaded_irq(
     entry->next = irq_list;
     irq_list = entry;
 
+    if (trace_irq_enabled()) {
+        fprintf(stderr, "kobox irq: request irq=%u dev_id=%p\n", irq, dev_id);
+    }
     (void)ops->irq_wait(device, entry->backend_irq, 0);
     return 0;
 }
@@ -89,6 +98,9 @@ void kb_free_irq(unsigned int irq, void *dev_id)
         shim_irq_t *entry = *cursor;
         if (entry->irq == irq && entry->dev_id == dev_id) {
             *cursor = entry->next;
+            if (trace_irq_enabled()) {
+                fprintf(stderr, "kobox irq: free irq=%u dev_id=%p\n", irq, dev_id);
+            }
             const kb_backend_ops_t *ops = kb_backend_get_ops(kb_shim_current_backend());
             if (ops != NULL && ops->irq_unregister != NULL) {
                 ops->irq_unregister(entry->device, entry->backend_irq);
@@ -98,6 +110,49 @@ void kb_free_irq(unsigned int irq, void *dev_id)
         }
         cursor = &entry->next;
     }
+}
+
+void kb_free_all_irqs(void)
+{
+    const kb_backend_ops_t *ops = kb_backend_get_ops(kb_shim_current_backend());
+    while (irq_list != NULL) {
+        shim_irq_t *entry = irq_list;
+        irq_list = entry->next;
+        if (trace_irq_enabled()) {
+            fprintf(stderr, "kobox irq: free-all irq=%u dev_id=%p\n", entry->irq, entry->dev_id);
+        }
+        if (ops != NULL && ops->irq_unregister != NULL) {
+            ops->irq_unregister(entry->device, entry->backend_irq);
+        }
+        free(entry);
+    }
+}
+
+int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
+{
+    for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
+        if (entry->dev_id != dev_id) {
+            continue;
+        }
+
+        const kb_backend_ops_t *ops = kb_backend_get_ops(kb_shim_current_backend());
+        if (ops == NULL || ops->irq_wait == NULL) {
+            return -95;
+        }
+
+        int (*handler)(int, void *) = entry->handler;
+        int (*thread_fn)(int, void *) = entry->thread_fn;
+        entry->handler = NULL;
+        entry->thread_fn = NULL;
+        kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
+        entry->handler = handler;
+        entry->thread_fn = thread_fn;
+        if (trace_irq_enabled()) {
+            fprintf(stderr, "kobox irq: wait dev_id=%p status=%d\n", dev_id, status);
+        }
+        return status == KB_OK ? 0 : -110;
+    }
+    return -19;
 }
 
 int request_threaded_irq(

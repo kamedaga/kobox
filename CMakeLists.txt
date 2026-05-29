@@ -24,6 +24,7 @@ add_library(kobox_runtime STATIC
     src/shim/linux_memory.c
     src/shim/linux_mmio.c
     src/shim/linux_netdev.c
+    src/shim/linux_nvme_prereq.c
     src/shim/linux_pci.c
     src/shim/linux_platform.c
     src/shim/linux_printk.c
@@ -98,6 +99,18 @@ add_executable(kobox-vfio-edu-smoke
 
 target_link_libraries(kobox-vfio-edu-smoke PRIVATE kobox_runtime)
 target_compile_options(kobox-vfio-edu-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
+add_executable(kobox-vfio-nvme-smoke
+    tools/kobox_vfio_nvme_smoke/main.c
+)
+
+target_link_libraries(kobox-vfio-nvme-smoke PRIVATE kobox_runtime)
+target_compile_options(kobox-vfio-nvme-smoke PRIVATE
     -Wall
     -Wextra
     -Wpedantic

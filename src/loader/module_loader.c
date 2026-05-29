@@ -32,10 +32,12 @@ typedef struct loaded_section {
 
 enum {
     KB_LOCAL_SHIM_STUB_SIZE = 48,
-    KB_LOCAL_SHIM_STUB_COUNT = 128,
+    KB_LOCAL_SHIM_STUB_COUNT = 512,
     KB_LOCAL_SHIM_DATA_SIZE = 4096,
     KB_LOCAL_SHIM_REGION_SIZE = (KB_LOCAL_SHIM_STUB_SIZE * KB_LOCAL_SHIM_STUB_COUNT) + KB_LOCAL_SHIM_DATA_SIZE,
     KB_LOCAL_SHIM_DATA_OFFSET = KB_LOCAL_SHIM_STUB_SIZE * KB_LOCAL_SHIM_STUB_COUNT,
+    KB_LOCAL_GS_SIZE = 4096,
+    KB_LOCAL_GS_PCPU_HOT_OFFSET = 0x100,
 };
 
 struct kb_module {
@@ -69,17 +71,21 @@ struct kb_module {
     void *shim_param_ops_int;
     void *shim_param_ops_uint;
     void *shim_param_ops_bool;
+    void *shim_param_ops_byte;
+    void *shim_param_ops_ulong;
     void *shim_cpu_possible_mask;
+    void *shim_cpu_online_mask;
     void *shim_nr_cpu_ids;
     void *shim_this_cpu_off;
     void *shim_pernet_ops_rwsem;
     void *shim_panic_notifier_list;
+    void *shim_misc_data;
     loaded_section_t *sections;
     size_t section_count;
     int (*init_module)(void);
     void (*cleanup_module)(void);
 #if !defined(_WIN32) && defined(__x86_64__)
-    uint8_t kernel_gs[64];
+    uint8_t kernel_gs[KB_LOCAL_GS_SIZE];
 #endif
 };
 
@@ -208,6 +214,312 @@ static const shim_symbol_t shim_symbols[] = {
     {"down_write", (void *)(uintptr_t)&kb_down_write},
     {"up_write", (void *)(uintptr_t)&kb_up_write},
     {"_find_next_bit", (void *)(uintptr_t)&kb_find_next_bit},
+    {"__SCT__preempt_schedule_notrace", (void *)(uintptr_t)&kb_noop},
+    {"___ratelimit", (void *)(uintptr_t)&kb_return_zero},
+    {"__bitmap_weight", (void *)(uintptr_t)&kb_bitmap_weight},
+    {"__do_once_done", (void *)(uintptr_t)&kb_noop},
+    {"__do_once_start", (void *)(uintptr_t)&kb_return_zero},
+    {"__dynamic_pr_debug", (void *)(uintptr_t)&kb_dynamic_dev_dbg},
+    {"__flush_workqueue", (void *)(uintptr_t)&kb_noop},
+    {"__init_swait_queue_head", (void *)(uintptr_t)&kb_init_swait_queue_head},
+    {"__init_waitqueue_head", (void *)(uintptr_t)&kb_init_waitqueue_head},
+    {"__kmalloc_node", (void *)(uintptr_t)&kb_kmalloc_node},
+    {"__msecs_to_jiffies", (void *)(uintptr_t)&kb_return_zero},
+    {"__mutex_init", (void *)(uintptr_t)&kb_mutex_init},
+    {"__ubsan_handle_shift_out_of_bounds", (void *)(uintptr_t)&kb_noop},
+    {"__warn_printk", (void *)(uintptr_t)&kb_printk},
+    {"_dev_info", (void *)(uintptr_t)&kb_dev_warn},
+    {"_raw_spin_lock_irq", (void *)(uintptr_t)&kb_raw_spin_lock},
+    {"_raw_spin_unlock_irq", (void *)(uintptr_t)&kb_raw_spin_unlock},
+    {"base64_decode", (void *)(uintptr_t)&kb_return_zero},
+    {"complete", (void *)(uintptr_t)&kb_complete},
+    {"crc32_le", (void *)(uintptr_t)&kb_return_zero},
+    {"dma_map_page_attrs", (void *)(uintptr_t)&kb_return_zero},
+    {"dma_map_sgtable", (void *)(uintptr_t)&kb_return_zero},
+    {"dma_opt_mapping_size", (void *)(uintptr_t)&kb_return_zero},
+    {"dma_pci_p2pdma_supported", (void *)(uintptr_t)&kb_return_zero},
+    {"dma_pool_alloc", (void *)(uintptr_t)&kb_dma_pool_alloc},
+    {"dma_pool_create", (void *)(uintptr_t)&kb_dma_pool_create},
+    {"dma_pool_destroy", (void *)(uintptr_t)&kb_dma_pool_destroy},
+    {"dma_pool_free", (void *)(uintptr_t)&kb_dma_pool_free},
+    {"dma_set_coherent_mask", (void *)(uintptr_t)&kb_dma_set_coherent_mask},
+    {"dma_set_mask", (void *)(uintptr_t)&kb_dma_set_mask},
+    {"dma_unmap_page_attrs", (void *)(uintptr_t)&kb_noop},
+    {"dma_unmap_sg_attrs", (void *)(uintptr_t)&kb_noop},
+    {"flush_work", (void *)(uintptr_t)&kb_return_zero},
+    {"fortify_panic", (void *)(uintptr_t)&kb_stack_chk_fail},
+    {"get_random_u32", (void *)(uintptr_t)&kb_return_zero},
+    {"kfree_sensitive", (void *)(uintptr_t)&kb_kfree_sensitive},
+    {"kmalloc_node_trace", (void *)(uintptr_t)&kb_kmalloc_node_trace},
+    {"kmemdup", (void *)(uintptr_t)&kb_kmemdup},
+    {"kstrtobool", (void *)(uintptr_t)&kb_return_zero},
+    {"kstrtoint", (void *)(uintptr_t)&kb_return_zero},
+    {"mempool_alloc", (void *)(uintptr_t)&kb_alloc_stub},
+    {"mempool_create", (void *)(uintptr_t)&kb_alloc_stub},
+    {"mempool_create_node", (void *)(uintptr_t)&kb_alloc_stub},
+    {"mempool_destroy", (void *)(uintptr_t)&kb_noop},
+    {"mempool_free", (void *)(uintptr_t)&kb_noop},
+    {"mempool_kfree", (void *)(uintptr_t)&kb_kfree},
+    {"mempool_kmalloc", (void *)(uintptr_t)&kb_kmalloc},
+    {"mutex_lock", (void *)(uintptr_t)&kb_mutex_lock},
+    {"mutex_trylock", (void *)(uintptr_t)&kb_mutex_trylock},
+    {"mutex_unlock", (void *)(uintptr_t)&kb_mutex_unlock},
+    {"pci_alloc_irq_vectors", (void *)(uintptr_t)&kb_pci_alloc_irq_vectors},
+    {"pci_alloc_irq_vectors_affinity", (void *)(uintptr_t)&kb_pci_alloc_irq_vectors_affinity},
+    {"pci_device_is_present", (void *)(uintptr_t)&kb_pci_device_is_present},
+    {"pci_enable_device_mem", (void *)(uintptr_t)&kb_pci_enable_device_mem},
+    {"pci_free_irq", (void *)(uintptr_t)&kb_pci_free_irq},
+    {"pci_free_irq_vectors", (void *)(uintptr_t)&kb_pci_free_irq_vectors},
+    {"pci_irq_vector", (void *)(uintptr_t)&kb_pci_irq_vector},
+    {"pci_read_config_word", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_release_selected_regions", (void *)(uintptr_t)&kb_pci_release_selected_regions},
+    {"pci_request_irq", (void *)(uintptr_t)&kb_pci_request_irq},
+    {"pci_request_selected_regions", (void *)(uintptr_t)&kb_pci_request_selected_regions},
+    {"pci_restore_state", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_save_state", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_select_bars", (void *)(uintptr_t)&kb_pci_select_bars},
+    {"pcie_aspm_enabled", (void *)(uintptr_t)&kb_return_zero},
+    {"pcie_reset_flr", (void *)(uintptr_t)&kb_return_zero},
+    {"sg_init_table", (void *)(uintptr_t)&kb_sg_init_one},
+    {"sg_next", (void *)(uintptr_t)&kb_return_zero},
+    {"sysfs_streq", (void *)(uintptr_t)&kb_return_zero},
+    {"sysfs_update_group", (void *)(uintptr_t)&kb_return_zero},
+    {"wait_for_completion", (void *)(uintptr_t)&kb_wait_for_completion},
+    {"wait_for_completion_io_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
+    {"strlen", (void *)(uintptr_t)&strlen},
+    {"strncmp", (void *)(uintptr_t)&strncmp},
+    {"strnlen", (void *)(uintptr_t)&strnlen},
+    {"strrchr", (void *)(uintptr_t)&strrchr},
+    {"sscanf", (void *)(uintptr_t)&sscanf},
+    {"memset", (void *)(uintptr_t)&memset},
+    {"memcpy", (void *)(uintptr_t)&memcpy},
+    {"memcmp", (void *)(uintptr_t)&memcmp},
+    {"strcmp", (void *)(uintptr_t)&strcmp},
+    {"sprintf", (void *)(uintptr_t)&sprintf},
+    {"__SCK__tp_func_block_bio_complete", (void *)(uintptr_t)&kb_noop},
+    {"__SCK__tp_func_block_bio_remap", (void *)(uintptr_t)&kb_noop},
+    {"__SCT__tp_func_block_bio_complete", (void *)(uintptr_t)&kb_noop},
+    {"__SCT__tp_func_block_bio_remap", (void *)(uintptr_t)&kb_noop},
+    {"__blk_alloc_disk", (void *)(uintptr_t)&kb_alloc_stub},
+    {"__blk_mq_alloc_disk", (void *)(uintptr_t)&kb_alloc_stub},
+    {"__blk_rq_map_sg", (void *)(uintptr_t)&kb_return_zero},
+    {"__free_pages", (void *)(uintptr_t)&kb_noop},
+    {"__io_uring_cmd_do_in_task", (void *)(uintptr_t)&kb_return_zero},
+    {"__node_distance", (void *)(uintptr_t)&kb_return_zero},
+    {"__put_user_4", (void *)(uintptr_t)&kb_return_zero},
+    {"__put_user_8", (void *)(uintptr_t)&kb_return_zero},
+    {"__srcu_read_lock", (void *)(uintptr_t)&kb_return_zero},
+    {"__srcu_read_unlock", (void *)(uintptr_t)&kb_noop},
+    {"__trace_trigger_soft_disabled", (void *)(uintptr_t)&kb_return_zero},
+    {"__tracepoint_block_bio_complete", (void *)(uintptr_t)&kb_noop},
+    {"__tracepoint_block_bio_remap", (void *)(uintptr_t)&kb_noop},
+    {"__vmalloc", (void *)(uintptr_t)&kb_kzalloc},
+    {"__wake_up", (void *)(uintptr_t)&kb_noop},
+    {"_copy_from_user", (void *)(uintptr_t)&kb_return_zero},
+    {"_find_first_bit", (void *)(uintptr_t)&kb_return_zero},
+    {"acpi_storage_d3", (void *)(uintptr_t)&kb_return_zero},
+    {"add_uevent_var", (void *)(uintptr_t)&kb_return_zero},
+    {"alloc_chrdev_region", (void *)(uintptr_t)&kb_return_zero},
+    {"alloc_pages", (void *)(uintptr_t)&kb_alloc_stub},
+    {"alloc_workqueue", (void *)(uintptr_t)&kb_alloc_stub},
+    {"bdev_disk_changed", (void *)(uintptr_t)&kb_return_zero},
+    {"bdev_end_io_acct", (void *)(uintptr_t)&kb_noop},
+    {"bdev_start_io_acct", (void *)(uintptr_t)&kb_return_zero},
+    {"bio_associate_blkg", (void *)(uintptr_t)&kb_noop},
+    {"bio_endio", (void *)(uintptr_t)&kb_noop},
+    {"bio_integrity_map_user", (void *)(uintptr_t)&kb_return_zero},
+    {"bio_split_to_limits", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_execute_rq", (void *)(uintptr_t)&kb_blk_execute_rq},
+    {"blk_execute_rq_nowait", (void *)(uintptr_t)&kb_blk_execute_rq},
+    {"blk_freeze_queue_start", (void *)(uintptr_t)&kb_noop},
+    {"blk_integrity_register", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_integrity_unregister", (void *)(uintptr_t)&kb_noop},
+    {"blk_mark_disk_dead", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_alloc_request", (void *)(uintptr_t)&kb_blk_mq_alloc_request},
+    {"blk_mq_alloc_request_hctx", (void *)(uintptr_t)&kb_blk_mq_alloc_request},
+    {"blk_mq_alloc_tag_set", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_complete_request", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_complete_request_remote", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_delay_kick_requeue_list", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_destroy_queue", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_end_request", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_end_request_batch", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_free_request", (void *)(uintptr_t)&kb_blk_mq_free_request},
+    {"blk_mq_free_tag_set", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_freeze_queue", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_freeze_queue_wait", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_freeze_queue_wait_timeout", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_init_queue", (void *)(uintptr_t)&kb_blk_mq_init_queue},
+    {"blk_mq_map_queues", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_pci_map_queues", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_quiesce_queue", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_quiesce_tagset", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_requeue_request", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_start_request", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_tagset_busy_iter", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_tagset_wait_completed_request", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_unfreeze_queue", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_unquiesce_queue", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_unquiesce_tagset", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_update_nr_hw_queues", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_wait_quiesce_done", (void *)(uintptr_t)&kb_noop},
+    {"blk_op_str", (void *)(uintptr_t)&kb_empty_string},
+    {"blk_put_queue", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_chunk_sectors", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_dma_alignment", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_flag_set", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_io_min", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_io_opt", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_logical_block_size", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_max_discard_sectors", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_max_discard_segments", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_max_hw_sectors", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_max_segments", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_max_write_zeroes_sectors", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_max_zone_append_sectors", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_physical_block_size", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_virt_boundary", (void *)(uintptr_t)&kb_noop},
+    {"blk_queue_write_cache", (void *)(uintptr_t)&kb_noop},
+    {"blk_revalidate_disk_zones", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_rq_is_poll", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_rq_map_kern", (void *)(uintptr_t)&kb_blk_rq_map_kern},
+    {"blk_rq_map_user_io", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_rq_map_user_iov", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_rq_poll", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_rq_unmap_user", (void *)(uintptr_t)&kb_noop},
+    {"blk_set_stacking_limits", (void *)(uintptr_t)&kb_noop},
+    {"blk_stack_limits", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_status_to_errno", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_steal_bios", (void *)(uintptr_t)&kb_noop},
+    {"blk_sync_queue", (void *)(uintptr_t)&kb_noop},
+    {"blkdev_compat_ptr_ioctl", (void *)(uintptr_t)&kb_return_zero},
+    {"bpf_trace_run1", (void *)(uintptr_t)&kb_noop},
+    {"bpf_trace_run2", (void *)(uintptr_t)&kb_noop},
+    {"bpf_trace_run3", (void *)(uintptr_t)&kb_noop},
+    {"cancel_delayed_work_sync", (void *)(uintptr_t)&kb_return_zero},
+    {"cancel_work_sync", (void *)(uintptr_t)&kb_return_zero},
+    {"capable", (void *)(uintptr_t)&kb_return_zero},
+    {"cdev_device_add", (void *)(uintptr_t)&kb_return_zero},
+    {"cdev_device_del", (void *)(uintptr_t)&kb_noop},
+    {"cdev_init", (void *)(uintptr_t)&kb_noop},
+    {"class_create", (void *)(uintptr_t)&kb_alloc_stub},
+    {"class_destroy", (void *)(uintptr_t)&kb_noop},
+    {"cleanup_srcu_struct", (void *)(uintptr_t)&kb_noop},
+    {"compat_ptr_ioctl", (void *)(uintptr_t)&kb_return_zero},
+    {"crypto_alloc_kpp", (void *)(uintptr_t)&kb_alloc_stub},
+    {"crypto_alloc_shash", (void *)(uintptr_t)&kb_alloc_stub},
+    {"crypto_destroy_tfm", (void *)(uintptr_t)&kb_noop},
+    {"crypto_req_done", (void *)(uintptr_t)&kb_noop},
+    {"crypto_shash_final", (void *)(uintptr_t)&kb_return_zero},
+    {"crypto_shash_setkey", (void *)(uintptr_t)&kb_return_zero},
+    {"crypto_shash_tfm_digest", (void *)(uintptr_t)&kb_return_zero},
+    {"crypto_shash_update", (void *)(uintptr_t)&kb_return_zero},
+    {"del_gendisk", (void *)(uintptr_t)&kb_noop},
+    {"delayed_work_timer_fn", (void *)(uintptr_t)&kb_noop},
+    {"destroy_workqueue", (void *)(uintptr_t)&kb_noop},
+    {"dev_pm_qos_expose_latency_tolerance", (void *)(uintptr_t)&kb_return_zero},
+    {"dev_pm_qos_hide_latency_tolerance", (void *)(uintptr_t)&kb_noop},
+    {"dev_pm_qos_update_user_latency_tolerance", (void *)(uintptr_t)&kb_return_zero},
+    {"dev_set_name", (void *)(uintptr_t)&kb_return_zero},
+    {"device_add", (void *)(uintptr_t)&kb_return_zero},
+    {"device_add_disk", (void *)(uintptr_t)&kb_return_zero},
+    {"device_del", (void *)(uintptr_t)&kb_noop},
+    {"device_initialize", (void *)(uintptr_t)&kb_noop},
+    {"device_remove_file_self", (void *)(uintptr_t)&kb_return_zero},
+    {"disable_irq", (void *)(uintptr_t)&kb_disable_irq_nosync},
+    {"disk_set_zoned", (void *)(uintptr_t)&kb_return_zero},
+    {"disk_uevent", (void *)(uintptr_t)&kb_noop},
+    {"disk_update_readahead", (void *)(uintptr_t)&kb_noop},
+    {"dmi_match", (void *)(uintptr_t)&kb_return_zero},
+    {"ext_pi_type1_crc64", (void *)(uintptr_t)&kb_return_zero},
+    {"ext_pi_type3_crc64", (void *)(uintptr_t)&kb_return_zero},
+    {"finish_wait", (void *)(uintptr_t)&kb_noop},
+    {"free_opal_dev", (void *)(uintptr_t)&kb_noop},
+    {"get_device", (void *)(uintptr_t)&kb_identity_ptr},
+    {"hwmon_device_register_with_info", (void *)(uintptr_t)&kb_hwmon_device_register_with_info},
+    {"hwmon_device_unregister", (void *)(uintptr_t)&kb_noop},
+    {"ida_alloc_range", (void *)(uintptr_t)&kb_return_zero},
+    {"ida_destroy", (void *)(uintptr_t)&kb_noop},
+    {"ida_free", (void *)(uintptr_t)&kb_noop},
+    {"init_opal_dev", (void *)(uintptr_t)&kb_return_zero},
+    {"init_srcu_struct", (void *)(uintptr_t)&kb_return_zero},
+    {"init_timer_key", (void *)(uintptr_t)&kb_noop},
+    {"init_wait_entry", (void *)(uintptr_t)&kb_noop},
+    {"io_uring_cmd_done", (void *)(uintptr_t)&kb_noop},
+    {"io_uring_cmd_import_fixed", (void *)(uintptr_t)&kb_return_zero},
+    {"ioremap", (void *)(uintptr_t)&kb_ioremap},
+    {"iounmap", (void *)(uintptr_t)&kb_iounmap},
+    {"jiffies_to_msecs", (void *)(uintptr_t)&kb_return_zero},
+    {"kasprintf", (void *)(uintptr_t)&kb_return_zero},
+    {"kblockd_schedule_work", (void *)(uintptr_t)&kb_return_zero},
+    {"kfree_const", (void *)(uintptr_t)&kb_kfree},
+    {"kmem_cache_create", (void *)(uintptr_t)&kb_alloc_stub},
+    {"kmem_cache_destroy", (void *)(uintptr_t)&kb_noop},
+    {"kobject_uevent_env", (void *)(uintptr_t)&kb_return_zero},
+    {"ktime_get_with_offset", (void *)(uintptr_t)&kb_return_zero},
+    {"kvfree", (void *)(uintptr_t)&kb_kfree},
+    {"kvmalloc_node", (void *)(uintptr_t)&kb_kzalloc},
+    {"memchr_inv", (void *)(uintptr_t)&kb_return_zero},
+    {"mempool_alloc_slab", (void *)(uintptr_t)&kb_alloc_stub},
+    {"mempool_free_slab", (void *)(uintptr_t)&kb_noop},
+    {"memremap_compat_align", (void *)(uintptr_t)&kb_return_zero},
+    {"mod_timer", (void *)(uintptr_t)&kb_return_zero},
+    {"module_put", (void *)(uintptr_t)&kb_noop},
+    {"msleep", (void *)(uintptr_t)&kb_noop},
+    {"numa_node", (void *)(uintptr_t)&kb_return_zero},
+    {"opal_unlock_from_suspend", (void *)(uintptr_t)&kb_return_zero},
+    {"param_get_uint", (void *)(uintptr_t)&kb_return_zero},
+    {"param_set_uint", (void *)(uintptr_t)&kb_return_zero},
+    {"param_set_uint_minmax", (void *)(uintptr_t)&kb_return_zero},
+    {"pcibios_resource_to_bus", (void *)(uintptr_t)&kb_noop},
+    {"pci_alloc_p2pmem", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_free_p2pmem", (void *)(uintptr_t)&kb_noop},
+    {"pci_load_saved_state", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_p2pdma_add_resource", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_p2pmem_publish", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_p2pmem_virt_to_bus", (void *)(uintptr_t)&kb_return_zero},
+    {"pci_sriov_configure_simple", (void *)(uintptr_t)&kb_return_zero},
+    {"perf_trace_buf_alloc", (void *)(uintptr_t)&kb_alloc_stub},
+    {"perf_trace_run_bpf_submit", (void *)(uintptr_t)&kb_noop},
+    {"prepare_to_wait_event", (void *)(uintptr_t)&kb_return_zero},
+    {"put_device", (void *)(uintptr_t)&kb_noop},
+    {"put_disk", (void *)(uintptr_t)&kb_noop},
+    {"queue_delayed_work_on", (void *)(uintptr_t)&kb_return_one},
+    {"queue_work_on", (void *)(uintptr_t)&kb_return_one},
+    {"refcount_warn_saturate", (void *)(uintptr_t)&kb_noop},
+    {"schedule", (void *)(uintptr_t)&kb_noop},
+    {"sed_ioctl", (void *)(uintptr_t)&kb_return_zero},
+    {"set_capacity", (void *)(uintptr_t)&kb_noop},
+    {"set_capacity_and_notify", (void *)(uintptr_t)&kb_noop},
+    {"set_disk_ro", (void *)(uintptr_t)&kb_noop},
+    {"strscpy", (void *)(uintptr_t)&kb_return_zero},
+    {"submit_bio_noacct", (void *)(uintptr_t)&kb_noop},
+    {"synchronize_rcu", (void *)(uintptr_t)&kb_noop},
+    {"synchronize_srcu", (void *)(uintptr_t)&kb_noop},
+    {"sysfs_create_link", (void *)(uintptr_t)&kb_return_zero},
+    {"sysfs_remove_link", (void *)(uintptr_t)&kb_noop},
+    {"t10_pi_type1_crc", (void *)(uintptr_t)&kb_return_zero},
+    {"t10_pi_type3_crc", (void *)(uintptr_t)&kb_return_zero},
+    {"timer_delete_sync", (void *)(uintptr_t)&kb_return_zero},
+    {"trace_event_buffer_commit", (void *)(uintptr_t)&kb_noop},
+    {"trace_event_buffer_reserve", (void *)(uintptr_t)&kb_alloc_stub},
+    {"trace_event_printf", (void *)(uintptr_t)&kb_noop},
+    {"trace_event_raw_init", (void *)(uintptr_t)&kb_return_zero},
+    {"trace_event_reg", (void *)(uintptr_t)&kb_return_zero},
+    {"trace_handle_return", (void *)(uintptr_t)&kb_return_zero},
+    {"trace_print_symbols_seq", (void *)(uintptr_t)&kb_return_zero},
+    {"trace_raw_output_prep", (void *)(uintptr_t)&kb_return_zero},
+    {"trace_seq_printf", (void *)(uintptr_t)&kb_return_zero},
+    {"trace_seq_putc", (void *)(uintptr_t)&kb_noop},
+    {"try_module_get", (void *)(uintptr_t)&kb_return_one},
+    {"unregister_chrdev_region", (void *)(uintptr_t)&kb_noop},
+    {"usleep_range_state", (void *)(uintptr_t)&kb_noop},
+    {"xa_destroy", (void *)(uintptr_t)&kb_noop},
+    {"xa_erase", (void *)(uintptr_t)&kb_return_zero},
+    {"xa_find", (void *)(uintptr_t)&kb_return_zero},
+    {"xa_find_after", (void *)(uintptr_t)&kb_return_zero},
+    {"xa_load", (void *)(uintptr_t)&kb_return_zero},
+    {"xa_store", (void *)(uintptr_t)&kb_return_zero},
 };
 
 _Static_assert(
@@ -435,8 +747,17 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     if (strcmp(name, "param_ops_bool") == 0) {
         return module->shim_param_ops_bool;
     }
+    if (strcmp(name, "param_ops_byte") == 0) {
+        return module->shim_param_ops_byte;
+    }
+    if (strcmp(name, "param_ops_ulong") == 0) {
+        return module->shim_param_ops_ulong;
+    }
     if (strcmp(name, "__cpu_possible_mask") == 0) {
         return module->shim_cpu_possible_mask;
+    }
+    if (strcmp(name, "__cpu_online_mask") == 0) {
+        return module->shim_cpu_online_mask;
     }
     if (strcmp(name, "nr_cpu_ids") == 0) {
         return module->shim_nr_cpu_ids;
@@ -449,6 +770,16 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     }
     if (strcmp(name, "panic_notifier_list") == 0) {
         return module->shim_panic_notifier_list;
+    }
+    if (strcmp(name, "pcpu_hot") == 0) {
+        return (void *)(uintptr_t)KB_LOCAL_GS_PCPU_HOT_OFFSET;
+    }
+    if (strcmp(name, "system_wq") == 0 || strcmp(name, "node_states") == 0 || strcmp(name, "page_offset_base") == 0 ||
+        strcmp(name, "phys_base") == 0 || strcmp(name, "vmemmap_base") == 0 ||
+        strcmp(name, "jiffies") == 0 || strcmp(name, "uuid_null") == 0 ||
+        strcmp(name, "pm_suspend_global_flags") == 0)
+    {
+        return module->shim_misc_data;
     }
     return lookup_shim_symbol(name);
 }
@@ -648,12 +979,17 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_param_ops_int = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3072;
     module->shim_param_ops_uint = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3136;
     module->shim_param_ops_bool = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3200;
-    module->shim_cpu_possible_mask = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3264;
-    module->shim_nr_cpu_ids = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3280;
-    module->shim_this_cpu_off = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3296;
-    module->shim_pernet_ops_rwsem = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3312;
-    module->shim_panic_notifier_list = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3376;
+    module->shim_param_ops_byte = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3264;
+    module->shim_param_ops_ulong = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3328;
+    module->shim_cpu_possible_mask = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3392;
+    module->shim_cpu_online_mask = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3408;
+    module->shim_nr_cpu_ids = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3424;
+    module->shim_this_cpu_off = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3440;
+    module->shim_pernet_ops_rwsem = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3456;
+    module->shim_panic_notifier_list = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3520;
+    module->shim_misc_data = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3584;
     write_u64le((uint8_t *)module->shim_cpu_possible_mask, 1);
+    write_u64le((uint8_t *)module->shim_cpu_online_mask, 1);
     write_u32le((uint8_t *)module->shim_nr_cpu_ids, 1);
     write_u64le((uint8_t *)module->shim_this_cpu_off, 0);
 
@@ -674,6 +1010,16 @@ static kb_status_t load_sections(kb_module_t *module)
         }
 
         void *memory = (uint8_t *)module->image_base + module->sections[i].offset;
+        if (getenv("KOBOX_TRACE_MODULES") != NULL) {
+            fprintf(
+                stderr,
+                "kobox-loader: section[%zu] %s base=%p offset=0x%llx size=0x%llx\n",
+                i,
+                section.name,
+                memory,
+                (unsigned long long)module->sections[i].offset,
+                (unsigned long long)module->sections[i].size);
+        }
         if (module->sections[i].size == 0) {
             module->sections[i].base = memory;
             continue;
@@ -997,10 +1343,13 @@ static kb_status_t prepare_module(kb_module_t *module)
 
     uint64_t init_address = 0;
     status = find_symbol_address(module, "init_module", &init_address);
-    if (status != KB_OK) {
+    if (status == KB_ERR_NOT_FOUND) {
+        module->init_module = NULL;
+    } else if (status != KB_OK) {
         return status;
+    } else {
+        module->init_module = (int (*)(void))(uintptr_t)init_address;
     }
-    module->init_module = (int (*)(void))(uintptr_t)init_address;
 
     uint64_t cleanup_address = 0;
     status = find_symbol_address(module, "cleanup_module", &cleanup_address);
@@ -1060,13 +1409,24 @@ kb_status_t kb_module_open_image(
     }
 
     *out_module = module;
+    if (getenv("KOBOX_TRACE_MODULES") != NULL) {
+        fprintf(
+            stderr,
+            "kobox-loader: loaded %s base=%p size=0x%llx\n",
+            image->name == NULL ? "(unnamed)" : image->name,
+            module->image_base,
+            (unsigned long long)module->image_size);
+    }
     return KB_OK;
 }
 
 kb_status_t kb_module_call_init(kb_module_t *module, int *out_result)
 {
-    if (module == 0 || module->init_module == 0 || out_result == 0) {
+    if (module == 0 || out_result == 0) {
         return KB_ERR_INVALID;
+    }
+    if (module->init_module == 0) {
+        return KB_ERR_NOT_FOUND;
     }
     unsigned long old_gs = 0;
     kb_status_t status = enter_module_context(module, &old_gs);

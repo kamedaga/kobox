@@ -1,12 +1,28 @@
 #include "kobox/shim.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+enum {
+    KB_LINUX___GFP_ZERO = 0x100u,
+};
+
+static int trace_memory(void)
+{
+    return getenv("KOBOX_TRACE_SHIMS") != NULL;
+}
+
 void *kb_kmalloc(size_t size, unsigned int flags)
 {
-    (void)flags;
-    return malloc(size);
+    void *ptr = malloc(size);
+    if (ptr != NULL && (flags & KB_LINUX___GFP_ZERO) != 0) {
+        memset(ptr, 0, size);
+    }
+    if (trace_memory()) {
+        fprintf(stderr, "kobox-shim: kmalloc size=%zu flags=0x%x ptr=%p\n", size, flags, ptr);
+    }
+    return ptr;
 }
 
 void *kb_kzalloc(size_t size, unsigned int flags)

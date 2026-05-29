@@ -25,6 +25,13 @@ enum {
     KB_VFIO_PCI_CONFIG_SIZE = 4096,
     KB_VFIO_DMA_MAPPING_MAX = 128,
     KB_VFIO_DMA_IOVA_BASE = 0x01000000,
+    KB_PCI_COMMAND_OFFSET = 0x04,
+    KB_PCI_COMMAND_MEMORY = 0x0002,
+    KB_PCI_CLASS_STORAGE = 0x01,
+    KB_PCI_SUBCLASS_NVME = 0x08,
+    KB_PCI_PROGIF_NVME = 0x02,
+    KB_NVME_REG_CC = 0x14,
+    KB_NVME_REG_CSTS = 0x1c,
 };
 
 typedef struct kb_linux_vfio_backend kb_linux_vfio_backend_t;
@@ -62,6 +69,10 @@ struct kb_linux_vfio_backend {
     kb_vfio_dma_mapping_t dma_mappings[KB_VFIO_DMA_MAPPING_MAX];
     struct kb_device device;
 };
+
+static void vfio_quiesce_nvme(kb_linux_vfio_backend_t *vfio);
+static void vfio_disable_irq_index(kb_device_t *device, uint32_t index);
+static void vfio_unmap_all_dma(kb_linux_vfio_backend_t *vfio);
 
 static kb_linux_vfio_backend_t *vfio_from_backend(kb_backend_t *backend)
 {
@@ -313,6 +324,12 @@ static void vfio_destroy(kb_backend_t *backend)
 {
     kb_linux_vfio_backend_t *vfio = vfio_from_backend(backend);
     if (vfio->device_fd >= 0) {
+        vfio_disable_irq_index(&vfio->device, VFIO_PCI_INTX_IRQ_INDEX);
+        vfio_disable_irq_index(&vfio->device, VFIO_PCI_MSI_IRQ_INDEX);
+        vfio_disable_irq_index(&vfio->device, VFIO_PCI_MSIX_IRQ_INDEX);
+        vfio_quiesce_nvme(vfio);
+        (void)ioctl(vfio->device_fd, VFIO_DEVICE_RESET);
+        vfio_unmap_all_dma(vfio);
         close(vfio->device_fd);
     }
     if (vfio->group_fd >= 0) {
@@ -479,6 +496,57 @@ static void vfio_unmap_bar(kb_device_t *device, kb_mmio_region_t *region)
     }
 }
 
+static uint32_t vfio_mmio_read32(void *base, size_t offset)
+{
+    volatile uint32_t *reg = (volatile uint32_t *)((unsigned char *)base + offset);
+    return *reg;
+}
+
+static void vfio_mmio_write32(void *base, size_t offset, uint32_t value)
+{
+    volatile uint32_t *reg = (volatile uint32_t *)((unsigned char *)base + offset);
+    *reg = value;
+}
+
+static void vfio_quiesce_nvme(kb_linux_vfio_backend_t *vfio)
+{
+    if (vfio == NULL) {
+        return;
+    }
+
+    kb_device_t *device = &vfio->device;
+    if (device->pci_id.class_code != KB_PCI_CLASS_STORAGE ||
+        device->pci_id.subclass != KB_PCI_SUBCLASS_NVME ||
+        device->pci_id.prog_if != KB_PCI_PROGIF_NVME)
+    {
+        return;
+    }
+
+    uint16_t command = 0;
+    if (vfio_pci_config_read(device, KB_PCI_COMMAND_OFFSET, &command, sizeof(command)) != KB_OK ||
+        (command & KB_PCI_COMMAND_MEMORY) == 0)
+    {
+        return;
+    }
+
+    kb_mmio_region_t bar;
+    memset(&bar, 0, sizeof(bar));
+    if (vfio_map_bar(device, 0, &bar) != KB_OK || bar.addr == NULL) {
+        return;
+    }
+
+    uint32_t cc = vfio_mmio_read32(bar.addr, KB_NVME_REG_CC);
+    if ((cc & 1u) != 0) {
+        vfio_mmio_write32(bar.addr, KB_NVME_REG_CC, cc & ~1u);
+        for (unsigned i = 0; i < 10000000u; i++) {
+            if ((vfio_mmio_read32(bar.addr, KB_NVME_REG_CSTS) & 1u) == 0) {
+                break;
+            }
+        }
+    }
+    vfio_unmap_bar(device, &bar);
+}
+
 static kb_status_t vfio_dma_map(
     kb_device_t *device,
     void *cpu_addr,
@@ -617,6 +685,86 @@ static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size
     memset(mapping, 0, sizeof(*mapping));
 }
 
+static void vfio_unmap_all_dma(kb_linux_vfio_backend_t *vfio)
+{
+    if (vfio == NULL || vfio->container_fd < 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < KB_VFIO_DMA_MAPPING_MAX; i++) {
+        kb_vfio_dma_mapping_t *mapping = &vfio->dma_mappings[i];
+        if (mapping->size == 0) {
+            continue;
+        }
+
+        struct vfio_iommu_type1_dma_unmap unmap;
+        memset(&unmap, 0, sizeof(unmap));
+        unmap.argsz = sizeof(unmap);
+        unmap.iova = mapping->iova;
+        unmap.size = mapping->size;
+        (void)ioctl(vfio->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
+        memset(mapping, 0, sizeof(*mapping));
+    }
+}
+
+static kb_status_t vfio_irq_info(kb_device_t *device, uint32_t index, struct vfio_irq_info *out_info)
+{
+    if (device == NULL || out_info == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->argsz = sizeof(*out_info);
+    out_info->index = index;
+    if (ioctl(device->device_fd, VFIO_DEVICE_GET_IRQ_INFO, out_info) != 0) {
+        return errno_status();
+    }
+    return KB_OK;
+}
+
+static void vfio_disable_irq_index(kb_device_t *device, uint32_t index)
+{
+    if (device == NULL || device->device_fd < 0) {
+        return;
+    }
+
+    struct vfio_irq_set request;
+    memset(&request, 0, sizeof(request));
+    request.argsz = sizeof(request);
+    request.flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER;
+    request.index = index;
+    request.start = 0;
+    request.count = 0;
+    (void)ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, &request);
+}
+
+static kb_status_t vfio_select_irq(kb_device_t *device, unsigned vector, uint32_t *out_index, uint32_t *out_start)
+{
+    if (device == NULL || out_index == NULL || out_start == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    struct vfio_irq_info msix;
+    kb_status_t status = vfio_irq_info(device, VFIO_PCI_MSIX_IRQ_INDEX, &msix);
+    if (status == KB_OK && vector < msix.count) {
+        *out_index = VFIO_PCI_MSIX_IRQ_INDEX;
+        *out_start = vector;
+        return KB_OK;
+    }
+
+    if (vector == 0) {
+        struct vfio_irq_info intx;
+        status = vfio_irq_info(device, VFIO_PCI_INTX_IRQ_INDEX, &intx);
+        if (status == KB_OK && intx.count > 0) {
+            *out_index = VFIO_PCI_INTX_IRQ_INDEX;
+            *out_start = 0;
+            return KB_OK;
+        }
+    }
+
+    return KB_ERR_UNSUPPORTED;
+}
+
 static kb_status_t vfio_irq_register(
     kb_device_t *device,
     unsigned vector,
@@ -626,9 +774,6 @@ static kb_status_t vfio_irq_register(
 {
     if (device == NULL || handler == NULL || out_irq == NULL) {
         return KB_ERR_INVALID;
-    }
-    if (vector != 0) {
-        return KB_ERR_UNSUPPORTED;
     }
 
     kb_irq_t *irq = calloc(1, sizeof(*irq));
@@ -640,8 +785,14 @@ static kb_status_t vfio_irq_register(
         free(irq);
         return errno_status();
     }
-    irq->index = VFIO_PCI_INTX_IRQ_INDEX;
-    irq->start = 0;
+
+    kb_status_t status = vfio_select_irq(device, vector, &irq->index, &irq->start);
+    if (status != KB_OK) {
+        close(irq->event_fd);
+        free(irq);
+        return status;
+    }
+
     irq->handler = handler;
     irq->ctx = ctx;
 
@@ -656,7 +807,7 @@ static kb_status_t vfio_irq_register(
     memcpy(request->data, &irq->event_fd, sizeof(irq->event_fd));
 
     if (ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, request) != 0) {
-        kb_status_t status = errno_status();
+        status = errno_status();
         close(irq->event_fd);
         free(irq);
         return status;
@@ -666,11 +817,34 @@ static kb_status_t vfio_irq_register(
     return KB_OK;
 }
 
+static void vfio_irq_drain(kb_irq_t *irq)
+{
+    if (irq == NULL || irq->event_fd < 0) {
+        return;
+    }
+
+    for (;;) {
+        uint64_t count = 0;
+        ssize_t read_size = read(irq->event_fd, &count, sizeof(count));
+        if (read_size < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return;
+            }
+            return;
+        }
+        if ((size_t)read_size != sizeof(count)) {
+            return;
+        }
+    }
+}
+
 static void vfio_irq_unregister(kb_device_t *device, kb_irq_t *irq)
 {
     if (device == NULL || irq == NULL) {
         return;
     }
+
+    vfio_irq_drain(irq);
 
     struct vfio_irq_set request;
     memset(&request, 0, sizeof(request));
@@ -680,6 +854,7 @@ static void vfio_irq_unregister(kb_device_t *device, kb_irq_t *irq)
     request.start = irq->start;
     request.count = 0;
     (void)ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, &request);
+    vfio_irq_drain(irq);
     close(irq->event_fd);
     free(irq);
 }
