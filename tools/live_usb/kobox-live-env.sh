@@ -23,6 +23,6 @@ if [ -d "$KOBOX_LIVE_ROOT/lib" ]; then
     export LD_LIBRARY_PATH="$KOBOX_LIVE_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-if [ "$#" -gt 0 ]; then
+if [ "$(basename -- "$0")" = "kobox-live-env.sh" ] && [ "$#" -gt 0 ]; then
     exec "$@"
 fi

@@ -134,6 +134,18 @@ target_compile_options(kobox-smoke PRIVATE
 add_test(NAME kobox-smoke COMMAND kobox-smoke)
 
 add_test(
+    NAME kobox-live-script-args
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/live_script_args.sh
+)
+
+add_test(
+    NAME kobox-nvidia-mock-smoke
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_nvidia_mock_smoke.sh
+)
+
+add_test(
     NAME kobox-linux-sysfs
     COMMAND sh
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_linux_sysfs_smoke.sh

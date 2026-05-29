@@ -49,6 +49,16 @@ static void crash_handler(int signo, siginfo_t *info, void *ucontext)
             info != NULL ? info->si_addr : NULL,
             (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RIP],
             (void *)sp);
+        dprintf(
+            STDERR_FILENO,
+            "kobox-run: rax=%p rbx=%p rcx=%p rdx=%p rdi=%p rsi=%p r12=%p\n",
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RAX],
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RBX],
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RCX],
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RDX],
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RDI],
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RSI],
+            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_R12]);
         if (sp != NULL && getenv("KOBOX_CRASH_STACK") != NULL) {
             for (int i = 0; i < 8; i++) {
                 dprintf(STDERR_FILENO, "kobox-run: stack[%d]=%p\n", i, (void *)sp[i]);
@@ -296,6 +306,19 @@ int main(int argc, char **argv)
     }
 
     printf("init_module returned %d\n", result);
+    if (result != 0) {
+        printf("cleanup_module skipped after failed init_module\n");
+        kb_module_close(module);
+        for (size_t i = dep_count; i > 0; i--) {
+            (void)kb_module_call_cleanup(deps[i - 1].module);
+            kb_module_close(deps[i - 1].module);
+            free(deps[i - 1].data);
+        }
+        kb_free_all_irqs();
+        kb_backend_destroy(backend);
+        free(data);
+        return 0;
+    }
     if (getenv("KOBOX_NVME_IO_SMOKE") != NULL) {
         kb_shim_set_backend(backend);
         int io_result = kb_nvme_io_smoke();

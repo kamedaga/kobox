@@ -40,16 +40,39 @@ download_pkg() {
         return
     fi
     echo "kobox bootstrap: apt download $pkg"
-    (cd "$debs_dir" && apt download "$pkg")
+    (cd "$debs_dir" && apt download "$pkg") || {
+        echo "kobox bootstrap: apt could not download $pkg" >&2
+        return 1
+    }
 }
 
-nvidia_kernel="${KOBOX_NVIDIA_KERNEL:-6.8.0-117-generic}"
+nvidia_kernel="${KOBOX_NVIDIA_KERNEL:-$(uname -r)}"
 nvidia_branch="${KOBOX_NVIDIA_BRANCH:-535}"
 
-download_pkg "linux-objects-nvidia-$nvidia_branch-$nvidia_kernel"
-download_pkg "linux-modules-nvidia-$nvidia_branch-$nvidia_kernel"
-download_pkg "linux-signatures-nvidia-$nvidia_kernel"
-download_pkg "nvidia-kernel-common-$nvidia_branch"
+find_nvidia_module() {
+    for candidate in \
+        "$nvidia_root/lib/modules/$nvidia_kernel/kernel/nvidia-$nvidia_branch/bits/nvidia.ko" \
+        "$nvidia_root/lib/modules/$nvidia_kernel/kernel/nvidia-$nvidia_branch/nvidia.ko" \
+        "$repo_root"/.artifacts/nvidia-*/root/lib/modules/*/kernel/nvidia-*/bits/nvidia.ko \
+        "$repo_root"/.artifacts/nvidia-*/root/lib/modules/*/kernel/nvidia-*/nvidia.ko \
+        /lib/modules/"$nvidia_kernel"/kernel/nvidia-"$nvidia_branch"/bits/nvidia.ko \
+        /lib/modules/"$nvidia_kernel"/kernel/nvidia-"$nvidia_branch"/nvidia.ko
+    do
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+module="$(find_nvidia_module || true)"
+if [ -z "$module" ]; then
+    download_pkg "linux-objects-nvidia-$nvidia_branch-$nvidia_kernel" || true
+    download_pkg "linux-modules-nvidia-$nvidia_branch-$nvidia_kernel" || true
+    download_pkg "linux-signatures-nvidia-$nvidia_kernel" || true
+    download_pkg "nvidia-kernel-common-$nvidia_branch" || true
+fi
 
 echo "kobox bootstrap: extracting NVIDIA modules"
 for deb in "$debs_dir"/*.deb; do
@@ -63,20 +86,11 @@ for deb in "$debs_dir"/*.deb; do
     esac
 done
 
-module=""
-for candidate in \
-    "$nvidia_root/lib/modules/$nvidia_kernel/kernel/nvidia-$nvidia_branch/bits/nvidia.ko" \
-    "$nvidia_root/lib/modules/$nvidia_kernel/kernel/nvidia-$nvidia_branch/nvidia.ko"
-do
-    if [ -f "$candidate" ]; then
-        module="$candidate"
-        break
-    fi
-done
+module="$(find_nvidia_module || true)"
 
 if [ -z "$module" ]; then
     echo "kobox bootstrap: nvidia.ko was not extracted" >&2
-    echo "Check whether Ubuntu apt has linux-objects-nvidia-$nvidia_branch-$nvidia_kernel." >&2
+    echo "Set KOBOX_NVIDIA_KERNEL/KOBOX_NVIDIA_BRANCH, install matching linux-objects-nvidia packages, or place nvidia.ko under .artifacts/nvidia-*/root." >&2
     exit 1
 fi
 
@@ -89,5 +103,4 @@ echo "  module: $module"
 echo ""
 echo "Next on the Live Ubuntu host:"
 echo "  sudo $repo_root/tools/live_usb/kobox-live-nvidia-vfio.sh status"
-echo "  sudo $repo_root/tools/live_usb/kobox-live-nvidia-vfio.sh bind"
 echo "  sudo $repo_root/tools/live_usb/kobox-live-nvidia-vfio.sh run"

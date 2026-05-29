@@ -113,32 +113,7 @@ bind_one_vfio() {
 }
 
 bind_vfio() {
-    require_root
-    ensure_vfio
-    mkdir -p "$state_dir"
-
-    bdf=$(find_nvidia_gpu)
-    group=$(group_for_bdf "$bdf")
-    for peer in /sys/kernel/iommu_groups/"$group"/devices/*; do
-        [ -e "$peer" ] || continue
-        peer_bdf=$(basename "$peer")
-        peer_vendor=$(read_trimmed "$peer/vendor")
-        if [ "$peer_vendor" = "0x10de" ]; then
-            bind_one_vfio "$peer_bdf"
-        fi
-    done
-
-    for peer in /sys/kernel/iommu_groups/"$group"/devices/*; do
-        [ -e "$peer" ] || continue
-        peer_bdf=$(basename "$peer")
-        peer_driver=$(driver_name "$peer_bdf")
-        if [ "$peer_driver" != "none" ] && [ "$peer_driver" != "vfio-pci" ]; then
-            die "IOMMU group $group still has $peer_bdf bound to $peer_driver; group is not VFIO-viable"
-        fi
-    done
-
-    ensure_group_node "$group"
-    echo "kobox-live: bound $bdf to $(driver_name "$bdf"), group=$group"
+    die "runtime GPU bind is intentionally disabled. Reserve the GPU at boot with vfio-pci.ids=vendor:device and use status/run only."
 }
 
 restore_driver() {
@@ -162,9 +137,7 @@ restore_driver() {
     done
 }
 
-run_kobox() {
-    require_root
-    bdf=$(find_nvidia_gpu)
+find_nvidia_module_dir() {
     module_dir="${KOBOX_NVIDIA_MODULE_DIR:-}"
     if [ -z "$module_dir" ]; then
         for candidate in \
@@ -178,9 +151,25 @@ run_kobox() {
             fi
         done
     fi
-    [ -n "$module_dir" ] || die "NVIDIA module directory was not found; run tools/live_usb/bootstrap_ubuntu_clone.sh first"
+    if [ -z "$module_dir" ] || [ ! -f "$module_dir/nvidia.ko" ]; then
+        return 1
+    fi
+    printf '%s\n' "$module_dir"
+}
+
+check_modules() {
+    module_dir=$(find_nvidia_module_dir) ||
+        die "NVIDIA module directory was not found; run tools/live_usb/bootstrap_ubuntu_clone.sh first"
+    echo "kobox-live: nvidia module directory=$module_dir"
+    echo "kobox-live: nvidia module=$module_dir/nvidia.ko"
+}
+
+run_kobox() {
+    require_root
+    bdf=$(find_nvidia_gpu)
+    module_dir=$(find_nvidia_module_dir) ||
+        die "NVIDIA module directory was not found; run tools/live_usb/bootstrap_ubuntu_clone.sh first"
     module="$module_dir/nvidia.ko"
-    [ -f "$module" ] || die "missing nvidia.ko: $module"
     [ "$(driver_name "$bdf")" = "vfio-pci" ] || die "$bdf is not bound to vfio-pci; run: $0 bind"
 
     kobox-ls-devices vfio "$bdf"
@@ -195,7 +184,9 @@ case "${1:-status}" in
         ;;
     bind)
         bind_vfio
-        show_status
+        ;;
+    check-modules)
+        check_modules
         ;;
     run)
         run_kobox
@@ -205,7 +196,7 @@ case "${1:-status}" in
         show_status
         ;;
     *)
-        echo "usage: $0 [status|bind|run|restore]" >&2
+        echo "usage: $0 [status|check-modules|run|restore]" >&2
         exit 1
         ;;
 esac

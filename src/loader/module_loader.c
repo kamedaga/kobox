@@ -1287,9 +1287,10 @@ static kb_status_t load_sections(kb_module_t *module)
             module->shim_symbol_stubs + (i * KB_LOCAL_SHIM_STUB_SIZE),
             shim_symbols[i].address);
     }
-    write_u64le(
-        (uint8_t *)module->shim_pv_ops + 0xec,
-        (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "crc32_le"));
+    const uint64_t pv_return_zero = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "crc32_le");
+    write_u64le((uint8_t *)module->shim_pv_ops + 0xb0, pv_return_zero);
+    write_u64le((uint8_t *)module->shim_pv_ops + 0xb8, pv_return_zero);
+    write_u64le((uint8_t *)module->shim_pv_ops + 0xf0, pv_return_zero);
 
     for (size_t i = 0; i < module->section_count; i++) {
         kb_elf_section_t section;
