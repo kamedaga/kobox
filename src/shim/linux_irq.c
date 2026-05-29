@@ -18,6 +18,7 @@ typedef struct shim_irq {
     int (*thread_fn)(int, void *);
     kb_device_t *device;
     kb_irq_t *backend_irq;
+    unsigned long kernel_gs;
     struct shim_irq *next;
 } shim_irq_t;
 
@@ -35,11 +36,16 @@ static kb_status_t first_device(kb_backend_t *backend, kb_device_t **out_device)
 static void irq_trampoline(void *ctx)
 {
     shim_irq_t *irq = ctx;
+    unsigned long old_gs = 0;
+    int has_gs = kb_shim_enter_kernel_gs(irq->kernel_gs, &old_gs) == 0;
     if (irq->handler != NULL) {
         (void)irq->handler((int)irq->irq, irq->dev_id);
     }
     if (irq->thread_fn != NULL) {
         (void)irq->thread_fn((int)irq->irq, irq->dev_id);
+    }
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
     }
 }
 
@@ -73,6 +79,7 @@ int kb_request_threaded_irq(
     entry->handler = handler;
     entry->thread_fn = thread_fn;
     entry->device = device;
+    entry->kernel_gs = kb_shim_current_kernel_gs();
 
     const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
     status = ops->irq_register(device, irq, irq_trampoline, entry, &entry->backend_irq);
@@ -149,6 +156,27 @@ int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
         entry->thread_fn = thread_fn;
         if (trace_irq_enabled()) {
             fprintf(stderr, "kobox irq: wait dev_id=%p status=%d\n", dev_id, status);
+        }
+        return status == KB_OK ? 0 : -110;
+    }
+    return -19;
+}
+
+int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
+{
+    for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
+        if (entry->dev_id != dev_id) {
+            continue;
+        }
+
+        const kb_backend_ops_t *ops = kb_backend_get_ops(kb_shim_current_backend());
+        if (ops == NULL || ops->irq_wait == NULL) {
+            return -95;
+        }
+
+        kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
+        if (trace_irq_enabled()) {
+            fprintf(stderr, "kobox irq: handle dev_id=%p status=%d\n", dev_id, status);
         }
         return status == KB_OK ? 0 : -110;
     }

@@ -15,6 +15,9 @@ void kb_kfree(void *ptr);
 int kb_printk(const char *fmt, ...);
 
 void kb_shim_set_backend(kb_backend_t *backend);
+unsigned long kb_shim_current_kernel_gs(void);
+int kb_shim_enter_kernel_gs(unsigned long kernel_gs, unsigned long *out_old_gs);
+void kb_shim_leave_kernel_gs(unsigned long old_gs);
 
 int kb_request_threaded_irq(
     unsigned int irq,
@@ -26,6 +29,7 @@ int kb_request_threaded_irq(
 void kb_free_irq(unsigned int irq, void *dev_id);
 void kb_free_all_irqs(void);
 int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
+int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
 
 void *kb_dma_alloc_attrs(void *dev, size_t size, uint64_t *dma_handle, unsigned int flags, unsigned long attrs);
 void kb_dma_free_attrs(void *dev, size_t size, void *cpu_addr, uint64_t dma_handle, unsigned long attrs);
@@ -169,6 +173,10 @@ void *kb_blk_mq_init_queue(void *tag_set);
 void *kb_blk_mq_alloc_request(void *queue, unsigned int op, unsigned int flags);
 int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int length, unsigned int gfp);
 int kb_blk_execute_rq(void *request, int at_head);
+void kb_blk_mq_complete_request(void *request);
+int kb_blk_mq_complete_request_remote(void *request);
+void kb_blk_mq_end_request(void *request, unsigned int status);
+void kb_blk_mq_end_request_batch(void *batch);
 void kb_blk_mq_free_request(void *request);
 int kb_nvme_io_smoke(void);
 void *kb_hwmon_device_register_with_info(void *dev, const char *name, void *data, const void *chip, const void *groups);

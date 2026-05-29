@@ -110,6 +110,8 @@ static void kb_noop(void)
 {
 }
 
+static unsigned char kb_tracepoint_disabled[128];
+
 static const shim_symbol_t shim_symbols[] = {
     {"__fentry__", (void *)(uintptr_t)&kb_noop},
     {"__x86_return_thunk", (void *)(uintptr_t)&kb_noop},
@@ -298,8 +300,10 @@ static const shim_symbol_t shim_symbols[] = {
     {"sprintf", (void *)(uintptr_t)&sprintf},
     {"__SCK__tp_func_block_bio_complete", (void *)(uintptr_t)&kb_noop},
     {"__SCK__tp_func_block_bio_remap", (void *)(uintptr_t)&kb_noop},
+    {"__SCK__tp_func_nvme_sq", (void *)(uintptr_t)&kb_noop},
     {"__SCT__tp_func_block_bio_complete", (void *)(uintptr_t)&kb_noop},
     {"__SCT__tp_func_block_bio_remap", (void *)(uintptr_t)&kb_noop},
+    {"__SCT__tp_func_nvme_sq", (void *)(uintptr_t)&kb_noop},
     {"__blk_alloc_disk", (void *)(uintptr_t)&kb_alloc_stub},
     {"__blk_mq_alloc_disk", (void *)(uintptr_t)&kb_alloc_stub},
     {"__blk_rq_map_sg", (void *)(uintptr_t)&kb_return_zero},
@@ -311,8 +315,9 @@ static const shim_symbol_t shim_symbols[] = {
     {"__srcu_read_lock", (void *)(uintptr_t)&kb_return_zero},
     {"__srcu_read_unlock", (void *)(uintptr_t)&kb_noop},
     {"__trace_trigger_soft_disabled", (void *)(uintptr_t)&kb_return_zero},
-    {"__tracepoint_block_bio_complete", (void *)(uintptr_t)&kb_noop},
-    {"__tracepoint_block_bio_remap", (void *)(uintptr_t)&kb_noop},
+    {"__tracepoint_block_bio_complete", (void *)(uintptr_t)&kb_tracepoint_disabled},
+    {"__tracepoint_block_bio_remap", (void *)(uintptr_t)&kb_tracepoint_disabled},
+    {"__tracepoint_nvme_sq", (void *)(uintptr_t)&kb_tracepoint_disabled},
     {"__vmalloc", (void *)(uintptr_t)&kb_kzalloc},
     {"__wake_up", (void *)(uintptr_t)&kb_noop},
     {"_copy_from_user", (void *)(uintptr_t)&kb_return_zero},
@@ -338,12 +343,12 @@ static const shim_symbol_t shim_symbols[] = {
     {"blk_mq_alloc_request", (void *)(uintptr_t)&kb_blk_mq_alloc_request},
     {"blk_mq_alloc_request_hctx", (void *)(uintptr_t)&kb_blk_mq_alloc_request},
     {"blk_mq_alloc_tag_set", (void *)(uintptr_t)&kb_return_zero},
-    {"blk_mq_complete_request", (void *)(uintptr_t)&kb_noop},
-    {"blk_mq_complete_request_remote", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_complete_request", (void *)(uintptr_t)&kb_blk_mq_complete_request},
+    {"blk_mq_complete_request_remote", (void *)(uintptr_t)&kb_blk_mq_complete_request_remote},
     {"blk_mq_delay_kick_requeue_list", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_destroy_queue", (void *)(uintptr_t)&kb_noop},
-    {"blk_mq_end_request", (void *)(uintptr_t)&kb_return_zero},
-    {"blk_mq_end_request_batch", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_end_request", (void *)(uintptr_t)&kb_blk_mq_end_request},
+    {"blk_mq_end_request_batch", (void *)(uintptr_t)&kb_blk_mq_end_request_batch},
     {"blk_mq_free_request", (void *)(uintptr_t)&kb_blk_mq_free_request},
     {"blk_mq_free_tag_set", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_freeze_queue", (void *)(uintptr_t)&kb_noop},
