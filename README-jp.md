@@ -11,8 +11,8 @@ kobox はプリコンパイル済みの Linux カーネルモジュール (`.ko`
 ## 設計目標
 
 - 既存の `.ko` binary を再コンパイルなしで動かす。
-- Linux 互換 shim は portable に保ち、libc ベースで実装する。
-- OS 固有の device access は backend API の内側に閉じ込める。
+- shimはlibc依存のみ。
+- OS 固有の device access は backend API の内側に。
 - Linux、PachaOS、OpenBSD の対応を shim の書き換えではなく backend 実装にする。
 - portable backend を増やす前に、Linux native driver との差分と overhead を測る。
 
@@ -67,11 +67,12 @@ ctest --test-dir .artifacts/build
 
 ## ロードマップ
 
-1. NVMe — 読み書きや負荷のある処理に対応完了💕
+1. NVMe — 対応完了
 2. USB (xHCI) — USB HID が bind し、subsystem/input に device 登録
 3. Network (e1000e / r8169) — PCI + DMA shim を流用
 4. SATA (AHCI) — NVMe とストレージ shim を共通化
 5. NVIDIA GPU — 一部重要な関数が未実装だが初期化に成功
+
 
 
 ## ライセンス

@@ -87,7 +87,8 @@ typedef struct shim_linux_request {
     kb_dma_dir_t dma_dir;
     kb_dma_dir_t prp_list_dma_dir;
     const kb_linux_block_driver_ops_t *driver_ops;
-    unsigned char reserved_a40[KB_SHIM_REQUEST_SIZE - 0xa40];
+    uint32_t started;
+    unsigned char reserved_a44[KB_SHIM_REQUEST_SIZE - 0xa44];
 } shim_linux_request_t;
 
 _Static_assert(offsetof(shim_linux_request_t, hctx) == KB_LINUX_REQUEST_HCTX_OFFSET, "request.hctx offset");
@@ -109,6 +110,7 @@ _Static_assert(offsetof(shim_linux_request_t, prp_list_dma) == KB_SHIM_REQUEST_P
 _Static_assert(offsetof(shim_linux_request_t, prp_list_len) == KB_SHIM_REQUEST_PRP_LIST_LEN_OFFSET, "shim prp_list_len offset");
 _Static_assert(offsetof(shim_linux_request_t, owns_queue) == KB_SHIM_REQUEST_OWNS_QUEUE_OFFSET, "shim owns_queue offset");
 _Static_assert(offsetof(shim_linux_request_t, driver_ops) == 0xa38, "shim driver_ops offset");
+_Static_assert(offsetof(shim_linux_request_t, started) == 0xa40, "shim started offset");
 _Static_assert(sizeof(shim_linux_request_t) == KB_SHIM_REQUEST_SIZE, "shim request size");
 _Static_assert(offsetof(shim_linux_hctx_t, driver_data) == 0xc8, "hctx.driver_data offset");
 _Static_assert(offsetof(shim_linux_queue_data_t, rq) == 0x00, "queue_data.rq offset");
@@ -336,6 +338,11 @@ static void *shim_blk_alloc_disk_with_queue(void *queue)
 
     write_ptr((unsigned char *)disk + KB_LINUX_6_8_GENDISK_PART0_OFFSET, part0);
     write_ptr((unsigned char *)disk + KB_LINUX_6_8_GENDISK_QUEUE_OFFSET, queue);
+    if (kb_block_subsystem_disk_attach(disk, queue, part0) != 0) {
+        kb_block_subsystem_object_free(part0);
+        kb_block_subsystem_object_free(disk);
+        return NULL;
+    }
     return disk;
 }
 
@@ -649,6 +656,17 @@ int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int le
     return rq->driver_ops->map_kernel_buffer(request, buffer, length, gfp);
 }
 
+void kb_blk_mq_start_request(void *request)
+{
+    shim_linux_request_t *rq = request;
+    if (rq == NULL) {
+        return;
+    }
+    rq->started = 1;
+    rq->completed = 0;
+    rq->end_status = 0;
+}
+
 void kb_blk_mq_complete_request(void *request)
 {
     kb_linux_block_request_mark_complete(request, 0);
@@ -756,4 +774,148 @@ int kb_blk_execute_rq(void *request, int at_head)
         return rq->end_status == 0 ? 0 : -5;
     }
     return -95;
+}
+
+int kb_blk_status_to_errno(unsigned int status)
+{
+    switch (status) {
+    case 0:
+        return 0;
+    case 1:
+        return -95;
+    case 2:
+        return -110;
+    case 3:
+        return -28;
+    case 4:
+        return -67;
+    case 5:
+        return -121;
+    case 6:
+        return -52;
+    case 7:
+        return -61;
+    case 8:
+        return -84;
+    case 9:
+        return -12;
+    case 10:
+        return -16;
+    case 11:
+        return -11;
+    case 16:
+        return -19;
+    default:
+        return -5;
+    }
+}
+
+void kb_blk_put_queue(void *queue)
+{
+    kb_block_subsystem_queue_put(queue);
+}
+
+void kb_blk_queue_chunk_sectors(void *queue, unsigned int sectors)
+{
+    kb_block_subsystem_queue_set_chunk_sectors(queue, sectors);
+}
+
+void kb_blk_queue_dma_alignment(void *queue, int mask)
+{
+    kb_block_subsystem_queue_set_dma_alignment(queue, (uint32_t)mask);
+}
+
+void kb_blk_queue_flag_set(unsigned int flag, void *queue)
+{
+    kb_block_subsystem_queue_flag_set(queue, flag);
+}
+
+void kb_blk_queue_io_min(void *queue, unsigned int size)
+{
+    kb_block_subsystem_queue_set_io_min(queue, size);
+}
+
+void kb_blk_queue_io_opt(void *queue, unsigned int size)
+{
+    kb_block_subsystem_queue_set_io_opt(queue, size);
+}
+
+void kb_blk_queue_logical_block_size(void *queue, unsigned int size)
+{
+    kb_block_subsystem_queue_set_logical_block_size(queue, size);
+}
+
+void kb_blk_queue_max_discard_sectors(void *queue, unsigned int sectors)
+{
+    kb_block_subsystem_queue_set_max_discard_sectors(queue, sectors);
+}
+
+void kb_blk_queue_max_discard_segments(void *queue, unsigned int segments)
+{
+    kb_block_subsystem_queue_set_max_discard_segments(queue, segments);
+}
+
+void kb_blk_queue_max_hw_sectors(void *queue, unsigned int sectors)
+{
+    kb_block_subsystem_queue_set_max_hw_sectors(queue, sectors);
+}
+
+void kb_blk_queue_max_segments(void *queue, unsigned int segments)
+{
+    kb_block_subsystem_queue_set_max_segments(queue, segments);
+}
+
+void kb_blk_queue_max_write_zeroes_sectors(void *queue, unsigned int sectors)
+{
+    kb_block_subsystem_queue_set_max_write_zeroes_sectors(queue, sectors);
+}
+
+void kb_blk_queue_max_zone_append_sectors(void *queue, unsigned int sectors)
+{
+    kb_block_subsystem_queue_set_max_zone_append_sectors(queue, sectors);
+}
+
+void kb_blk_queue_physical_block_size(void *queue, unsigned int size)
+{
+    kb_block_subsystem_queue_set_physical_block_size(queue, size);
+}
+
+void kb_blk_queue_virt_boundary(void *queue, unsigned long mask)
+{
+    kb_block_subsystem_queue_set_virt_boundary(queue, mask);
+}
+
+void kb_blk_queue_write_cache(void *queue, bool write_cache, bool fua)
+{
+    kb_block_subsystem_queue_set_write_cache(queue, write_cache, fua);
+}
+
+int kb_device_add_disk(void *parent, void *disk, void *groups)
+{
+    return kb_block_subsystem_disk_register(parent, disk, groups);
+}
+
+void kb_del_gendisk(void *disk)
+{
+    kb_block_subsystem_disk_unregister(disk);
+}
+
+void kb_put_disk(void *disk)
+{
+    kb_block_subsystem_disk_put(disk);
+}
+
+void kb_set_capacity(void *disk, uint64_t sectors)
+{
+    kb_block_subsystem_disk_set_capacity(disk, sectors);
+}
+
+int kb_set_capacity_and_notify(void *disk, uint64_t sectors)
+{
+    return kb_block_subsystem_disk_set_capacity_and_notify(disk, sectors);
+}
+
+void kb_set_disk_ro(void *disk, int read_only)
+{
+    kb_block_subsystem_disk_set_read_only(disk, read_only);
 }

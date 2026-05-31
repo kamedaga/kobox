@@ -187,6 +187,23 @@ target_compile_options(kobox-input-subsystem-smoke PRIVATE
 
 add_test(NAME kobox-input-subsystem-smoke COMMAND kobox-input-subsystem-smoke)
 
+add_executable(kobox-block-subsystem-smoke
+    tests/block_subsystem_smoke.c
+    src/subsystem/block/block.c
+)
+
+target_include_directories(kobox-block-subsystem-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(kobox-block-subsystem-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
+add_test(NAME kobox-block-subsystem-smoke COMMAND kobox-block-subsystem-smoke)
+
 add_test(
     NAME kobox-live-script-args
     COMMAND sh
