@@ -18,22 +18,28 @@ add_library(kobox_runtime STATIC
     src/backend/linux_vfio/backend_linux_vfio.c
     src/loader/elf_reader.c
     src/loader/module_loader.c
-    src/subsystem/block.c
-    src/subsystem/dma.c
-    src/subsystem/nvme.c
-    src/subsystem/pci.c
-    src/subsystem/usb.c
+    src/subsystem/block/block.c
+    src/subsystem/dma/dma.c
+    src/subsystem/input/input.c
+    src/subsystem/nvme/nvme.c
+    src/subsystem/pci/pci.c
+    src/subsystem/usb/usb.c
     src/shim/linux_context.c
+    src/shim/linux_block.c
     src/shim/linux_device.c
     src/shim/linux_dma.c
+    src/shim/linux_dma_pool.c
+    src/shim/linux_hwmon.c
     src/shim/linux_irq.c
     src/shim/linux_memory.c
     src/shim/linux_mmio.c
     src/shim/linux_netdev.c
-    src/shim/linux_nvme_prereq.c
+    src/shim/linux_nvme.c
     src/shim/linux_pci.c
     src/shim/linux_platform.c
     src/shim/linux_printk.c
+    src/shim/linux_stubs.c
+    src/shim/linux_sync.c
     src/shim/linux_usb.c
     src/shim/linux_virtio_input.c
     src/shim/linux_work.c
@@ -70,6 +76,9 @@ add_executable(kobox-run-init
 )
 
 target_link_libraries(kobox-run-init PRIVATE kobox_runtime)
+target_include_directories(kobox-run-init PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 target_compile_options(kobox-run-init PRIVATE
     -Wall
     -Wextra
@@ -82,6 +91,9 @@ add_executable(kobox-run
 )
 
 target_link_libraries(kobox-run PRIVATE kobox_runtime)
+target_include_directories(kobox-run PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 target_compile_options(kobox-run PRIVATE
     -Wall
     -Wextra
@@ -140,6 +152,40 @@ target_compile_options(kobox-smoke PRIVATE
 )
 
 add_test(NAME kobox-smoke COMMAND kobox-smoke)
+
+add_executable(kobox-usb-subsystem-smoke
+    tests/usb_subsystem_smoke.c
+    src/subsystem/usb/usb.c
+)
+
+target_include_directories(kobox-usb-subsystem-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(kobox-usb-subsystem-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
+add_test(NAME kobox-usb-subsystem-smoke COMMAND kobox-usb-subsystem-smoke)
+
+add_executable(kobox-input-subsystem-smoke
+    tests/input_subsystem_smoke.c
+    src/subsystem/input/input.c
+)
+
+target_include_directories(kobox-input-subsystem-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(kobox-input-subsystem-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
+add_test(NAME kobox-input-subsystem-smoke COMMAND kobox-input-subsystem-smoke)
 
 add_test(
     NAME kobox-live-script-args

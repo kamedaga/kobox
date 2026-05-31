@@ -14,6 +14,8 @@ modules_pkg="${KERNEL_MODULES_PACKAGE:-linux-modules-6.8.0-117-generic}"
 usb_stack_root="${KOBOX_USB_STACK_MODULES_ROOT:-/lib/modules/$(uname -r)}"
 qemu_usb_device="${KOBOX_QEMU_USB_DEVICE:-}"
 expect_usb_device="${KOBOX_EXPECT_USB_DEVICE:-0}"
+enable_usb_hid="${KOBOX_ENABLE_USB_HID:-0}"
+expect_usb_hid="${KOBOX_EXPECT_USB_HID:-0}"
 run_drain_ms="${KOBOX_RUN_DRAIN_MS:-0}"
 run_trace_internal="${KOBOX_RUN_TRACE_INTERNAL:-}"
 run_trace_xhci="${KOBOX_RUN_TRACE_XHCI:-}"
@@ -25,6 +27,8 @@ run_trace_device="${KOBOX_RUN_TRACE_DEVICE:-}"
 run_trace_modules="${KOBOX_RUN_TRACE_MODULES:-}"
 run_trace_shim_calls="${KOBOX_RUN_TRACE_SHIM_CALLS:-}"
 run_trace_shim_calls_top="${KOBOX_RUN_TRACE_SHIM_CALLS_TOP:-}"
+run_crash_stack="${KOBOX_RUN_CRASH_STACK:-}"
+run_input_summary="${KOBOX_RUN_INPUT_SUMMARY:-$expect_usb_hid}"
 run_enable_sysfs_dirent="${KOBOX_RUN_ENABLE_SYSFS_DIRENT:-}"
 run_enable_usb_event_inject="${KOBOX_RUN_ENABLE_USB_EVENT_INJECT:-${KOBOX_ENABLE_USB_EVENT_INJECT:-}}"
 
@@ -59,6 +63,19 @@ do
         exit 0
     fi
 done
+
+if [ "$enable_usb_hid" = "1" ] || [ "$expect_usb_hid" = "1" ]; then
+    for rel in \
+        kernel/drivers/hid/hid.ko \
+        kernel/drivers/hid/hid-generic.ko \
+        kernel/drivers/hid/usbhid/usbhid.ko
+    do
+        if [ ! -f "$usb_stack_root/$rel" ]; then
+            echo "skip qemu vfio xhci stack smoke: missing $usb_stack_root/$rel" >&2
+            exit 0
+        fi
+    done
+fi
 
 fetch_deb "$kernel_pkg"
 fetch_deb "$modules_pkg"
@@ -137,6 +154,11 @@ copy_guest_module kernel/virt/lib/irqbypass.ko
 cp "$usb_stack_root/kernel/drivers/usb/core/usbcore.ko" "$root_dir/usr/lib/kobox/usbcore.ko"
 cp "$usb_stack_root/kernel/drivers/usb/host/xhci-hcd.ko" "$root_dir/usr/lib/kobox/xhci-hcd.ko"
 cp "$usb_stack_root/kernel/drivers/usb/host/xhci-pci.ko" "$root_dir/usr/lib/kobox/xhci-pci.ko"
+if [ "$enable_usb_hid" = "1" ] || [ "$expect_usb_hid" = "1" ]; then
+    cp "$usb_stack_root/kernel/drivers/hid/hid.ko" "$root_dir/usr/lib/kobox/hid.ko"
+    cp "$usb_stack_root/kernel/drivers/hid/hid-generic.ko" "$root_dir/usr/lib/kobox/hid-generic.ko"
+    cp "$usb_stack_root/kernel/drivers/hid/usbhid/usbhid.ko" "$root_dir/usr/lib/kobox/usbhid.ko"
+fi
 
 cat >"$root_dir/init" <<'INIT'
 #!/bin/sh
@@ -204,6 +226,8 @@ KOBOX_TRACE_DEVICE="@RUN_TRACE_DEVICE@" \
 KOBOX_TRACE_MODULES="@RUN_TRACE_MODULES@" \
 KOBOX_TRACE_SHIM_CALLS="@RUN_TRACE_SHIM_CALLS@" \
 KOBOX_TRACE_SHIM_CALLS_TOP="@RUN_TRACE_SHIM_CALLS_TOP@" \
+KOBOX_CRASH_STACK="@RUN_CRASH_STACK@" \
+KOBOX_INPUT_SUMMARY="@RUN_INPUT_SUMMARY@" \
 KOBOX_ENABLE_SYSFS_DIRENT="@RUN_ENABLE_SYSFS_DIRENT@" \
 KOBOX_ENABLE_USB_EVENT_INJECT="@RUN_ENABLE_USB_EVENT_INJECT@" \
     timeout 45 /usr/bin/kobox-run \
@@ -211,6 +235,7 @@ KOBOX_ENABLE_USB_EVENT_INJECT="@RUN_ENABLE_USB_EVENT_INJECT@" \
         --pci="$xhci_bdf" \
         --drain-ms="@RUN_DRAIN_MS@" \
         --dep=/usr/lib/kobox/usbcore.ko \
+        @RUN_USB_HID_DEPS@ \
         --dep=/usr/lib/kobox/xhci-hcd.ko \
         run /usr/lib/kobox/xhci-pci.ko
 status=$?
@@ -232,8 +257,15 @@ trace_device_escaped=$(printf '%s' "$run_trace_device" | sed 's/[\/&]/\\&/g')
 trace_modules_escaped=$(printf '%s' "$run_trace_modules" | sed 's/[\/&]/\\&/g')
 trace_shim_calls_escaped=$(printf '%s' "$run_trace_shim_calls" | sed 's/[\/&]/\\&/g')
 trace_shim_calls_top_escaped=$(printf '%s' "$run_trace_shim_calls_top" | sed 's/[\/&]/\\&/g')
+crash_stack_escaped=$(printf '%s' "$run_crash_stack" | sed 's/[\/&]/\\&/g')
+input_summary_escaped=$(printf '%s' "$run_input_summary" | sed 's/[\/&]/\\&/g')
 enable_sysfs_dirent_escaped=$(printf '%s' "$run_enable_sysfs_dirent" | sed 's/[\/&]/\\&/g')
 enable_usb_event_inject_escaped=$(printf '%s' "$run_enable_usb_event_inject" | sed 's/[\/&]/\\&/g')
+usb_hid_deps=""
+if [ "$enable_usb_hid" = "1" ] || [ "$expect_usb_hid" = "1" ]; then
+    usb_hid_deps="--dep=/usr/lib/kobox/hid.ko --dep=/usr/lib/kobox/hid-generic.ko --dep=/usr/lib/kobox/usbhid.ko"
+fi
+usb_hid_deps_escaped=$(printf '%s' "$usb_hid_deps" | sed 's/[\/&]/\\&/g')
 sed -i "s/@RUN_TRACE_INTERNAL@/$trace_internal_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_XHCI@/$trace_xhci_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_IRQ@/$trace_irq_escaped/g" "$root_dir/init"
@@ -244,8 +276,11 @@ sed -i "s/@RUN_TRACE_DEVICE@/$trace_device_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_MODULES@/$trace_modules_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_SHIM_CALLS@/$trace_shim_calls_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_SHIM_CALLS_TOP@/$trace_shim_calls_top_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_CRASH_STACK@/$crash_stack_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_INPUT_SUMMARY@/$input_summary_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_ENABLE_SYSFS_DIRENT@/$enable_sysfs_dirent_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_ENABLE_USB_EVENT_INJECT@/$enable_usb_event_inject_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_HID_DEPS@/$usb_hid_deps_escaped/g" "$root_dir/init"
 
 initramfs="$work_dir/initramfs.cpio"
 (cd "$root_dir" && find . -print | "$cpio_bin" -o -H newc --quiet >"$initramfs")
@@ -281,4 +316,8 @@ if [ "$expect_usb_device" = "1" ]; then
         ! grep -q "device descriptor read/.*error" "$serial_log"
         ! grep -q "unable to enumerate USB device" "$serial_log"
     fi
+fi
+if [ "$expect_usb_hid" = "1" ]; then
+    grep -Eq "hid-generic|USB HID|input:" "$serial_log"
+    grep -q "kobox-input: device" "$serial_log"
 fi

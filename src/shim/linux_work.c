@@ -234,6 +234,16 @@ static int deferred_contains(kb_deferred_kind_t kind, void *object)
     return 0;
 }
 
+static kb_deferred_item_t *find_deferred(kb_deferred_kind_t kind, void *object)
+{
+    for (kb_deferred_item_t *item = deferred_head; item != NULL; item = item->next) {
+        if (item->kind == kind && item->object == object) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
 static void refresh_deferred_tail(void);
 
 static int remove_deferred(kb_deferred_kind_t kind, void *object)
@@ -680,10 +690,13 @@ int kb_mod_timer(void *timer, unsigned long expires)
         memcpy((unsigned char *)timer + KB_LINUX_TIMER_EXPIRES_OFFSET, &expires, sizeof(expires));
         write_pointer(timer, KB_LINUX_TIMER_ENTRY_PPREV_OFFSET, timer);
     }
-    if (deferred_contains(KB_DEFERRED_TIMER, timer)) {
+    const uint64_t due_ns = jiffies_to_ns(expires);
+    kb_deferred_item_t *item = find_deferred(KB_DEFERRED_TIMER, timer);
+    if (item != NULL) {
+        item->due_ns = due_ns;
+        item->kernel_gs = kb_shim_current_kernel_gs();
         return 1;
     }
-    const uint64_t due_ns = jiffies_to_ns(expires);
     return queue_deferred(KB_DEFERRED_TIMER, timer, due_ns);
 }
 

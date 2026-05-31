@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include "kobox/backend.h"
 
 #ifdef __cplusplus
@@ -18,6 +19,7 @@ void *kb_kmem_cache_alloc(void *cache, unsigned int flags);
 void kb_kmem_cache_free(void *cache, void *ptr);
 void kb_kfree(void *ptr);
 int kb_printk(const char *fmt, ...);
+int kb_vprintk_safe(const char *fmt, va_list args);
 
 void kb_shim_set_backend(kb_backend_t *backend);
 unsigned long kb_shim_current_kernel_gs(void);

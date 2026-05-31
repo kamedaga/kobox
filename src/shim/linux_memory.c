@@ -42,6 +42,35 @@ void *kb_kmalloc_trace(void *cache, unsigned int flags, size_t size)
     return kb_kmalloc(size, flags);
 }
 
+void *kb_kmalloc_node(size_t size, unsigned int flags, int node)
+{
+    (void)node;
+    return kb_kmalloc(size, flags);
+}
+
+void *kb_kmalloc_node_trace(void *cache, unsigned int flags, int node, size_t size)
+{
+    (void)node;
+    return kb_kmalloc_trace(cache, flags, size);
+}
+
+void *kb_kmemdup(const void *src, size_t len, unsigned int flags)
+{
+    if (src == NULL) {
+        return NULL;
+    }
+    void *dst = kb_kmalloc(len, flags);
+    if (dst != NULL) {
+        memcpy(dst, src, len);
+    }
+    return dst;
+}
+
+void kb_kfree_sensitive(const void *ptr)
+{
+    kb_kfree((void *)ptr);
+}
+
 void *kb_kmem_cache_create(const char *name, size_t size, size_t align, unsigned long flags, void *ctor)
 {
     (void)name;
@@ -97,6 +126,11 @@ void *kzalloc(size_t size, unsigned int flags)
 void *kmalloc_trace(void *cache, unsigned int flags, size_t size)
 {
     return kb_kmalloc_trace(cache, flags, size);
+}
+
+void *__kmalloc_node(size_t size, unsigned int flags, int node)
+{
+    return kb_kmalloc_node(size, flags, node);
 }
 
 void *kmem_cache_alloc(void *cache, unsigned int flags)

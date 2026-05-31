@@ -1,5 +1,5 @@
-#include "subsystem/nvme.h"
-#include "subsystem/dma.h"
+#include "subsystem/nvme/nvme.h"
+#include "subsystem/dma/dma.h"
 
 #include <string.h>
 

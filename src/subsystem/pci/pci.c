@@ -1,4 +1,4 @@
-#include "subsystem/pci.h"
+#include "subsystem/pci/pci.h"
 
 #include <string.h>
 

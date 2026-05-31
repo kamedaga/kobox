@@ -1,5 +1,5 @@
 #include "kobox/shim.h"
-#include "subsystem/usb.h"
+#include "subsystem/usb/usb.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -23,7 +23,6 @@ enum {
     KB_LINUX_6_8_USB_INTERFACE_DRIVER_DATA_OFFSET = 0x0c8,
     KB_LINUX_6_8_USB_HUB_HDEV_OFFSET = 0x008,
     KB_LINUX_6_8_USB_HUB_EVENT_BITS_OFFSET = 0x060,
-    KB_LINUX_6_8_USB_HUB_EVENTS_WORK_OFFSET = 0x218,
     KB_USB_REQ_GET_PORT_STATUS = 0xa300,
 };
 
@@ -53,16 +52,6 @@ static int usb_hub_ready_for_events(void *hub)
     }
     memcpy(&hdev, (const unsigned char *)hub + KB_LINUX_6_8_USB_HUB_HDEV_OFFSET, sizeof(hdev));
     return hdev != NULL;
-}
-
-static int usb_root_hub_can_run_events(void *hcd)
-{
-    unsigned char state = 0;
-    if (hcd == NULL) {
-        return 0;
-    }
-    memcpy(&state, (const unsigned char *)hcd + KB_LINUX_6_8_USB_HCD_RH_STATE_OFFSET, sizeof(state));
-    return (state & 1u) != 0;
 }
 
 static void usb_hcd_release_record(kb_usb_hcd_record_t *record)
@@ -97,6 +86,12 @@ static void *usb_root_hub_for_hcd(void *hcd)
 
 static void *usb_hub_for_root_hub(void *root_hub)
 {
+    void *(*hub_to_struct_hub)(void *) =
+        (void *(*)(void *))kb_module_lookup_exported_symbol("usb_hub_to_struct_hub");
+    if (hub_to_struct_hub != NULL) {
+        return hub_to_struct_hub(root_hub);
+    }
+
     void *config = NULL;
     void *interface0 = NULL;
     void *hub = NULL;
@@ -256,36 +251,25 @@ static void kick_root_hub_if_changed(void *hcd)
     }
 
     void *hub = usb_hub_for_root_hub(root_hub);
-    int hub_ready = usb_root_hub_can_run_events(hcd) && usb_hub_ready_for_events(hub);
-    unsigned long bits = 0;
-    for (int i = 0; i < status_len && i < (int)sizeof(bits); i++) {
-        bits |= ((unsigned long)status[i]) << (i * 8);
+    int hub_ready = usb_hub_ready_for_events(hub);
+    kb_usb_hub_event_update_t event;
+    if (kb_usb_subsystem_hub_event_prepare(hcd, status, (size_t)status_len, &event) != 0) {
+        return;
     }
 
-    kb_usb_hub_event_injection_t *injection = kb_usb_subsystem_hub_event_injection_for_hcd(hcd);
-    unsigned long new_bits = bits;
-    unsigned long injected_before = injection != NULL ? injection->bits : 0;
-    if (injection != NULL) {
-        if (bits == 0) {
-            injection->bits = 0;
-        }
-        new_bits = bits & ~injection->bits;
-    }
-    if (inject_events && hub != NULL && hub_ready && bits != 0) {
+    if (inject_events && hub != NULL && hub_ready && event.bits != 0) {
         unsigned long existing_bits = 0;
         memcpy(
             &existing_bits,
             (const unsigned char *)hub + KB_LINUX_6_8_USB_HUB_EVENT_BITS_OFFSET,
             sizeof(existing_bits));
-        if (new_bits != 0) {
-            existing_bits |= new_bits;
+        if (event.new_bits != 0) {
+            existing_bits |= event.new_bits;
             memcpy(
                 (unsigned char *)hub + KB_LINUX_6_8_USB_HUB_EVENT_BITS_OFFSET,
                 &existing_bits,
                 sizeof(existing_bits));
-            if (injection != NULL) {
-                injection->bits |= new_bits;
-            }
+            (void)kb_usb_subsystem_hub_event_commit(hcd, event.new_bits, &event);
         }
     }
 
@@ -298,26 +282,24 @@ static void kick_root_hub_if_changed(void *hcd)
                 sizeof(hub_event_bits));
         }
         fprintf(stderr,
-            "kobox usb: kick_root_hub hcd=%p root_hub=%p hub=%p injection=%p slot=%ld injected=0x%lx->0x%lx hub_event_bits=0x%lx bits=0x%lx new_bits=0x%lx status_len=%d status=%02x %02x %02x %02x\n",
+            "kobox usb: kick_root_hub hcd=%p root_hub=%p hub=%p slot=%ld injected=0x%lx->0x%lx hub_event_bits=0x%lx bits=0x%lx new_bits=0x%lx status_len=%d status=%02x %02x %02x %02x\n",
             hcd,
             root_hub,
             hub,
-            (void *)injection,
-            kb_usb_subsystem_hub_event_injection_index(injection),
-            injected_before,
-            injection != NULL ? injection->bits : 0,
+            event.slot,
+            event.injected_before,
+            event.injected_after,
             hub_event_bits,
-            bits,
-            new_bits,
-            status_len,
-            status[0],
-            status[1],
-            status[2],
-            status[3]);
+            event.bits,
+            event.new_bits,
+            event.status_len,
+            event.status[0],
+            event.status[1],
+            event.status[2],
+            event.status[3]);
     }
-    if (inject_events && hub != NULL && hub_ready && new_bits != 0) {
+    if (inject_events && hub != NULL && hub_ready && event.new_bits != 0) {
         kick_hub_wq(root_hub);
-        (void)kb_queue_work_on(0, NULL, (unsigned char *)hub + KB_LINUX_6_8_USB_HUB_EVENTS_WORK_OFFSET);
     }
 }
 

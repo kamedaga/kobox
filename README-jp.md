@@ -67,11 +67,11 @@ ctest --test-dir .artifacts/build
 
 ## ロードマップ
 
-1. NVMe — 一部対応完了💕
-2. USB (xHCI) — 複数 .ko 同時ロード、サブシステム対応
+1. NVMe — 読み書きや負荷のある処理に対応完了💕
+2. USB (xHCI) — USB HID が bind し、subsystem/input に device 登録
 3. Network (e1000e / r8169) — PCI + DMA shim を流用
 4. SATA (AHCI) — NVMe とストレージ shim を共通化
-5. NVIDIA GPU — 最終目標
+5. NVIDIA GPU — 一部重要な関数が未実装だが初期化に成功
 
 
 ## ライセンス

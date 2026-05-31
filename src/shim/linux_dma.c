@@ -1,5 +1,5 @@
 #include "kobox/shim.h"
-#include "subsystem/dma.h"
+#include "subsystem/dma/dma.h"
 
 #include <stdio.h>
 #include <stdlib.h>

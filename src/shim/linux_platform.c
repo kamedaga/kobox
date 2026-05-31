@@ -36,7 +36,7 @@ int kb_devm_uio_register_device(void *dev, void *info)
 static void kb_vdev_log(const char *fmt, va_list args)
 {
     if (fmt != NULL) {
-        (void)vfprintf(stderr, fmt, args);
+        (void)kb_vprintk_safe(fmt, args);
     }
 }
 

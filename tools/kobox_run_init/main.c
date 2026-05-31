@@ -7,6 +7,7 @@
 #include "kobox/backend_linux_vfio.h"
 #include "kobox/module.h"
 #include "kobox/shim.h"
+#include "subsystem/input/input.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -388,6 +389,10 @@ int main(int argc, char **argv)
         }
     }
     drain_after_init(backend, drain_ms);
+    const char *input_summary = getenv("KOBOX_INPUT_SUMMARY");
+    if (input_summary != NULL && input_summary[0] != '\0' && strcmp(input_summary, "0") != 0) {
+        kb_input_subsystem_print_summary(stdout);
+    }
 
     status = kb_module_call_cleanup(module);
     if (status == KB_OK) {

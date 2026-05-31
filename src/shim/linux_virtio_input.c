@@ -1,4 +1,5 @@
 #include "kobox/shim.h"
+#include "subsystem/input/input.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -99,54 +100,42 @@ void kb_sg_init_one(void *sg, const void *buf, unsigned int buflen)
 
 void *kb_input_allocate_device(void)
 {
-    return calloc(1, 1024);
+    return kb_input_subsystem_allocate_device();
 }
 
 void kb_input_free_device(void *dev)
 {
-    free(dev);
+    kb_input_subsystem_free_device(dev);
 }
 
 int kb_input_register_device(void *dev)
 {
-    (void)dev;
-    return 0;
+    return kb_input_subsystem_register_device(dev);
 }
 
 void kb_input_unregister_device(void *dev)
 {
-    free(dev);
+    kb_input_subsystem_unregister_device(dev);
 }
 
 void kb_input_event(void *dev, unsigned int type, unsigned int code, int value)
 {
-    (void)dev;
-    (void)type;
-    (void)code;
-    (void)value;
+    kb_input_subsystem_record_event(dev, type, code, value);
 }
 
 void kb_input_set_abs_params(void *dev, unsigned int axis, int min, int max, int fuzz, int flat)
 {
-    (void)dev;
-    (void)axis;
-    (void)min;
-    (void)max;
-    (void)fuzz;
-    (void)flat;
+    kb_input_subsystem_set_abs_params(dev, axis, min, max, fuzz, flat);
 }
 
 void kb_input_alloc_absinfo(void *dev)
 {
-    (void)dev;
+    kb_input_subsystem_alloc_absinfo(dev);
 }
 
 int kb_input_mt_init_slots(void *dev, unsigned int num_slots, unsigned int flags)
 {
-    (void)dev;
-    (void)num_slots;
-    (void)flags;
-    return 0;
+    return kb_input_subsystem_mt_init_slots(dev, num_slots, flags);
 }
 
 void *__kmalloc(size_t size, unsigned int flags)

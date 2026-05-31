@@ -1,4 +1,4 @@
-#include "subsystem/dma.h"
+#include "subsystem/dma/dma.h"
 
 #include <stdlib.h>
 

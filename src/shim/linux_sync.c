@@ -1,0 +1,136 @@
+#include "kobox/shim.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int trace_work_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_WORK");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+void kb_mutex_init(void *lock)
+{
+    (void)lock;
+}
+
+void kb_mutex_lock(void *lock)
+{
+    (void)lock;
+}
+
+void kb_mutex_unlock(void *lock)
+{
+    (void)lock;
+}
+
+int kb_mutex_trylock(void *lock)
+{
+    (void)lock;
+    return 1;
+}
+
+void kb_complete(void *completion)
+{
+    if (completion != NULL) {
+        uint32_t done = 1;
+        memcpy(completion, &done, sizeof(done));
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: complete completion=%p done=%u\n", completion, done);
+        }
+    }
+}
+
+void kb_complete_all(void *completion)
+{
+    if (completion != NULL) {
+        uint32_t done = UINT32_MAX / 2u;
+        memcpy(completion, &done, sizeof(done));
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: complete_all completion=%p done=%u\n", completion, done);
+        }
+    }
+}
+
+void kb_init_completion(void *completion)
+{
+    if (completion != NULL) {
+        uint32_t done = 0;
+        memcpy(completion, &done, sizeof(done));
+    }
+}
+
+void kb_init_waitqueue_head(void *wq_head)
+{
+    (void)wq_head;
+}
+
+void kb_init_swait_queue_head(void *wq_head)
+{
+    (void)wq_head;
+}
+
+unsigned long kb_wait_for_completion(void *completion)
+{
+    if (completion == NULL) {
+        return 0;
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion completion=%p\n", completion);
+    }
+    for (unsigned i = 0; i < 20; i++) {
+        kb_run_deferred_work();
+        (void)kb_handle_any_irq_no_work(0);
+        uint32_t done = 0;
+        memcpy(&done, completion, sizeof(done));
+        if (done != 0) {
+            done--;
+            memcpy(completion, &done, sizeof(done));
+            if (trace_work_enabled()) {
+                fprintf(stderr, "kobox work: wait_for_completion done completion=%p remaining=%u\n", completion, done);
+            }
+            return 1;
+        }
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion timeout completion=%p\n", completion);
+    }
+    return 0;
+}
+
+unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long timeout)
+{
+    if (completion == NULL) {
+        return 0;
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion_timeout completion=%p timeout=%lu\n", completion, timeout);
+    }
+    const unsigned long loops = timeout == 0 ? 20 : (timeout > 100 ? 100 : timeout);
+    for (unsigned long i = 0; i < loops; i++) {
+        kb_run_deferred_work();
+        (void)kb_handle_any_irq_no_work(0);
+        uint32_t done = 0;
+        memcpy(&done, completion, sizeof(done));
+        if (done != 0) {
+            done--;
+            memcpy(completion, &done, sizeof(done));
+            if (trace_work_enabled()) {
+                fprintf(
+                    stderr,
+                    "kobox work: wait_for_completion_timeout done completion=%p remaining=%u left=%lu\n",
+                    completion,
+                    done,
+                    timeout == 0 ? 1 : timeout - i);
+            }
+            return timeout == 0 ? 1 : timeout - i;
+        }
+        (void)kb_handle_any_irq_no_work(1000000ull);
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion_timeout expired completion=%p timeout=%lu\n", completion, timeout);
+    }
+    return 0;
+}

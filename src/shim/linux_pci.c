@@ -1,5 +1,6 @@
 #include "kobox/shim.h"
-#include "subsystem/pci.h"
+#include "shim/linux_nvme.h"
+#include "subsystem/pci/pci.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -10,6 +11,7 @@
 kb_backend_t *kb_shim_current_backend(void);
 
 static kb_status_t first_device(kb_backend_t *backend, kb_device_t **out_device);
+static int trace_pci_enabled(void);
 
 typedef struct shim_pci_driver {
     const char *name;
@@ -168,6 +170,267 @@ int kb_pci_msix_unmask_entries(void *dev, const uint16_t *entries, unsigned int 
 
     ops->unmap_bar(device, &region);
     return result;
+}
+
+int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags)
+{
+    enum {
+        KB_PCI_IRQ_LEGACY = 1u << 0,
+        KB_PCI_IRQ_MSI = 1u << 1,
+        KB_PCI_IRQ_MSIX = 1u << 2,
+        KB_PCI_MSI_CONTROL_MMC_MASK = 0x000e,
+        KB_PCI_MSI_CONTROL_MME_MASK = 0x0070,
+    };
+
+    if (min_vecs == 0) {
+        min_vecs = 1;
+    }
+    if (max_vecs == 0 || max_vecs < min_vecs) {
+        return -22;
+    }
+    if (min_vecs > KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX) {
+        return -28;
+    }
+    if (max_vecs > KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX) {
+        max_vecs = KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX;
+    }
+
+    kb_pci_subsystem_irq_vectors_clear();
+    kb_irq_clear_mappings();
+
+    if (trace_pci_enabled()) {
+        fprintf(
+            stderr,
+            "kobox pci: alloc_irq_vectors min=%u max=%u flags=0x%x\n",
+            min_vecs,
+            max_vecs,
+            flags);
+    }
+
+    if ((flags & KB_PCI_IRQ_MSIX) != 0) {
+        int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSIX);
+        if (cap != 0) {
+            uint16_t control = 0;
+            if (kb_pci_read_config_word(dev, cap + 2, &control) == 0) {
+                unsigned int table_size = (unsigned int)((control & KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1u);
+                unsigned int vectors = max_vecs < table_size ? max_vecs : table_size;
+                if (vectors >= min_vecs) {
+                    control |= KB_PCI_MSIX_CONTROL_ENABLE;
+                    control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
+                    if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
+                        return -5;
+                    }
+                    unsigned int linux_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
+                    uint16_t entries[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
+                    for (unsigned int i = 0; i < vectors; i++) {
+                        entries[i] = (uint16_t)i;
+                        if (kb_irq_allocate_mapping(KB_IRQ_BACKEND_KIND_MSIX, i, &linux_vectors[i]) != 0) {
+                            kb_irq_clear_mappings();
+                            kb_pci_subsystem_irq_vectors_clear();
+                            return -12;
+                        }
+                    }
+                    if (kb_pci_msix_unmask_entries(dev, entries, vectors) != 0) {
+                        kb_irq_clear_mappings();
+                        kb_pci_subsystem_irq_vectors_clear();
+                        return -5;
+                    }
+                    if (kb_pci_subsystem_irq_vectors_set(vectors, linux_vectors) != 0) {
+                        kb_irq_clear_mappings();
+                        return -22;
+                    }
+                    if (trace_pci_enabled()) {
+                        fprintf(stderr, "kobox pci: alloc_irq_vectors msix=%u\n", vectors);
+                    }
+                    return (int)vectors;
+                } else if (trace_pci_enabled()) {
+                    fprintf(
+                        stderr,
+                        "kobox pci: alloc_irq_vectors msix insufficient table=%u min=%u\n",
+                        table_size,
+                        min_vecs);
+                }
+            }
+        }
+    }
+    if ((flags & KB_PCI_IRQ_MSI) != 0) {
+        int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSI);
+        if (cap != 0) {
+            uint16_t control = 0;
+            if (kb_pci_read_config_word(dev, cap + 2, &control) == 0) {
+                unsigned int max_supported = 1u << ((control & KB_PCI_MSI_CONTROL_MMC_MASK) >> 1);
+                unsigned int vectors = max_vecs < max_supported ? max_vecs : max_supported;
+                if (vectors >= min_vecs) {
+                    unsigned int mme = 0;
+                    while ((1u << mme) < vectors) {
+                        mme++;
+                    }
+                    if ((1u << mme) > vectors) {
+                        mme--;
+                        vectors = 1u << mme;
+                    }
+                    if (vectors < min_vecs) {
+                        if (trace_pci_enabled()) {
+                            fprintf(
+                                stderr,
+                                "kobox pci: alloc_irq_vectors msi rounded insufficient vectors=%u min=%u\n",
+                                vectors,
+                                min_vecs);
+                        }
+                    } else {
+                        control |= KB_PCI_MSI_CONTROL_ENABLE;
+                        control &= (uint16_t)~KB_PCI_MSI_CONTROL_MME_MASK;
+                        control |= (uint16_t)((mme << 4) & KB_PCI_MSI_CONTROL_MME_MASK);
+                        if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
+                            return -5;
+                        }
+                        unsigned int linux_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
+                        for (unsigned int i = 0; i < vectors; i++) {
+                            if (kb_irq_allocate_mapping(KB_IRQ_BACKEND_KIND_MSI, i, &linux_vectors[i]) != 0) {
+                                kb_irq_clear_mappings();
+                                kb_pci_subsystem_irq_vectors_clear();
+                                return -12;
+                            }
+                        }
+                        if (kb_pci_subsystem_irq_vectors_set(vectors, linux_vectors) != 0) {
+                            kb_irq_clear_mappings();
+                            return -22;
+                        }
+                        if (trace_pci_enabled()) {
+                            fprintf(stderr, "kobox pci: alloc_irq_vectors msi=%u\n", vectors);
+                        }
+                        return (int)vectors;
+                    }
+                } else if (trace_pci_enabled()) {
+                    fprintf(
+                        stderr,
+                        "kobox pci: alloc_irq_vectors msi insufficient max_supported=%u min=%u\n",
+                        max_supported,
+                        min_vecs);
+                }
+            }
+        }
+    }
+    if ((flags & KB_PCI_IRQ_LEGACY) != 0 || flags == 0) {
+        uint8_t interrupt_pin = 0;
+        if (kb_pci_read_config_byte(dev, 0x3d, &interrupt_pin) == 0 && interrupt_pin != 0) {
+            if (min_vecs <= 1) {
+                unsigned int legacy_vector = 0;
+                if (kb_pci_subsystem_irq_vectors_set(1, &legacy_vector) != 0) {
+                    return -22;
+                }
+                if (trace_pci_enabled()) {
+                    fprintf(stderr, "kobox pci: alloc_irq_vectors legacy=1\n");
+                }
+                return 1;
+            }
+            if (trace_pci_enabled()) {
+                fprintf(
+                    stderr,
+                    "kobox pci: alloc_irq_vectors legacy insufficient min=%u\n",
+                    min_vecs);
+            }
+        }
+    }
+    return -28;
+}
+
+int kb_pci_alloc_irq_vectors_affinity(void *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags, void *affd)
+{
+    (void)affd;
+    return kb_pci_alloc_irq_vectors(dev, min_vecs, max_vecs, flags);
+}
+
+void kb_pci_free_irq_vectors(void *dev)
+{
+    int msix_cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSIX);
+    if (msix_cap != 0) {
+        uint16_t control = 0;
+        if (kb_pci_read_config_word(dev, msix_cap + 2, &control) == 0) {
+            control &= (uint16_t)~KB_PCI_MSIX_CONTROL_ENABLE;
+            (void)kb_pci_write_config_word(dev, msix_cap + 2, control);
+        }
+    }
+    int msi_cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSI);
+    if (msi_cap != 0) {
+        uint16_t control = 0;
+        if (kb_pci_read_config_word(dev, msi_cap + 2, &control) == 0) {
+            control &= (uint16_t)~KB_PCI_MSI_CONTROL_ENABLE;
+            (void)kb_pci_write_config_word(dev, msi_cap + 2, control);
+        }
+    }
+    kb_free_all_irqs();
+    kb_pci_subsystem_irq_vectors_clear();
+    kb_irq_clear_mappings();
+}
+
+int kb_pci_irq_vector(void *dev, unsigned int nr)
+{
+    (void)dev;
+    unsigned int vector = 0;
+    if (kb_pci_subsystem_irq_vector(nr, &vector) == 0) {
+        return (int)vector;
+    }
+    if (kb_pci_subsystem_irq_vector_count() != 0) {
+        return -22;
+    }
+    return (int)nr;
+}
+
+int kb_pci_request_irq(
+    void *dev,
+    unsigned int nr,
+    int (*handler)(int, void *),
+    int (*thread_fn)(int, void *),
+    void *dev_id,
+    const char *fmt,
+    ...)
+{
+    (void)fmt;
+    int irq = kb_pci_irq_vector(dev, nr);
+    if (irq < 0) {
+        return irq;
+    }
+    kb_nvme_shim_track_queue(dev_id);
+    return kb_request_threaded_irq((unsigned int)irq, handler, thread_fn, 0, "kobox-pci", dev_id);
+}
+
+void kb_pci_free_irq(void *dev, unsigned int nr, void *dev_id)
+{
+    int irq = kb_pci_irq_vector(dev, nr);
+    kb_free_irq(irq < 0 ? nr : (unsigned int)irq, dev_id);
+}
+
+int kb_pci_enable_device_mem(void *dev)
+{
+    return kb_pci_enable_device(dev);
+}
+
+int kb_pci_request_selected_regions(void *dev, int bars, const char *name)
+{
+    (void)dev;
+    (void)bars;
+    (void)name;
+    return 0;
+}
+
+void kb_pci_release_selected_regions(void *dev, int bars)
+{
+    (void)dev;
+    (void)bars;
+}
+
+int kb_pci_select_bars(void *dev, unsigned long flags)
+{
+    (void)dev;
+    (void)flags;
+    return 1;
+}
+
+int kb_pci_device_is_present(void *dev)
+{
+    (void)dev;
+    return 1;
 }
 
 static kb_status_t first_device(kb_backend_t *backend, kb_device_t **out_device)

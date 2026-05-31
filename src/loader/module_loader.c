@@ -35,7 +35,7 @@ typedef struct loaded_section {
 
 enum {
     KB_LOCAL_SHIM_STUB_SIZE = 48,
-    KB_LOCAL_SHIM_STUB_COUNT = 1024,
+    KB_LOCAL_SHIM_STUB_COUNT = 2048,
     KB_LOCAL_SHIM_DATA_SIZE = 32768,
     KB_LOCAL_SHIM_REGION_SIZE = (KB_LOCAL_SHIM_STUB_SIZE * KB_LOCAL_SHIM_STUB_COUNT) + KB_LOCAL_SHIM_DATA_SIZE,
     KB_LOCAL_SHIM_DATA_OFFSET = KB_LOCAL_SHIM_STUB_SIZE * KB_LOCAL_SHIM_STUB_COUNT,
@@ -997,7 +997,7 @@ static void kb_proc_deactivate_tree(const char *path)
 
 static int kb_vprintk(const char *fmt, va_list args)
 {
-    return vprintf(fmt, args);
+    return kb_vprintk_safe(fmt, args);
 }
 
 static int kb_register_chrdev_stub(unsigned major, unsigned baseminor, unsigned count, const char *name, void *fops)
@@ -1797,6 +1797,10 @@ static const shim_symbol_t shim_symbols[] = {
     {"pm_vt_switch_unregister", (void *)(uintptr_t)&kb_noop},
     {"devm_kmalloc", (void *)(uintptr_t)&kb_devm_kmalloc},
     {"devm_kasprintf", (void *)(uintptr_t)&kb_devm_kasprintf},
+    {"devres_close_group", (void *)(uintptr_t)&kb_noop},
+    {"devres_open_group", (void *)(uintptr_t)&kb_identity_ptr},
+    {"devres_release_group", (void *)(uintptr_t)&kb_return_zero},
+    {"devres_remove_group", (void *)(uintptr_t)&kb_noop},
     {"platform_get_irq_optional", (void *)(uintptr_t)&kb_platform_get_irq_optional},
     {"disable_irq_nosync", (void *)(uintptr_t)&kb_disable_irq_nosync},
     {"enable_irq", (void *)(uintptr_t)&kb_enable_irq},
@@ -1834,6 +1838,8 @@ static const shim_symbol_t shim_symbols[] = {
     {"input_register_device", (void *)(uintptr_t)&kb_input_register_device},
     {"input_unregister_device", (void *)(uintptr_t)&kb_input_unregister_device},
     {"input_event", (void *)(uintptr_t)&kb_input_event},
+    {"input_ff_event", (void *)(uintptr_t)&kb_return_zero},
+    {"input_scancode_to_scalar", (void *)(uintptr_t)&kb_return_zero},
     {"input_set_abs_params", (void *)(uintptr_t)&kb_input_set_abs_params},
     {"input_alloc_absinfo", (void *)(uintptr_t)&kb_input_alloc_absinfo},
     {"input_mt_init_slots", (void *)(uintptr_t)&kb_input_mt_init_slots},
@@ -1943,6 +1949,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"down_trylock", (void *)(uintptr_t)&kb_return_zero},
     {"down_write_trylock", (void *)(uintptr_t)&kb_return_one},
     {"downgrade_write", (void *)(uintptr_t)&kb_noop},
+    {"fasync_helper", (void *)(uintptr_t)&kb_return_zero},
     {"flush_work", (void *)(uintptr_t)&kb_flush_work},
     {"freezing_slow_path", (void *)(uintptr_t)&kb_return_zero},
     {"fortify_panic", (void *)(uintptr_t)&kb_stack_chk_fail},
@@ -1962,6 +1969,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"mempool_kmalloc", (void *)(uintptr_t)&kb_kmalloc},
     {"mutex_lock", (void *)(uintptr_t)&kb_mutex_lock},
     {"mutex_lock_interruptible", (void *)(uintptr_t)&kb_return_zero},
+    {"mutex_lock_killable", (void *)(uintptr_t)&kb_return_zero},
     {"mutex_is_locked", (void *)(uintptr_t)&kb_return_zero},
     {"mutex_trylock", (void *)(uintptr_t)&kb_mutex_trylock},
     {"mutex_unlock", (void *)(uintptr_t)&kb_mutex_unlock},
@@ -2034,6 +2042,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"__blk_rq_map_sg", (void *)(uintptr_t)&kb_return_zero},
     {"__alloc_pages", (void *)(uintptr_t)&kb_alloc_stub},
     {"__check_object_size", (void *)(uintptr_t)&kb_noop},
+    {"__copy_overflow", (void *)(uintptr_t)&kb_noop},
     {"__const_udelay", (void *)(uintptr_t)&kb_const_udelay},
     {"__folio_lock", (void *)(uintptr_t)&kb_noop},
     {"__folio_put", (void *)(uintptr_t)&kb_noop},
@@ -2381,6 +2390,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"kblockd_schedule_work", (void *)(uintptr_t)&kb_return_zero},
     {"kernel_read", (void *)(uintptr_t)&kb_return_zero},
     {"kernel_write", (void *)(uintptr_t)&kb_return_zero},
+    {"kill_fasync", (void *)(uintptr_t)&kb_noop},
     {"kfree_const", (void *)(uintptr_t)&kb_kfree},
     {"kthread_create_on_node", (void *)(uintptr_t)&kb_alloc_stub},
     {"kthread_should_stop", (void *)(uintptr_t)&kb_return_one},
@@ -2388,6 +2398,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"kmem_cache_create", (void *)(uintptr_t)&kb_kmem_cache_create},
     {"kmem_cache_destroy", (void *)(uintptr_t)&kb_kmem_cache_destroy},
     {"kmem_cache_free", (void *)(uintptr_t)&kb_kmem_cache_free},
+    {"kmalloc_large", (void *)(uintptr_t)&kb_kmalloc_alias},
     {"krealloc", (void *)(uintptr_t)&kb_krealloc_shim},
     {"ksize", (void *)(uintptr_t)&kb_ksize_shim},
     {"kobject_uevent_env", (void *)(uintptr_t)&kb_return_zero},
@@ -2450,6 +2461,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"pcie_capability_read_word", (void *)(uintptr_t)&kb_return_zero},
     {"perf_trace_buf_alloc", (void *)(uintptr_t)&kb_alloc_stub},
     {"perf_trace_run_bpf_submit", (void *)(uintptr_t)&kb_noop},
+    {"prepare_to_wait", (void *)(uintptr_t)&kb_noop},
     {"prepare_to_wait_event", (void *)(uintptr_t)&kb_return_zero},
     {"proc_create_data", (void *)(uintptr_t)&kb_proc_create_data_stub},
     {"proc_mkdir_mode", (void *)(uintptr_t)&kb_proc_mkdir_mode_stub},
@@ -2569,6 +2581,10 @@ static const shim_symbol_t shim_symbols[] = {
     {"__devm_request_region", (void *)(uintptr_t)&kb_alloc_stub},
     {"__get_user_1", (void *)(uintptr_t)&kb_return_zero},
     {"__get_user_4", (void *)(uintptr_t)&kb_return_zero},
+    {"__kfifo_alloc", (void *)(uintptr_t)&kb_return_zero},
+    {"__kfifo_free", (void *)(uintptr_t)&kb_noop},
+    {"__kfifo_in", (void *)(uintptr_t)&kb_return_zero},
+    {"__kfifo_to_user", (void *)(uintptr_t)&kb_return_zero},
     {"__list_add_valid_or_report", (void *)(uintptr_t)&kb_return_one},
     {"__list_del_entry_valid_or_report", (void *)(uintptr_t)&kb_return_one},
     {"__pm_runtime_set_status", (void *)(uintptr_t)&kb_return_zero},
@@ -2598,6 +2614,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"bus_for_each_drv", (void *)(uintptr_t)&kb_bus_for_each_drv},
     {"bus_register", (void *)(uintptr_t)&kb_return_zero},
     {"bus_register_notifier", (void *)(uintptr_t)&kb_return_zero},
+    {"bus_rescan_devices", (void *)(uintptr_t)&kb_return_zero},
     {"bus_unregister", (void *)(uintptr_t)&kb_noop},
     {"bus_unregister_notifier", (void *)(uintptr_t)&kb_return_zero},
     {"class_register", (void *)(uintptr_t)&kb_return_zero},
@@ -2610,6 +2627,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"debugfs_create_regset32", (void *)(uintptr_t)&kb_alloc_stub},
     {"debugfs_lookup_and_remove", (void *)(uintptr_t)&kb_return_zero},
     {"debugfs_remove", (void *)(uintptr_t)&kb_noop},
+    {"autoremove_wake_function", (void *)(uintptr_t)&kb_return_zero},
     {"default_wake_function", (void *)(uintptr_t)&kb_return_zero},
     {"dev_pm_qos_add_request", (void *)(uintptr_t)&kb_return_zero},
     {"dev_pm_qos_expose_flags", (void *)(uintptr_t)&kb_return_zero},
@@ -3156,6 +3174,9 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
         return module->shim_param_ops_ulong;
     }
     if (strcmp(name, "param_ops_charp") == 0) {
+        return module->shim_param_ops_ulong;
+    }
+    if (strcmp(name, "param_array_ops") == 0) {
         return module->shim_param_ops_ulong;
     }
     if (strcmp(name, "__cpu_possible_mask") == 0) {
