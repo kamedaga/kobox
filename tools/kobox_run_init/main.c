@@ -152,6 +152,34 @@ static kb_status_t read_file(const char *path, void **out_data, size_t *out_size
     return KB_OK;
 }
 
+static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
+{
+    if (drain_ms == 0) {
+        return;
+    }
+
+    kb_shim_set_backend(backend);
+    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    uint64_t start_ns = 0;
+    if (ops != NULL && ops->monotonic_ns != NULL) {
+        start_ns = ops->monotonic_ns(backend);
+    }
+
+    for (unsigned long i = 0; i < drain_ms; i++) {
+        kb_run_deferred_work();
+        (void)kb_handle_any_irq(1000000ull);
+        if (start_ns != 0 && ops != NULL && ops->monotonic_ns != NULL) {
+            uint64_t now_ns = ops->monotonic_ns(backend);
+            if (now_ns >= start_ns && now_ns - start_ns >= ((uint64_t)drain_ms * 1000000ull)) {
+                break;
+            }
+        }
+    }
+    kb_run_deferred_work();
+    (void)kb_handle_any_irq(0);
+    kb_shim_set_backend(NULL);
+}
+
 int main(int argc, char **argv)
 {
     install_crash_handler();
@@ -161,6 +189,7 @@ int main(int argc, char **argv)
     const char *pci_bdf = NULL;
     const char *dep_paths[KB_RUN_DEPS_MAX];
     size_t dep_count = 0;
+    unsigned long drain_ms = 0;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-') {
         if (strncmp(argv[argi], "--backend=", 10) == 0) {
@@ -182,7 +211,12 @@ int main(int argc, char **argv)
             argi++;
             continue;
         }
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko>] run <module.ko>\n");
+        if (strncmp(argv[argi], "--drain-ms=", 11) == 0) {
+            drain_ms = strtoul(argv[argi] + 11, NULL, 10);
+            argi++;
+            continue;
+        }
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
         return 1;
     }
 
@@ -191,7 +225,7 @@ int main(int argc, char **argv)
     } else if (argi + 2 == argc && strcmp(argv[argi], "run") == 0) {
         path = argv[argi + 1];
     } else {
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko>] run <module.ko>\n");
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
         return 1;
     }
 
@@ -337,6 +371,23 @@ int main(int argc, char **argv)
             return 8;
         }
     }
+    if (getenv("KOBOX_FOPS_SMOKE") != NULL) {
+        int fops_result = kb_module_run_registered_ops_smoke();
+        if (fops_result != 0) {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            kb_backend_destroy(backend);
+            free(data);
+            fprintf(stderr, "fops smoke failed: %d\n", fops_result);
+            return 9;
+        }
+    }
+    drain_after_init(backend, drain_ms);
 
     status = kb_module_call_cleanup(module);
     if (status == KB_OK) {

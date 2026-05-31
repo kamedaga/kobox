@@ -27,6 +27,18 @@ enum {
     KB_VFIO_DMA_IOVA_BASE = 0x01000000,
     KB_PCI_COMMAND_OFFSET = 0x04,
     KB_PCI_COMMAND_MEMORY = 0x0002,
+    KB_PCI_STATUS_OFFSET = 0x06,
+    KB_PCI_STATUS_CAP_LIST = 0x0010,
+    KB_PCI_CAPABILITY_LIST_OFFSET = 0x34,
+    KB_PCI_CAP_ID_MSI = 0x05,
+    KB_PCI_CAP_ID_MSIX = 0x11,
+    KB_PCI_CAP_NEXT_MASK = 0xfc,
+    KB_PCI_MSI_CONTROL_ENABLE = 0x0001,
+    KB_PCI_MSIX_CONTROL_ENABLE = 0x8000,
+    KB_IRQ_BACKEND_KIND_SHIFT = 30,
+    KB_IRQ_BACKEND_VECTOR_MASK = 0x3fffffff,
+    KB_IRQ_BACKEND_KIND_MSI = 1,
+    KB_IRQ_BACKEND_KIND_MSIX = 2,
     KB_PCI_CLASS_STORAGE = 0x01,
     KB_PCI_SUBCLASS_NVME = 0x08,
     KB_PCI_PROGIF_NVME = 0x02,
@@ -135,6 +147,12 @@ static kb_status_t errno_status(void)
         return KB_ERR_NOT_FOUND;
     }
     return KB_ERR_IO;
+}
+
+static int vfio_trace_dma_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_DMA");
+    return value != NULL && value[0] != '\0' && value[0] != '0';
 }
 
 static kb_status_t read_text_file(const char *path, char *dst, size_t dst_size)
@@ -646,6 +664,17 @@ static kb_status_t vfio_dma_map(
     }
 
     if (ioctl(device->backend->container_fd, VFIO_IOMMU_MAP_DMA, &map) != 0) {
+        if (vfio_trace_dma_enabled()) {
+            fprintf(stderr,
+                "kobox vfio: map_dma failed errno=%d vaddr=0x%llx iova=0x%llx size=0x%llx flags=0x%x cpu=%p len=0x%llx\n",
+                errno,
+                (unsigned long long)map.vaddr,
+                (unsigned long long)map.iova,
+                (unsigned long long)map.size,
+                map.flags,
+                cpu_addr,
+                (unsigned long long)size);
+        }
         return errno_status();
     }
 
@@ -661,6 +690,17 @@ static kb_status_t vfio_dma_map(
     }
     backend->next_iova = iova + map_size + ps;
     *out_dma_addr = iova + offset;
+    if (vfio_trace_dma_enabled()) {
+        fprintf(stderr,
+            "kobox vfio: map_dma ok vaddr=0x%llx iova=0x%llx size=0x%llx flags=0x%x cpu=%p len=0x%llx dma=0x%llx\n",
+            (unsigned long long)map.vaddr,
+            (unsigned long long)map.iova,
+            (unsigned long long)map.size,
+            map.flags,
+            cpu_addr,
+            (unsigned long long)size,
+            (unsigned long long)*out_dma_addr);
+    }
     return KB_OK;
 }
 
@@ -738,28 +778,178 @@ static void vfio_disable_irq_index(kb_device_t *device, uint32_t index)
     (void)ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, &request);
 }
 
+static int vfio_trace_irq_enabled(void)
+{
+    return getenv("KOBOX_TRACE_IRQ") != NULL;
+}
+
+static void vfio_unmask_irq(kb_device_t *device, uint32_t index, uint32_t start)
+{
+    if (device == NULL || device->device_fd < 0) {
+        return;
+    }
+
+    struct vfio_irq_set request;
+    memset(&request, 0, sizeof(request));
+    request.argsz = sizeof(request);
+    request.flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_UNMASK;
+    request.index = index;
+    request.start = start;
+    request.count = 1;
+    (void)ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, &request);
+}
+
+static int vfio_irq_index_available(kb_device_t *device, uint32_t index, unsigned vector)
+{
+    struct vfio_irq_info info;
+    kb_status_t status = vfio_irq_info(device, index, &info);
+    return status == KB_OK && vector < info.count;
+}
+
+static int vfio_pci_find_capability(kb_device_t *device, uint8_t cap_id, uint8_t *out_offset)
+{
+    if (device == NULL || out_offset == NULL) {
+        return 0;
+    }
+
+    uint16_t status = 0;
+    if (vfio_pci_config_read(device, KB_PCI_STATUS_OFFSET, &status, sizeof(status)) != KB_OK ||
+        (status & KB_PCI_STATUS_CAP_LIST) == 0)
+    {
+        return 0;
+    }
+
+    uint8_t cap = 0;
+    if (vfio_pci_config_read(device, KB_PCI_CAPABILITY_LIST_OFFSET, &cap, sizeof(cap)) != KB_OK) {
+        return 0;
+    }
+    cap &= KB_PCI_CAP_NEXT_MASK;
+
+    for (unsigned depth = 0; depth < 48 && cap >= 0x40; depth++) {
+        uint8_t header[2] = {0, 0};
+        if (vfio_pci_config_read(device, cap, header, sizeof(header)) != KB_OK) {
+            return 0;
+        }
+        if (header[0] == cap_id) {
+            *out_offset = cap;
+            return 1;
+        }
+        cap = header[1] & KB_PCI_CAP_NEXT_MASK;
+    }
+
+    return 0;
+}
+
+static int vfio_pci_msi_enabled(kb_device_t *device)
+{
+    uint8_t cap = 0;
+    uint16_t control = 0;
+    return vfio_pci_find_capability(device, KB_PCI_CAP_ID_MSI, &cap) &&
+           vfio_pci_config_read(device, (uint16_t)(cap + 2u), &control, sizeof(control)) == KB_OK &&
+           (control & KB_PCI_MSI_CONTROL_ENABLE) != 0;
+}
+
+static int vfio_pci_msix_enabled(kb_device_t *device)
+{
+    uint8_t cap = 0;
+    uint16_t control = 0;
+    return vfio_pci_find_capability(device, KB_PCI_CAP_ID_MSIX, &cap) &&
+           vfio_pci_config_read(device, (uint16_t)(cap + 2u), &control, sizeof(control)) == KB_OK &&
+           (control & KB_PCI_MSIX_CONTROL_ENABLE) != 0;
+}
+
+static void vfio_enable_irq_mode(kb_device_t *device, unsigned encoded_vector)
+{
+    const unsigned backend_kind = encoded_vector >> KB_IRQ_BACKEND_KIND_SHIFT;
+    if (backend_kind == KB_IRQ_BACKEND_KIND_MSIX) {
+        uint8_t cap = 0;
+        uint16_t control = 0;
+        if (vfio_pci_find_capability(device, KB_PCI_CAP_ID_MSIX, &cap) &&
+            vfio_pci_config_read(device, (uint16_t)(cap + 2u), &control, sizeof(control)) == KB_OK)
+        {
+            control |= KB_PCI_MSIX_CONTROL_ENABLE;
+            (void)vfio_pci_config_write(device, (uint16_t)(cap + 2u), &control, sizeof(control));
+        }
+        return;
+    }
+
+    if (backend_kind == KB_IRQ_BACKEND_KIND_MSI) {
+        uint8_t cap = 0;
+        uint16_t control = 0;
+        if (vfio_pci_find_capability(device, KB_PCI_CAP_ID_MSI, &cap) &&
+            vfio_pci_config_read(device, (uint16_t)(cap + 2u), &control, sizeof(control)) == KB_OK)
+        {
+            control |= KB_PCI_MSI_CONTROL_ENABLE;
+            (void)vfio_pci_config_write(device, (uint16_t)(cap + 2u), &control, sizeof(control));
+        }
+    }
+}
+
 static kb_status_t vfio_select_irq(kb_device_t *device, unsigned vector, uint32_t *out_index, uint32_t *out_start)
 {
     if (device == NULL || out_index == NULL || out_start == NULL) {
         return KB_ERR_INVALID;
     }
 
-    struct vfio_irq_info msix;
-    kb_status_t status = vfio_irq_info(device, VFIO_PCI_MSIX_IRQ_INDEX, &msix);
-    if (status == KB_OK && vector < msix.count) {
-        *out_index = VFIO_PCI_MSIX_IRQ_INDEX;
-        *out_start = vector;
+    const unsigned backend_kind = vector >> KB_IRQ_BACKEND_KIND_SHIFT;
+    const unsigned backend_vector = vector & KB_IRQ_BACKEND_VECTOR_MASK;
+
+    if (backend_kind == KB_IRQ_BACKEND_KIND_MSIX) {
+        if (vfio_irq_index_available(device, VFIO_PCI_MSIX_IRQ_INDEX, backend_vector)) {
+            *out_index = VFIO_PCI_MSIX_IRQ_INDEX;
+            *out_start = backend_vector;
+            return KB_OK;
+        }
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    if (backend_kind == KB_IRQ_BACKEND_KIND_MSI) {
+        if (vfio_irq_index_available(device, VFIO_PCI_MSI_IRQ_INDEX, backend_vector)) {
+            *out_index = VFIO_PCI_MSI_IRQ_INDEX;
+            *out_start = backend_vector;
+            return KB_OK;
+        }
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    const int msix_enabled = vfio_pci_msix_enabled(device);
+    const int msi_enabled = vfio_pci_msi_enabled(device);
+    const int intx_available = backend_vector == 0 && vfio_irq_index_available(device, VFIO_PCI_INTX_IRQ_INDEX, 0);
+
+    if (backend_vector == 0 && !msix_enabled && !msi_enabled && intx_available) {
+        *out_index = VFIO_PCI_INTX_IRQ_INDEX;
+        *out_start = 0;
+        if (vfio_trace_irq_enabled()) {
+            fprintf(stderr, "kobox vfio: irq vector=%u index=INTx start=0\n", vector);
+        }
         return KB_OK;
     }
 
-    if (vector == 0) {
-        struct vfio_irq_info intx;
-        status = vfio_irq_info(device, VFIO_PCI_INTX_IRQ_INDEX, &intx);
-        if (status == KB_OK && intx.count > 0) {
-            *out_index = VFIO_PCI_INTX_IRQ_INDEX;
-            *out_start = 0;
-            return KB_OK;
+    if (msix_enabled && vfio_irq_index_available(device, VFIO_PCI_MSIX_IRQ_INDEX, backend_vector)) {
+        *out_index = VFIO_PCI_MSIX_IRQ_INDEX;
+        *out_start = backend_vector;
+        if (vfio_trace_irq_enabled()) {
+            fprintf(stderr, "kobox vfio: irq vector=%u index=MSI-X start=%u\n", vector, backend_vector);
         }
+        return KB_OK;
+    }
+
+    if (msi_enabled && vfio_irq_index_available(device, VFIO_PCI_MSI_IRQ_INDEX, backend_vector)) {
+        *out_index = VFIO_PCI_MSI_IRQ_INDEX;
+        *out_start = backend_vector;
+        if (vfio_trace_irq_enabled()) {
+            fprintf(stderr, "kobox vfio: irq vector=%u index=MSI start=%u\n", vector, backend_vector);
+        }
+        return KB_OK;
+    }
+
+    if (intx_available) {
+        *out_index = VFIO_PCI_INTX_IRQ_INDEX;
+        *out_start = 0;
+        if (vfio_trace_irq_enabled()) {
+            fprintf(stderr, "kobox vfio: irq vector=%u index=INTx start=0 fallback\n", vector);
+        }
+        return KB_OK;
     }
 
     return KB_ERR_UNSUPPORTED;
@@ -788,6 +978,7 @@ static kb_status_t vfio_irq_register(
 
     kb_status_t status = vfio_select_irq(device, vector, &irq->index, &irq->start);
     if (status != KB_OK) {
+        fprintf(stderr, "kobox vfio: irq vector=%u select failed status=%d\n", vector, status);
         close(irq->event_fd);
         free(irq);
         return status;
@@ -808,10 +999,20 @@ static kb_status_t vfio_irq_register(
 
     if (ioctl(device->device_fd, VFIO_DEVICE_SET_IRQS, request) != 0) {
         status = errno_status();
+        fprintf(
+            stderr,
+            "kobox vfio: irq vector=%u index=%u start=%u SET_IRQS failed errno=%d status=%d\n",
+            vector,
+            irq->index,
+            irq->start,
+            errno,
+            status);
         close(irq->event_fd);
         free(irq);
         return status;
     }
+    vfio_enable_irq_mode(device, vector);
+    vfio_unmask_irq(device, irq->index, irq->start);
 
     *out_irq = irq;
     return KB_OK;
@@ -895,6 +1096,7 @@ static kb_status_t vfio_irq_wait(kb_device_t *device, kb_irq_t *irq, uint64_t ti
     if (irq->handler != NULL) {
         irq->handler(irq->ctx);
     }
+    vfio_unmask_irq(device, irq->index, irq->start);
     return KB_OK;
 }
 

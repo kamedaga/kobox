@@ -26,9 +26,14 @@ log="$repo_root/.artifacts/nvidia-mock-smoke.log"
 mkdir -p "$repo_root/.artifacts"
 
 KOBOX_TRACE_PCI="${KOBOX_TRACE_PCI:-1}" \
-KOBOX_MOCK_PCI_ID="${KOBOX_MOCK_PCI_ID:-10de:25a2:03:00:00}" \
+KOBOX_MOCK_PCI_ID="${KOBOX_MOCK_PCI_ID:-10de:25b6:03:00:00}" \
+KOBOX_MOCK_NVIDIA_PROBE_COUNT="${KOBOX_MOCK_NVIDIA_PROBE_COUNT:-1}" \
     "$build_dir/kobox-run" run "$module" >"$log" 2>&1
 
-grep -q "init_module returned" "$log"
-grep -q "cleanup_module skipped after failed init_module" "$log"
+grep -q "init_module returned 0" "$log"
+grep -q "cleanup_module returned" "$log"
+if grep -q "probe routine was not called" "$log"; then
+    echo "nvidia mock smoke: unexpected probe-count warning" >&2
+    exit 1
+fi
 echo "nvidia mock smoke: $(tail -n 1 "$log")"

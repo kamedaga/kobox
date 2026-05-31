@@ -67,7 +67,7 @@ ctest --test-dir .artifacts/build
 
 ## ロードマップ
 
-1. NVMe — 単体 .ko、PCI + DMA + IRQ の shim 基盤構築
+1. NVMe — 一部対応完了💕
 2. USB (xHCI) — 複数 .ko 同時ロード、サブシステム対応
 3. Network (e1000e / r8169) — PCI + DMA shim を流用
 4. SATA (AHCI) — NVMe とストレージ shim を共通化

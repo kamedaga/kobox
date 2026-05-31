@@ -1,4 +1,8 @@
 #include "kobox/shim.h"
+#include "subsystem/block.h"
+#include "subsystem/dma.h"
+#include "subsystem/nvme.h"
+#include "subsystem/pci.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -19,27 +23,6 @@ typedef struct shim_dma_pool_alloc {
 } shim_dma_pool_alloc_t;
 
 kb_backend_t *kb_shim_current_backend(void);
-
-typedef struct shim_blk_queue {
-    void *tag_set;
-} shim_blk_queue_t;
-
-typedef struct shim_blk_mq_tags {
-    uint32_t nr_tags;
-    uint32_t nr_reserved_tags;
-    uint32_t active_queues;
-    unsigned char reserved_00c[0x90 - 0x0c];
-    void **rqs;
-} shim_blk_mq_tags_t;
-
-typedef struct shim_blk_tagset_state {
-    void *tag_set;
-    void *tag_array[4];
-    shim_blk_mq_tags_t tags[4];
-    void *rqs[4][64];
-    uint32_t next_tag[4];
-    struct shim_blk_tagset_state *next;
-} shim_blk_tagset_state_t;
 
 typedef struct shim_linux_hctx {
     void *tags;
@@ -79,6 +62,8 @@ enum {
     KB_LINUX_BLK_MQ_TAG_SET_OPS_OFFSET = 0x00,
     KB_LINUX_BLK_MQ_TAG_SET_DRIVER_DATA_OFFSET = 0x58,
     KB_LINUX_BLK_MQ_TAG_SET_TAGS_OFFSET = 0x60,
+    KB_LINUX_6_8_GENDISK_PART0_OFFSET = 0x40,
+    KB_LINUX_6_8_GENDISK_QUEUE_OFFSET = 0x50,
 
     KB_LINUX_REQUEST_HCTX_OFFSET = 0x00,
     KB_LINUX_REQUEST_QUEUE_OFFSET = 0x10,
@@ -113,8 +98,6 @@ enum {
     KB_NVME_ADMIN_QUEUE_DEPTH = 64,
     KB_NVME_IO_QUEUE_DEPTH = 64,
 };
-
-_Static_assert(offsetof(shim_blk_mq_tags_t, rqs) == 0x90, "blk_mq_tags.rqs offset");
 
 typedef struct shim_linux_request {
     void *hctx;
@@ -181,14 +164,7 @@ typedef struct nvme_io_smoke_case {
 static void *tracked_admin_tag_set;
 static unsigned char *tracked_admin_nvmeq;
 static unsigned char *tracked_io_nvmeq;
-static uint64_t tracked_dbbuf_dbs_dma;
-static uint64_t tracked_dbbuf_eis_dma;
-static void *tracked_dbbuf_dbs_cpu;
-static void *tracked_dbbuf_eis_cpu;
-static size_t tracked_dbbuf_dbs_size;
-static size_t tracked_dbbuf_eis_size;
 static unsigned int tracked_io_irq_waits;
-static shim_blk_tagset_state_t *tracked_tagsets;
 
 static uint16_t read_u16(const void *ptr)
 {
@@ -219,6 +195,11 @@ static void write_u64(void *ptr, uint64_t value)
     memcpy(ptr, &value, sizeof(value));
 }
 
+static void write_ptr(void *ptr, void *value)
+{
+    memcpy(ptr, &value, sizeof(value));
+}
+
 static uint32_t mmio_read32(const void *base, size_t offset)
 {
     volatile const uint32_t *reg = (volatile const uint32_t *)((const unsigned char *)base + offset);
@@ -244,9 +225,17 @@ static void *read_ptr(const void *ptr)
     return (void *)value;
 }
 
+static int trace_work_enabled(void);
+
 static int trace_nvme_enabled(void)
 {
     return getenv("KOBOX_TRACE_NVME") != NULL;
+}
+
+static int trace_pci_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_PCI");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
 static void fill_io_pattern(unsigned char *buffer, unsigned int length, uint64_t lba, unsigned int blocks, unsigned int pattern)
@@ -257,21 +246,47 @@ static void fill_io_pattern(unsigned char *buffer, unsigned int length, uint64_t
     }
 }
 
-static uint32_t shim_blk_tagset_alloc_tag(void *tag_set, unsigned char *nvmeq);
+static size_t shim_nvme_queue_index(const unsigned char *nvmeq)
+{
+    if (nvmeq == NULL) {
+        return 0;
+    }
+    uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
+    return qid == 0 ? 0u : (size_t)qid - 1u;
+}
+
+static int shim_blk_tagset_prepare(void *tag_set)
+{
+    void *tag_array = kb_block_subsystem_tagset_array(tag_set);
+    if (tag_array == NULL) {
+        return -12;
+    }
+    write_ptr((unsigned char *)tag_set + KB_LINUX_BLK_MQ_TAG_SET_TAGS_OFFSET, tag_array);
+    return 0;
+}
+
+static uint32_t shim_blk_tagset_alloc_tag(void *tag_set, unsigned char *nvmeq)
+{
+    if (tag_set == NULL || nvmeq == NULL || shim_blk_tagset_prepare(tag_set) != 0) {
+        return 1;
+    }
+    return kb_block_subsystem_tagset_alloc_tag(tag_set, shim_nvme_queue_index(nvmeq));
+}
 
 static void shim_blk_request_init(
     shim_linux_request_t *request,
-    shim_blk_queue_t *queue,
+    void *queue,
     void *ctrl,
     void *nvmeq,
     unsigned int op,
     int owns_queue)
 {
+    void *tag_set = kb_block_subsystem_queue_tag_set(queue);
     memset(request, 0, sizeof(*request));
     request->hctx = &request->hctx_storage;
     request->queue = queue;
     request->cmd_flags = op;
-    request->tag = shim_blk_tagset_alloc_tag(queue->tag_set, nvmeq);
+    request->tag = shim_blk_tagset_alloc_tag(tag_set, nvmeq);
     request->special = request->nvme_cmd;
     request->ctrl = ctrl;
     request->owns_queue = owns_queue ? 1u : 0u;
@@ -279,13 +294,13 @@ static void shim_blk_request_init(
 }
 
 static shim_linux_request_t *shim_blk_request_alloc(
-    shim_blk_queue_t *queue,
+    void *queue,
     void *ctrl,
     void *nvmeq,
     unsigned int op,
     int owns_queue)
 {
-    if (queue == NULL || ctrl == NULL || nvmeq == NULL) {
+    if (queue == NULL || kb_block_subsystem_queue_tag_set(queue) == NULL || ctrl == NULL || nvmeq == NULL) {
         return NULL;
     }
 
@@ -298,76 +313,16 @@ static shim_linux_request_t *shim_blk_request_alloc(
     return request;
 }
 
-static shim_blk_tagset_state_t *shim_blk_tagset_state_for(void *tag_set)
-{
-    for (shim_blk_tagset_state_t *state = tracked_tagsets; state != NULL; state = state->next) {
-        if (state->tag_set == tag_set) {
-            return state;
-        }
-    }
-
-    shim_blk_tagset_state_t *state = calloc(1, sizeof(*state));
-    if (state == NULL) {
-        return NULL;
-    }
-    state->tag_set = tag_set;
-    for (size_t i = 0; i < sizeof(state->tags) / sizeof(state->tags[0]); i++) {
-        state->tag_array[i] = &state->tags[i];
-        state->tags[i].nr_tags = (uint32_t)(sizeof(state->rqs[i]) / sizeof(state->rqs[i][0]));
-        state->tags[i].rqs = state->rqs[i];
-        state->next_tag[i] = 1;
-    }
-
-    void *tag_array = state->tag_array;
-    memcpy((unsigned char *)tag_set + KB_LINUX_BLK_MQ_TAG_SET_TAGS_OFFSET, &tag_array, sizeof(tag_array));
-    state->next = tracked_tagsets;
-    tracked_tagsets = state;
-    return state;
-}
-
-static uint32_t shim_blk_tagset_alloc_tag(void *tag_set, unsigned char *nvmeq)
-{
-    shim_blk_tagset_state_t *state = shim_blk_tagset_state_for(tag_set);
-    if (state == NULL || nvmeq == NULL) {
-        return 1;
-    }
-
-    uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
-    size_t queue_index = qid == 0 ? 0u : (size_t)qid - 1u;
-    if (queue_index >= sizeof(state->tags) / sizeof(state->tags[0])) {
-        return 1;
-    }
-
-    uint32_t limit = state->tags[queue_index].nr_tags;
-    if (limit <= 1) {
-        return 0;
-    }
-
-    uint32_t tag = state->next_tag[queue_index];
-    if (tag == 0 || tag >= limit) {
-        tag = 1;
-    }
-    state->next_tag[queue_index] = tag + 1;
-    if (state->next_tag[queue_index] >= limit) {
-        state->next_tag[queue_index] = 1;
-    }
-    return tag;
-}
-
 static void shim_blk_tagset_bind_request(shim_linux_request_t *request, void *tag_set, unsigned char *nvmeq)
 {
-    if (request == NULL || tag_set == NULL || nvmeq == NULL) {
+    if (request == NULL || tag_set == NULL || nvmeq == NULL || shim_blk_tagset_prepare(tag_set) != 0) {
         return;
     }
 
-    uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
-    size_t queue_index = qid == 0 ? 0u : (size_t)qid - 1u;
-    shim_blk_tagset_state_t *state = shim_blk_tagset_state_for(tag_set);
-    if (state == NULL || queue_index >= sizeof(state->tags) / sizeof(state->tags[0]) || request->tag >= state->tags[queue_index].nr_tags) {
+    size_t queue_index = shim_nvme_queue_index(nvmeq);
+    if (kb_block_subsystem_tagset_bind_request(tag_set, queue_index, request->tag, request) != 0) {
         return;
     }
-
-    state->rqs[queue_index][request->tag] = request;
     if (trace_nvme_enabled()) {
         fprintf(
             stderr,
@@ -385,21 +340,17 @@ static void shim_blk_tagset_unbind_request(shim_linux_request_t *request)
         return;
     }
 
-    shim_blk_queue_t *queue = request->queue;
     shim_linux_hctx_t *hctx = request->hctx;
-    if (queue->tag_set == NULL || hctx == NULL || hctx->driver_data == NULL) {
+    void *tag_set = kb_block_subsystem_queue_tag_set(request->queue);
+    if (tag_set == NULL || hctx == NULL || hctx->driver_data == NULL) {
         return;
     }
 
-    uint16_t qid = read_u16((unsigned char *)hctx->driver_data + KB_NVME_QUEUE_QID_OFFSET);
-    size_t queue_index = qid == 0 ? 0u : (size_t)qid - 1u;
-    shim_blk_tagset_state_t *state = shim_blk_tagset_state_for(queue->tag_set);
-    if (state == NULL || queue_index >= sizeof(state->tags) / sizeof(state->tags[0]) || request->tag >= state->tags[queue_index].nr_tags) {
-        return;
-    }
-    if (state->rqs[queue_index][request->tag] == request) {
-        state->rqs[queue_index][request->tag] = NULL;
-    }
+    kb_block_subsystem_tagset_unbind_request(
+        tag_set,
+        shim_nvme_queue_index(hctx->driver_data),
+        request->tag,
+        request);
 }
 
 static void track_nvme_queue(void *nvmeq_raw)
@@ -418,15 +369,6 @@ static void track_nvme_queue(void *nvmeq_raw)
     if (trace_nvme_enabled()) {
         fprintf(stderr, "kobox nvme: track queue qid=%u nvmeq=%p\n", (unsigned)qid, (void *)nvmeq);
     }
-}
-
-static kb_status_t first_device(kb_backend_t *backend, kb_device_t **out_device)
-{
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
-    if (ops == NULL || ops->device_at == NULL) {
-        return KB_ERR_INVALID;
-    }
-    return ops->device_at(backend, 0, out_device);
 }
 
 void *kb_kmalloc_node(size_t size, unsigned int flags, int node)
@@ -549,10 +491,173 @@ int kb_dma_set_coherent_mask(void *dev, uint64_t mask)
 
 int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags)
 {
-    (void)dev;
-    (void)max_vecs;
-    (void)flags;
-    return min_vecs == 0 ? 1 : (int)min_vecs;
+    enum {
+        KB_PCI_IRQ_LEGACY = 1u << 0,
+        KB_PCI_IRQ_MSI = 1u << 1,
+        KB_PCI_IRQ_MSIX = 1u << 2,
+        KB_PCI_CAP_ID_MSI = 0x05,
+        KB_PCI_CAP_ID_MSIX = 0x11,
+        KB_PCI_MSI_CONTROL_MMC_MASK = 0x000e,
+        KB_PCI_MSI_CONTROL_MME_MASK = 0x0070,
+        KB_PCI_MSI_CONTROL_ENABLE = 0x0001,
+        KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK = 0x07ff,
+        KB_PCI_MSIX_CONTROL_MASKALL = 0x4000,
+        KB_PCI_MSIX_CONTROL_ENABLE = 0x8000,
+        KB_IRQ_BACKEND_KIND_MSI = 1,
+        KB_IRQ_BACKEND_KIND_MSIX = 2,
+    };
+
+    if (min_vecs == 0) {
+        min_vecs = 1;
+    }
+    if (max_vecs == 0 || max_vecs < min_vecs) {
+        return -22;
+    }
+    if (min_vecs > KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX) {
+        return -28;
+    }
+    if (max_vecs > KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX) {
+        max_vecs = KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX;
+    }
+
+    kb_pci_subsystem_irq_vectors_clear();
+    kb_irq_clear_mappings();
+
+    if (trace_pci_enabled()) {
+        fprintf(
+            stderr,
+            "kobox pci: alloc_irq_vectors min=%u max=%u flags=0x%x\n",
+            min_vecs,
+            max_vecs,
+            flags);
+    }
+
+    if ((flags & KB_PCI_IRQ_MSIX) != 0) {
+        int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSIX);
+        if (cap != 0) {
+            uint16_t control = 0;
+            if (kb_pci_read_config_word(dev, cap + 2, &control) == 0) {
+                unsigned int table_size = (unsigned int)((control & KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1u);
+                unsigned int vectors = max_vecs < table_size ? max_vecs : table_size;
+                if (vectors >= min_vecs) {
+                    control |= KB_PCI_MSIX_CONTROL_ENABLE;
+                    control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
+                    if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
+                        return -5;
+                    }
+                    unsigned int linux_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
+                    uint16_t entries[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
+                    for (unsigned int i = 0; i < vectors; i++) {
+                        entries[i] = (uint16_t)i;
+                        if (kb_irq_allocate_mapping(KB_IRQ_BACKEND_KIND_MSIX, i, &linux_vectors[i]) != 0) {
+                            kb_irq_clear_mappings();
+                            kb_pci_subsystem_irq_vectors_clear();
+                            return -12;
+                        }
+                    }
+                    if (kb_pci_msix_unmask_entries(dev, entries, vectors) != 0) {
+                        kb_irq_clear_mappings();
+                        kb_pci_subsystem_irq_vectors_clear();
+                        return -5;
+                    }
+                    if (kb_pci_subsystem_irq_vectors_set(vectors, linux_vectors) != 0) {
+                        kb_irq_clear_mappings();
+                        return -22;
+                    }
+                    if (trace_pci_enabled()) {
+                        fprintf(stderr, "kobox pci: alloc_irq_vectors msix=%u\n", vectors);
+                    }
+                    return (int)vectors;
+                } else if (trace_pci_enabled()) {
+                    fprintf(
+                        stderr,
+                        "kobox pci: alloc_irq_vectors msix insufficient table=%u min=%u\n",
+                        table_size,
+                        min_vecs);
+                }
+            }
+        }
+    }
+    if ((flags & KB_PCI_IRQ_MSI) != 0) {
+        int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSI);
+        if (cap != 0) {
+            uint16_t control = 0;
+            if (kb_pci_read_config_word(dev, cap + 2, &control) == 0) {
+                unsigned int max_supported = 1u << ((control & KB_PCI_MSI_CONTROL_MMC_MASK) >> 1);
+                unsigned int vectors = max_vecs < max_supported ? max_vecs : max_supported;
+                if (vectors >= min_vecs) {
+                    unsigned int mme = 0;
+                    while ((1u << mme) < vectors) {
+                        mme++;
+                    }
+                    if ((1u << mme) > vectors) {
+                        mme--;
+                        vectors = 1u << mme;
+                    }
+                    if (vectors < min_vecs) {
+                        if (trace_pci_enabled()) {
+                            fprintf(
+                                stderr,
+                                "kobox pci: alloc_irq_vectors msi rounded insufficient vectors=%u min=%u\n",
+                                vectors,
+                                min_vecs);
+                        }
+                    } else {
+                        control |= KB_PCI_MSI_CONTROL_ENABLE;
+                        control &= (uint16_t)~KB_PCI_MSI_CONTROL_MME_MASK;
+                        control |= (uint16_t)((mme << 4) & KB_PCI_MSI_CONTROL_MME_MASK);
+                        if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
+                            return -5;
+                        }
+                        unsigned int linux_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
+                        for (unsigned int i = 0; i < vectors; i++) {
+                            if (kb_irq_allocate_mapping(KB_IRQ_BACKEND_KIND_MSI, i, &linux_vectors[i]) != 0) {
+                                kb_irq_clear_mappings();
+                                kb_pci_subsystem_irq_vectors_clear();
+                                return -12;
+                            }
+                        }
+                        if (kb_pci_subsystem_irq_vectors_set(vectors, linux_vectors) != 0) {
+                            kb_irq_clear_mappings();
+                            return -22;
+                        }
+                        if (trace_pci_enabled()) {
+                            fprintf(stderr, "kobox pci: alloc_irq_vectors msi=%u\n", vectors);
+                        }
+                        return (int)vectors;
+                    }
+                } else if (trace_pci_enabled()) {
+                    fprintf(
+                        stderr,
+                        "kobox pci: alloc_irq_vectors msi insufficient max_supported=%u min=%u\n",
+                        max_supported,
+                        min_vecs);
+                }
+            }
+        }
+    }
+    if ((flags & KB_PCI_IRQ_LEGACY) != 0 || flags == 0) {
+        uint8_t interrupt_pin = 0;
+        if (kb_pci_read_config_byte(dev, 0x3d, &interrupt_pin) == 0 && interrupt_pin != 0) {
+            if (min_vecs <= 1) {
+                unsigned int legacy_vector = 0;
+                if (kb_pci_subsystem_irq_vectors_set(1, &legacy_vector) != 0) {
+                    return -22;
+                }
+                if (trace_pci_enabled()) {
+                    fprintf(stderr, "kobox pci: alloc_irq_vectors legacy=1\n");
+                }
+                return 1;
+            }
+            if (trace_pci_enabled()) {
+                fprintf(
+                    stderr,
+                    "kobox pci: alloc_irq_vectors legacy insufficient min=%u\n",
+                    min_vecs);
+            }
+        }
+    }
+    return -28;
 }
 
 int kb_pci_alloc_irq_vectors_affinity(void *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags, void *affd)
@@ -563,13 +668,44 @@ int kb_pci_alloc_irq_vectors_affinity(void *dev, unsigned int min_vecs, unsigned
 
 void kb_pci_free_irq_vectors(void *dev)
 {
-    (void)dev;
+    enum {
+        KB_PCI_CAP_ID_MSI = 0x05,
+        KB_PCI_CAP_ID_MSIX = 0x11,
+        KB_PCI_MSI_CONTROL_ENABLE = 0x0001,
+        KB_PCI_MSIX_CONTROL_ENABLE = 0x8000,
+    };
+
+    int msix_cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSIX);
+    if (msix_cap != 0) {
+        uint16_t control = 0;
+        if (kb_pci_read_config_word(dev, msix_cap + 2, &control) == 0) {
+            control &= (uint16_t)~KB_PCI_MSIX_CONTROL_ENABLE;
+            (void)kb_pci_write_config_word(dev, msix_cap + 2, control);
+        }
+    }
+    int msi_cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSI);
+    if (msi_cap != 0) {
+        uint16_t control = 0;
+        if (kb_pci_read_config_word(dev, msi_cap + 2, &control) == 0) {
+            control &= (uint16_t)~KB_PCI_MSI_CONTROL_ENABLE;
+            (void)kb_pci_write_config_word(dev, msi_cap + 2, control);
+        }
+    }
     kb_free_all_irqs();
+    kb_pci_subsystem_irq_vectors_clear();
+    kb_irq_clear_mappings();
 }
 
 int kb_pci_irq_vector(void *dev, unsigned int nr)
 {
     (void)dev;
+    unsigned int vector = 0;
+    if (kb_pci_subsystem_irq_vector(nr, &vector) == 0) {
+        return (int)vector;
+    }
+    if (kb_pci_subsystem_irq_vector_count() != 0) {
+        return -22;
+    }
     return (int)nr;
 }
 
@@ -582,16 +718,19 @@ int kb_pci_request_irq(
     const char *fmt,
     ...)
 {
-    (void)dev;
     (void)fmt;
+    int irq = kb_pci_irq_vector(dev, nr);
+    if (irq < 0) {
+        return irq;
+    }
     track_nvme_queue(dev_id);
-    return kb_request_threaded_irq(nr, handler, thread_fn, 0, "kobox-pci", dev_id);
+    return kb_request_threaded_irq((unsigned int)irq, handler, thread_fn, 0, "kobox-pci", dev_id);
 }
 
 void kb_pci_free_irq(void *dev, unsigned int nr, void *dev_id)
 {
-    (void)dev;
-    kb_free_irq(nr, dev_id);
+    int irq = kb_pci_irq_vector(dev, nr);
+    kb_free_irq(irq < 0 ? nr : (unsigned int)irq, dev_id);
 }
 
 int kb_pci_enable_device_mem(void *dev)
@@ -649,12 +788,38 @@ int kb_mutex_trylock(void *lock)
 
 void kb_complete(void *completion)
 {
-    (void)completion;
+    if (completion != NULL) {
+        uint32_t done = 1;
+        memcpy(completion, &done, sizeof(done));
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: complete completion=%p done=%u\n", completion, done);
+        }
+    }
+}
+
+void kb_complete_all(void *completion)
+{
+    if (completion != NULL) {
+        uint32_t done = UINT32_MAX / 2u;
+        memcpy(completion, &done, sizeof(done));
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: complete_all completion=%p done=%u\n", completion, done);
+        }
+    }
+}
+
+static int trace_work_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_WORK");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
 void kb_init_completion(void *completion)
 {
-    (void)completion;
+    if (completion != NULL) {
+        uint32_t done = 0;
+        memcpy(completion, &done, sizeof(done));
+    }
 }
 
 void kb_init_waitqueue_head(void *wq_head)
@@ -669,14 +834,64 @@ void kb_init_swait_queue_head(void *wq_head)
 
 unsigned long kb_wait_for_completion(void *completion)
 {
-    (void)completion;
-    return 1;
+    if (completion == NULL) {
+        return 0;
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion completion=%p\n", completion);
+    }
+    for (unsigned i = 0; i < 20; i++) {
+        kb_run_deferred_work();
+        (void)kb_handle_any_irq_no_work(0);
+        uint32_t done = 0;
+        memcpy(&done, completion, sizeof(done));
+        if (done != 0) {
+            done--;
+            memcpy(completion, &done, sizeof(done));
+            if (trace_work_enabled()) {
+                fprintf(stderr, "kobox work: wait_for_completion done completion=%p remaining=%u\n", completion, done);
+            }
+            return 1;
+        }
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion timeout completion=%p\n", completion);
+    }
+    return 0;
 }
 
 unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long timeout)
 {
-    (void)completion;
-    return timeout == 0 ? 1 : timeout;
+    if (completion == NULL) {
+        return 0;
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion_timeout completion=%p timeout=%lu\n", completion, timeout);
+    }
+    const unsigned long loops = timeout == 0 ? 20 : (timeout > 100 ? 100 : timeout);
+    for (unsigned long i = 0; i < loops; i++) {
+        kb_run_deferred_work();
+        (void)kb_handle_any_irq_no_work(0);
+        uint32_t done = 0;
+        memcpy(&done, completion, sizeof(done));
+        if (done != 0) {
+            done--;
+            memcpy(completion, &done, sizeof(done));
+            if (trace_work_enabled()) {
+                fprintf(stderr,
+                    "kobox work: wait_for_completion_timeout done completion=%p remaining=%u left=%lu\n",
+                    completion,
+                    done,
+                    timeout == 0 ? 1 : timeout - i);
+            }
+            return timeout == 0 ? 1 : timeout - i;
+        }
+        (void)kb_handle_any_irq_no_work(1000000ull);
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: wait_for_completion_timeout expired completion=%p timeout=%lu\n", completion, timeout);
+    }
+    return 0;
 }
 
 void kb_trace_noop(void)
@@ -708,16 +923,72 @@ const char *kb_empty_string(void)
     return "";
 }
 
+static void *shim_blk_alloc_disk_with_queue(void *queue)
+{
+    void *disk = kb_block_subsystem_disk_alloc();
+    if (disk == NULL) {
+        return NULL;
+    }
+    void *part0 = kb_block_subsystem_block_device_alloc();
+    if (part0 == NULL) {
+        kb_block_subsystem_object_free(disk);
+        return NULL;
+    }
+
+    write_ptr((unsigned char *)disk + KB_LINUX_6_8_GENDISK_PART0_OFFSET, part0);
+    write_ptr((unsigned char *)disk + KB_LINUX_6_8_GENDISK_QUEUE_OFFSET, queue);
+    return disk;
+}
+
+void *kb_blk_alloc_disk(int node, void *lock_class_key)
+{
+    (void)node;
+    (void)lock_class_key;
+    void *queue = kb_block_subsystem_queue_alloc(NULL);
+    if (queue == NULL) {
+        return NULL;
+    }
+    void *disk = shim_blk_alloc_disk_with_queue(queue);
+    if (disk == NULL) {
+        kb_block_subsystem_object_free(queue);
+        return NULL;
+    }
+    return disk;
+}
+
+void *kb_blk_mq_alloc_disk(void *tag_set, void *queuedata, void *lock_class_key)
+{
+    (void)queuedata;
+    (void)lock_class_key;
+    if (tag_set == NULL) {
+        return NULL;
+    }
+
+    void *queue = kb_block_subsystem_queue_alloc(tag_set);
+    if (queue == NULL) {
+        return NULL;
+    }
+    void *disk = shim_blk_alloc_disk_with_queue(queue);
+    if (disk == NULL) {
+        kb_block_subsystem_object_free(queue);
+        return NULL;
+    }
+    tracked_admin_tag_set = tag_set;
+    if (trace_nvme_enabled()) {
+        fprintf(stderr, "kobox nvme: blk_mq_alloc_disk tag_set=%p disk=%p queue=%p\n", tag_set, disk, queue);
+    }
+    return disk;
+}
+
 void *kb_blk_mq_init_queue(void *tag_set)
 {
     if (tag_set == NULL) {
         return NULL;
     }
-    shim_blk_queue_t *queue = calloc(1, sizeof(*queue));
+    void *queue = kb_block_subsystem_queue_alloc(tag_set);
     if (queue == NULL) {
         return NULL;
     }
-    queue->tag_set = tag_set;
     tracked_admin_tag_set = tag_set;
     if (trace_nvme_enabled()) {
         fprintf(stderr, "kobox nvme: blk_mq_init_queue tag_set=%p queue=%p\n", tag_set, (void *)queue);
@@ -732,8 +1003,7 @@ void *kb_blk_mq_alloc_request(void *queue, unsigned int op, unsigned int flags)
         return NULL;
     }
 
-    shim_blk_queue_t *blk_queue = queue;
-    unsigned char *tag_set = blk_queue->tag_set;
+    unsigned char *tag_set = kb_block_subsystem_queue_tag_set(queue);
     if (tag_set == NULL) {
         return NULL;
     }
@@ -758,7 +1028,7 @@ void *kb_blk_mq_alloc_request(void *queue, unsigned int op, unsigned int flags)
         return NULL;
     }
 
-    shim_linux_request_t *request = shim_blk_request_alloc(blk_queue, ctrl, nvmeq, op, 0);
+    shim_linux_request_t *request = shim_blk_request_alloc(queue, ctrl, nvmeq, op, 0);
     if (request == NULL) {
         return NULL;
     }
@@ -785,18 +1055,23 @@ int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int le
     }
 
     kb_backend_t *backend = kb_shim_current_backend();
-    kb_device_t *device = NULL;
-    if (first_device(backend, &device) != KB_OK) {
+    kb_device_t *device = kb_subsystem_dma_default_device(backend);
+    if (device == NULL) {
         return -19;
     }
 
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
-    if (ops == NULL || ops->dma_map == NULL) {
+    kb_status_t dma_status = KB_ERR_INVALID;
+    uint64_t dma_addr = kb_subsystem_dma_map(
+        backend,
+        device,
+        buffer,
+        length,
+        KB_DMA_BIDIRECTIONAL,
+        &dma_status);
+    if (dma_status == KB_ERR_UNSUPPORTED) {
         return -95;
     }
-
-    uint64_t dma_addr = 0;
-    if (ops->dma_map(device, buffer, length, KB_DMA_BIDIRECTIONAL, &dma_addr) != KB_OK) {
+    if (dma_status != KB_OK) {
         return -5;
     }
 
@@ -820,13 +1095,13 @@ int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int le
             size_t prp_count = (remaining + KB_NVME_PAGE_SIZE - 1u) / KB_NVME_PAGE_SIZE;
             size_t list_len = prp_count * sizeof(uint64_t);
             if (list_len > KB_NVME_PAGE_SIZE) {
-                ops->dma_unmap(device, dma_addr, length, KB_DMA_BIDIRECTIONAL);
+                kb_subsystem_dma_unmap(backend, device, dma_addr, length, KB_DMA_BIDIRECTIONAL);
                 return -95;
             }
 
             uint64_t *prp_list = calloc(prp_count, sizeof(*prp_list));
             if (prp_list == NULL) {
-                ops->dma_unmap(device, dma_addr, length, KB_DMA_BIDIRECTIONAL);
+                kb_subsystem_dma_unmap(backend, device, dma_addr, length, KB_DMA_BIDIRECTIONAL);
                 return -12;
             }
             for (size_t i = 0; i < prp_count; i++) {
@@ -834,9 +1109,17 @@ int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int le
             }
 
             uint64_t prp_list_dma = 0;
-            if (ops->dma_map(device, prp_list, list_len, KB_DMA_BIDIRECTIONAL, &prp_list_dma) != KB_OK) {
+            dma_status = KB_ERR_INVALID;
+            prp_list_dma = kb_subsystem_dma_map(
+                backend,
+                device,
+                prp_list,
+                list_len,
+                KB_DMA_BIDIRECTIONAL,
+                &dma_status);
+            if (dma_status != KB_OK) {
                 free(prp_list);
-                ops->dma_unmap(device, dma_addr, length, KB_DMA_BIDIRECTIONAL);
+                kb_subsystem_dma_unmap(backend, device, dma_addr, length, KB_DMA_BIDIRECTIONAL);
                 return -5;
             }
 
@@ -878,16 +1161,14 @@ static void *nvme_smoke_alloc_request_for_queue(unsigned char *nvmeq, void *tag_
         return NULL;
     }
 
-    shim_blk_queue_t *queue = calloc(1, sizeof(*queue));
+    void *queue = kb_block_subsystem_queue_alloc(tag_set);
     if (queue == NULL) {
-        free(queue);
         return NULL;
     }
 
-    queue->tag_set = tag_set;
     shim_linux_request_t *request = shim_blk_request_alloc(queue, ctrl, nvmeq, op, 1);
     if (request == NULL) {
-        free(queue);
+        kb_block_subsystem_object_free(queue);
         return NULL;
     }
     return request;
@@ -939,7 +1220,8 @@ static int nvme_submit_admin_create_queue(unsigned char *adminq, uint8_t opcode,
     write_u64(cmd + 24, prp1);
     write_u32(cmd + 40, ((uint32_t)(depth - 1u) << 16) | qid);
     if (opcode == KB_NVME_ADMIN_CREATE_CQ) {
-        write_u32(cmd + 44, 0x00000003u);
+        unsigned int cq_vector = kb_pci_subsystem_irq_vector_count() > qid ? qid : 0u;
+        write_u32(cmd + 44, (cq_vector << 16) | 0x00000003u);
     } else {
         write_u32(cmd + 44, ((uint32_t)qid << 16) | 0x00000001u);
     }
@@ -951,7 +1233,7 @@ static int nvme_submit_admin_create_queue(unsigned char *adminq, uint8_t opcode,
 
 static int nvme_submit_admin_dbbuf_config(unsigned char *adminq)
 {
-    if (tracked_dbbuf_dbs_dma == 0 || tracked_dbbuf_eis_dma == 0) {
+    if (!kb_nvme_subsystem_dbbuf_ready()) {
         return 0;
     }
 
@@ -963,8 +1245,8 @@ static int nvme_submit_admin_dbbuf_config(unsigned char *adminq)
     unsigned char *cmd = ((shim_linux_request_t *)request)->special;
     memset(cmd, 0, 64);
     cmd[0] = KB_NVME_ADMIN_DBBUF_CONFIG;
-    write_u64(cmd + 24, tracked_dbbuf_dbs_dma);
-    write_u64(cmd + 32, tracked_dbbuf_eis_dma);
+    write_u64(cmd + 24, kb_nvme_subsystem_dbbuf_dbs_dma());
+    write_u64(cmd + 32, kb_nvme_subsystem_dbbuf_eis_dma());
 
     int result = kb_blk_execute_rq(request, 0);
     nvme_smoke_free_request(request);
@@ -1012,12 +1294,7 @@ static void nvme_reset_queue_state(unsigned char *nvmeq)
 
 static void nvme_reset_dbbuf_shadow(void)
 {
-    if (tracked_dbbuf_dbs_cpu != NULL && tracked_dbbuf_dbs_size != 0) {
-        memset(tracked_dbbuf_dbs_cpu, 0, tracked_dbbuf_dbs_size);
-    }
-    if (tracked_dbbuf_eis_cpu != NULL && tracked_dbbuf_eis_size != 0) {
-        memset(tracked_dbbuf_eis_cpu, 0, tracked_dbbuf_eis_size);
-    }
+    kb_nvme_subsystem_reset_dbbuf_shadow();
 }
 
 static int nvme_wait_ready(unsigned char *bar, int ready)
@@ -1034,25 +1311,37 @@ static int nvme_wait_ready(unsigned char *bar, int ready)
 static int nvme_dma_map_existing(void *cpu_addr, uint64_t size, uint64_t *out_dma)
 {
     kb_backend_t *backend = kb_shim_current_backend();
-    kb_device_t *device = NULL;
-    if (first_device(backend, &device) != KB_OK) {
+    kb_device_t *device = kb_subsystem_dma_default_device(backend);
+    if (device == NULL) {
         return -19;
     }
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
-    if (ops == NULL || ops->dma_map == NULL) {
+    kb_status_t status = KB_ERR_INVALID;
+    uint64_t dma_addr = kb_subsystem_dma_map(
+        backend,
+        device,
+        cpu_addr,
+        (size_t)size,
+        KB_DMA_BIDIRECTIONAL,
+        &status);
+    if (status == KB_ERR_UNSUPPORTED) {
         return -95;
     }
-    return ops->dma_map(device, cpu_addr, size, KB_DMA_BIDIRECTIONAL, out_dma) == KB_OK ? 0 : -5;
+    if (status != KB_OK) {
+        return -5;
+    }
+    *out_dma = dma_addr;
+    return 0;
 }
 
 static void nvme_dma_unmap_existing(uint64_t dma_addr, uint64_t size)
 {
     kb_backend_t *backend = kb_shim_current_backend();
-    kb_device_t *device = NULL;
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
-    if (ops != NULL && ops->dma_unmap != NULL && first_device(backend, &device) == KB_OK) {
-        ops->dma_unmap(device, dma_addr, size, KB_DMA_BIDIRECTIONAL);
-    }
+    kb_subsystem_dma_unmap(
+        backend,
+        kb_subsystem_dma_default_device(backend),
+        dma_addr,
+        (size_t)size,
+        KB_DMA_BIDIRECTIONAL);
 }
 
 static int nvme_reset_controller_and_recreate_io_queue(void)
@@ -1313,23 +1602,25 @@ void kb_blk_mq_free_request(void *request)
     uint32_t prp_list_len = rq->prp_list_len;
     if (prp_list != NULL && prp_list_dma != 0 && prp_list_len != 0) {
         kb_backend_t *backend = kb_shim_current_backend();
-        kb_device_t *device = NULL;
-        const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
-        if (ops != NULL && ops->dma_unmap != NULL && first_device(backend, &device) == KB_OK) {
-            ops->dma_unmap(device, prp_list_dma, prp_list_len, KB_DMA_BIDIRECTIONAL);
-        }
+        kb_subsystem_dma_unmap(
+            backend,
+            kb_subsystem_dma_default_device(backend),
+            prp_list_dma,
+            prp_list_len,
+            KB_DMA_BIDIRECTIONAL);
         free(prp_list);
     }
     if (dma_addr != 0 && dma_len != 0) {
         kb_backend_t *backend = kb_shim_current_backend();
-        kb_device_t *device = NULL;
-        const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
-        if (ops != NULL && ops->dma_unmap != NULL && first_device(backend, &device) == KB_OK) {
-            ops->dma_unmap(device, dma_addr, dma_len, KB_DMA_BIDIRECTIONAL);
-        }
+        kb_subsystem_dma_unmap(
+            backend,
+            kb_subsystem_dma_default_device(backend),
+            dma_addr,
+            dma_len,
+            KB_DMA_BIDIRECTIONAL);
     }
     if (rq->owns_queue) {
-        free(rq->queue);
+        kb_block_subsystem_object_free(rq->queue);
     }
     free(request);
 }
@@ -1343,12 +1634,11 @@ int kb_blk_execute_rq(void *request, int at_head)
 
     shim_linux_request_t *rq = request;
     shim_linux_hctx_t *hctx = rq->hctx;
-    shim_blk_queue_t *queue = rq->queue;
-    if (hctx == NULL || queue == NULL || queue->tag_set == NULL) {
+    unsigned char *tag_set = kb_block_subsystem_queue_tag_set(rq->queue);
+    if (hctx == NULL || tag_set == NULL) {
         return -22;
     }
 
-    unsigned char *tag_set = queue->tag_set;
     unsigned char *ops = read_ptr(tag_set + KB_LINUX_BLK_MQ_TAG_SET_OPS_OFFSET);
     if (ops == NULL) {
         return -22;
@@ -1374,20 +1664,21 @@ int kb_blk_execute_rq(void *request, int at_head)
         cmd = rq->nvme_cmd;
     }
     if (cmd[0] == KB_NVME_ADMIN_DBBUF_CONFIG) {
-        tracked_dbbuf_dbs_dma = read_u64(cmd + 24);
-        tracked_dbbuf_eis_dma = read_u64(cmd + 32);
-        tracked_dbbuf_dbs_cpu = kb_dma_cpu_addr(tracked_dbbuf_dbs_dma, &tracked_dbbuf_dbs_size);
-        tracked_dbbuf_eis_cpu = kb_dma_cpu_addr(tracked_dbbuf_eis_dma, &tracked_dbbuf_eis_size);
+        kb_nvme_subsystem_track_dbbuf(read_u64(cmd + 24), read_u64(cmd + 32));
         if (trace_nvme_enabled()) {
+            size_t dbs_size = 0;
+            size_t eis_size = 0;
+            void *dbs_cpu = kb_nvme_subsystem_dbbuf_dbs_cpu(&dbs_size);
+            void *eis_cpu = kb_nvme_subsystem_dbbuf_eis_cpu(&eis_size);
             fprintf(
                 stderr,
                 "kobox nvme: track dbbuf dbs=0x%llx/%p+%zu eis=0x%llx/%p+%zu\n",
-                (unsigned long long)tracked_dbbuf_dbs_dma,
-                tracked_dbbuf_dbs_cpu,
-                tracked_dbbuf_dbs_size,
-                (unsigned long long)tracked_dbbuf_eis_dma,
-                tracked_dbbuf_eis_cpu,
-                tracked_dbbuf_eis_size);
+                (unsigned long long)kb_nvme_subsystem_dbbuf_dbs_dma(),
+                dbs_cpu,
+                dbs_size,
+                (unsigned long long)kb_nvme_subsystem_dbbuf_eis_dma(),
+                eis_cpu,
+                eis_size);
         }
     }
 
@@ -1444,22 +1735,17 @@ int kb_blk_execute_rq(void *request, int at_head)
     uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
     if (qid != 0) {
         if (trace_nvme_enabled()) {
-            unsigned char *queue_dev = read_ptr(nvmeq + KB_NVME_QUEUE_DEV_OFFSET);
-            void **tags_array = queue_dev == NULL ? NULL : read_ptr(queue_dev + 0x68);
-            unsigned char *tags = tags_array == NULL ? NULL : tags_array[qid - 1u];
-            void **rqs = tags == NULL ? NULL : read_ptr(tags + 0x90);
-            void *tag_request = rqs == NULL ? NULL : rqs[rq->tag];
+            size_t queue_index = shim_nvme_queue_index(nvmeq);
+            void *tag_request = kb_block_subsystem_tagset_request(tag_set, queue_index, rq->tag);
             uint16_t command_id = read_u16((const void *)(completion + 12));
             unsigned int command_gen = (unsigned int)((command_id >> 12) & 0xfu);
             unsigned int request_gen = (unsigned int)(rq->reserved_120[0] & 0xfu);
             fprintf(
                 stderr,
-                "kobox blk-mq: irq lookup qid=%u dev=%p tags_array=%p tags=%p rqs=%p tag=%u cid=0x%x gen=%u/%u request=%p tag_request=%p\n",
+                "kobox blk-mq: irq lookup qid=%u queue=%zu tagset=%p tag=%u cid=0x%x gen=%u/%u request=%p tag_request=%p\n",
                 (unsigned)qid,
-                (void *)queue_dev,
-                (void *)tags_array,
-                (void *)tags,
-                (void *)rqs,
+                queue_index,
+                (void *)tag_set,
                 rq->tag,
                 command_id,
                 command_gen,

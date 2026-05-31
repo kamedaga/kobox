@@ -6,7 +6,7 @@ param(
     [string]$PayloadRoot = ".\.artifacts\live-usb-payload\kobox-live",
 
     [Parameter(Mandatory = $false)]
-    [string]$IsoPath = ".\.artifacts\ubuntu-26.04-desktop-amd64.iso",
+    [string]$IsoPath = ".\.artifacts\ubuntu-24.04.4-desktop-amd64.iso",
 
     [Parameter(Mandatory = $false)]
     [switch]$SkipIso

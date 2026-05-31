@@ -3,12 +3,11 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir="${BUILD_DIR:-$repo_root/.artifacts/build-current}"
-work_dir="$repo_root/.artifacts/qemu-vfio-nvme-ko"
+work_dir="$repo_root/.artifacts/qemu-vfio-xhci-pci"
 debs_dir="$repo_root/.artifacts/debs"
 root_dir="$work_dir/initramfs-root"
 serial_log="$work_dir/serial.log"
 qemu_stderr="$work_dir/qemu.stderr"
-qemu_trace_events="$work_dir/qemu-trace-events"
 kernel_pkg="${KERNEL_IMAGE_PACKAGE:-linux-image-6.8.0-117-generic}"
 kernel_version="${KERNEL_VERSION:-6.8.0-117-generic}"
 modules_pkg="${KERNEL_MODULES_PACKAGE:-linux-modules-6.8.0-117-generic}"
@@ -106,12 +105,8 @@ copy_module kernel/drivers/vfio/pci/vfio-pci-core.ko
 copy_module kernel/drivers/vfio/pci/vfio-pci.ko
 copy_module kernel/drivers/iommu/iommufd/iommufd.ko
 copy_module kernel/virt/lib/irqbypass.ko
-copy_module kernel/drivers/nvme/common/nvme-auth.ko
-copy_module kernel/drivers/nvme/host/nvme-core.ko
-copy_module kernel/drivers/nvme/host/nvme.ko
-cp "$root_dir/lib/modules/$kernel_version/kernel/drivers/nvme/common/nvme-auth.ko" "$root_dir/usr/lib/kobox/nvme-auth.ko"
-cp "$root_dir/lib/modules/$kernel_version/kernel/drivers/nvme/host/nvme-core.ko" "$root_dir/usr/lib/kobox/nvme-core.ko"
-cp "$root_dir/lib/modules/$kernel_version/kernel/drivers/nvme/host/nvme.ko" "$root_dir/usr/lib/kobox/nvme.ko"
+copy_module kernel/drivers/usb/host/xhci-pci.ko
+cp "$root_dir/lib/modules/$kernel_version/kernel/drivers/usb/host/xhci-pci.ko" "$root_dir/usr/lib/kobox/xhci-pci.ko"
 
 cat >"$root_dir/init" <<'INIT'
 #!/bin/sh
@@ -126,7 +121,7 @@ mkdir -p /dev/vfio
 [ -e /dev/null ] || mknod /dev/null c 1 3
 [ -e /dev/vfio/vfio ] || mknod /dev/vfio/vfio c 10 196
 
-echo "kobox-qemu-vfio-nvme-ko: booted"
+echo "kobox-qemu-vfio-xhci-pci: booted"
 
 insmod /lib/modules/@KERNEL_VERSION@/kernel/virt/lib/irqbypass.ko || true
 insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/iommu/iommufd/iommufd.ko
@@ -135,33 +130,33 @@ insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/vfio/vfio_iommu_type1.ko
 insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/vfio/pci/vfio-pci-core.ko
 insmod /lib/modules/@KERNEL_VERSION@/kernel/drivers/vfio/pci/vfio-pci.ko
 
-nvme_bdf=""
+xhci_bdf=""
 for dev in /sys/bus/pci/devices/*; do
     [ -f "$dev/class" ] || continue
     class=$(cat "$dev/class")
-    if [ "$class" = "0x010802" ]; then
-        nvme_bdf=${dev##*/}
+    if [ "$class" = "0x0c0330" ]; then
+        xhci_bdf=${dev##*/}
         break
     fi
 done
 
-if [ -z "$nvme_bdf" ]; then
-    echo "kobox-qemu-vfio-nvme-ko: nvme device not found"
+if [ -z "$xhci_bdf" ]; then
+    echo "kobox-qemu-vfio-xhci-pci: xhci device not found"
     poweroff -f
 fi
 
-vendor=$(cat "/sys/bus/pci/devices/$nvme_bdf/vendor")
-device=$(cat "/sys/bus/pci/devices/$nvme_bdf/device")
+vendor=$(cat "/sys/bus/pci/devices/$xhci_bdf/vendor")
+device=$(cat "/sys/bus/pci/devices/$xhci_bdf/device")
 vendor=${vendor#0x}
 device=${device#0x}
-echo "kobox-qemu-vfio-nvme-ko: nvme=$nvme_bdf id=$vendor:$device"
+echo "kobox-qemu-vfio-xhci-pci: xhci=$xhci_bdf id=$vendor:$device"
 echo "$vendor $device" >/sys/bus/pci/drivers/vfio-pci/new_id || true
-if [ -e "/sys/bus/pci/devices/$nvme_bdf/driver/unbind" ]; then
-    echo "$nvme_bdf" >"/sys/bus/pci/devices/$nvme_bdf/driver/unbind" || true
+if [ -e "/sys/bus/pci/devices/$xhci_bdf/driver/unbind" ]; then
+    echo "$xhci_bdf" >"/sys/bus/pci/devices/$xhci_bdf/driver/unbind" || true
 fi
-echo "$nvme_bdf" >/sys/bus/pci/drivers/vfio-pci/bind || true
+echo "$xhci_bdf" >/sys/bus/pci/drivers/vfio-pci/bind || true
 
-group=$(basename "$(readlink "/sys/bus/pci/devices/$nvme_bdf/iommu_group")")
+group=$(basename "$(readlink "/sys/bus/pci/devices/$xhci_bdf/iommu_group")")
 if [ ! -e "/dev/vfio/$group" ]; then
     devno=$(cat "/sys/class/vfio/$group/dev")
     major=${devno%:*}
@@ -169,82 +164,26 @@ if [ ! -e "/dev/vfio/$group" ]; then
     mknod "/dev/vfio/$group" c "$major" "$minor"
 fi
 
-echo "kobox-qemu-vfio-nvme-ko: group=$group"
-/usr/bin/kobox-ls-devices vfio "$nvme_bdf"
+echo "kobox-qemu-vfio-xhci-pci: group=$group"
+/usr/bin/kobox-ls-devices vfio "$xhci_bdf"
 
 set +e
-/usr/bin/kobox-run \
-    --backend=vfio \
-    --pci="$nvme_bdf" \
-    --dep=/usr/lib/kobox/nvme-auth.ko \
-    --dep=/usr/lib/kobox/nvme-core.ko \
-    run /usr/lib/kobox/nvme.ko
+KOBOX_TRACE_PCI=1 KOBOX_TRACE_USB=1 KOBOX_TRACE_MODULES=1 KOBOX_TRACE_SHIM_CALLS=1 KOBOX_TRACE_SHIM_CALLS_TOP=96 \
+    /usr/bin/kobox-run --backend=vfio --pci="$xhci_bdf" run /usr/lib/kobox/xhci-pci.ko
 status=$?
 set -e
 
-echo "kobox-qemu-vfio-nvme-ko: status=$status"
+echo "kobox-qemu-vfio-xhci-pci: status=$status"
 poweroff -f
 INIT
 chmod +x "$root_dir/init"
 sed -i "s/@KERNEL_VERSION@/$kernel_version/g" "$root_dir/init"
-kobox_run_env="KOBOX_NVME_IO_SMOKE=1"
-if [ "${KOBOX_TRACE_NVME:-}" = "1" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_NVME=1"
-fi
-if [ "${KOBOX_TRACE_PCI:-}" = "1" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_PCI=1"
-fi
-if [ "${KOBOX_TRACE_IRQ:-}" = "1" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_IRQ=1"
-fi
-if [ -n "${KOBOX_TRACE_MODULES:-}" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_MODULES=$KOBOX_TRACE_MODULES"
-fi
-if [ -n "${KOBOX_TRACE_SHIM_CALLS:-}" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_SHIM_CALLS=$KOBOX_TRACE_SHIM_CALLS"
-fi
-if [ -n "${KOBOX_TRACE_SHIM_CALLS_TOP:-}" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_SHIM_CALLS_TOP=$KOBOX_TRACE_SHIM_CALLS_TOP"
-fi
-if [ -n "${KOBOX_CRASH_STACK:-}" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_CRASH_STACK=$KOBOX_CRASH_STACK"
-fi
-if [ -n "$kobox_run_env" ]; then
-    kobox_run_env=${kobox_run_env# }
-    sed -i "s#^/usr/bin/kobox-run #$kobox_run_env /usr/bin/kobox-run #" "$root_dir/init"
-fi
 
 initramfs="$work_dir/initramfs.cpio"
 (cd "$root_dir" && find . -print | "$cpio_bin" -o -H newc --quiet >"$initramfs")
 
-disk="$work_dir/nvme.img"
-if [ ! -f "$disk" ]; then
-    qemu-img create -f raw "$disk" 16M >/dev/null
-fi
-
 rm -f "$serial_log" "$qemu_stderr"
-qemu_trace_args=""
-if [ "${KOBOX_QEMU_TRACE_NVME:-}" = "1" ]; then
-    cat >"$qemu_trace_events" <<'TRACE'
-pci_nvme_admin_cmd
-pci_nvme_io_cmd
-pci_nvme_dbbuf_config
-pci_nvme_setfeat
-pci_nvme_getfeat
-pci_nvme_process_aers
-pci_nvme_aer
-pci_nvme_aer_post_cqe
-pci_nvme_enqueue_req_completion
-pci_nvme_map_prp
-pci_nvme_dma_read
-pci_nvme_mmio_cfg
-pci_nvme_mmio_stopped
-pci_nvme_pci_reset
-TRACE
-    qemu_trace_args="-trace events=$qemu_trace_events"
-fi
 qemu-system-x86_64 \
-    $qemu_trace_args \
     -enable-kvm \
     -machine q35,accel=kvm,kernel-irqchip=split \
     -cpu host \
@@ -253,8 +192,7 @@ qemu-system-x86_64 \
     -initrd "$initramfs" \
     -append "console=ttyS0 panic=-1 quiet intel_iommu=on iommu=pt" \
     -device intel-iommu,intremap=on \
-    -drive id=nvme0,if=none,format=raw,file="$disk" \
-    -device nvme,serial=koboxnvme0,drive=nvme0 \
+    -device qemu-xhci,id=xhci0 \
     -no-reboot \
     -display none \
     -serial "file:$serial_log" \
@@ -264,18 +202,7 @@ cat "$serial_log"
 if [ -s "$qemu_stderr" ]; then
     cat "$qemu_stderr" >&2
 fi
-grep -q "kobox-qemu-vfio-nvme-ko: status=0" "$serial_log"
-grep -q "dependency /usr/lib/kobox/nvme-core.ko init_module returned 0" "$serial_log"
-grep -q "1/0/0 default/read/poll queues" "$serial_log"
+grep -q "kobox-qemu-vfio-xhci-pci: status=0" "$serial_log"
+grep -q "kobox usb: usb_hcd_pci_probe" "$serial_log"
 grep -q "init_module returned 0" "$serial_log"
-grep -q "kobox nvme io smoke: read-after-reset lba=17 blocks=1 bytes=512 compare=ok" "$serial_log"
-grep -q "kobox nvme io smoke: read-after-reset lba=109 blocks=2 bytes=1024 compare=ok" "$serial_log"
-grep -q "kobox nvme io smoke: read-after-reset lba=257 blocks=4 bytes=2048 compare=ok" "$serial_log"
-grep -q "kobox nvme io smoke: cases=3 reset=ok msix-waits=6 block-requests=ok" "$serial_log"
 grep -q "cleanup_module returned" "$serial_log"
-! grep -q "missing or invalid SUBNQN field" "$serial_log"
-! grep -q "IO queues not created" "$serial_log"
-! grep -q "blk_execute_rq timeout" "$serial_log"
-! grep -q "vtd_iova_to_slpte" "$qemu_stderr"
-! grep -q "vtd_iommu_translate" "$qemu_stderr"
-! grep -q "detected translation failure" "$qemu_stderr"

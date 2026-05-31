@@ -18,7 +18,13 @@ add_library(kobox_runtime STATIC
     src/backend/linux_vfio/backend_linux_vfio.c
     src/loader/elf_reader.c
     src/loader/module_loader.c
+    src/subsystem/block.c
+    src/subsystem/dma.c
+    src/subsystem/nvme.c
+    src/subsystem/pci.c
+    src/subsystem/usb.c
     src/shim/linux_context.c
+    src/shim/linux_device.c
     src/shim/linux_dma.c
     src/shim/linux_irq.c
     src/shim/linux_memory.c
@@ -28,7 +34,9 @@ add_library(kobox_runtime STATIC
     src/shim/linux_pci.c
     src/shim/linux_platform.c
     src/shim/linux_printk.c
+    src/shim/linux_usb.c
     src/shim/linux_virtio_input.c
+    src/shim/linux_work.c
 )
 
 target_include_directories(kobox_runtime
@@ -143,6 +151,42 @@ add_test(
     NAME kobox-nvidia-mock-smoke
     COMMAND sh
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_nvidia_mock_smoke.sh
+)
+
+add_test(
+    NAME kobox-nvidia-modeset-mock-smoke
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_nvidia_modeset_mock_smoke.sh
+)
+
+add_test(
+    NAME kobox-nvidia-uvm-mock-smoke
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_nvidia_uvm_mock_smoke.sh
+)
+
+add_test(
+    NAME kobox-nvidia-drm-mock-smoke
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_nvidia_drm_mock_smoke.sh
+)
+
+add_test(
+    NAME kobox-nvidia-stack-mock-smoke
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_nvidia_stack_mock_smoke.sh
+)
+
+add_test(
+    NAME kobox-xhci-pci-mock-smoke
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_xhci_pci_mock_smoke.sh
+)
+
+add_test(
+    NAME kobox-xhci-pci-vfio-smoke
+    COMMAND sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_xhci_pci_vfio_smoke.sh
 )
 
 add_test(

@@ -6,10 +6,18 @@
 #include <string.h>
 #include <time.h>
 
+enum {
+    KB_MOCK_PCI_BAR_COUNT = 6,
+    KB_MOCK_IORESOURCE_MEM = 0x00000200,
+};
+
 struct kb_device {
     kb_pci_id_t pci_id;
     kb_pci_location_t location;
-    unsigned char bar0[4096];
+    unsigned char *bars[KB_MOCK_PCI_BAR_COUNT];
+    size_t bar_sizes[KB_MOCK_PCI_BAR_COUNT];
+    uint64_t bar_starts[KB_MOCK_PCI_BAR_COUNT];
+    uint64_t bar_flags[KB_MOCK_PCI_BAR_COUNT];
 };
 
 struct kb_irq {
@@ -27,9 +35,30 @@ static kb_linux_mock_backend_t *mock_from_backend(kb_backend_t *backend)
     return (kb_linux_mock_backend_t *)backend;
 }
 
+static void mock_mmio_write32(unsigned char *bar, size_t bar_size, size_t offset, uint32_t value)
+{
+    if (bar == 0 || offset + sizeof(value) > bar_size) {
+        return;
+    }
+    memcpy(bar + offset, &value, sizeof(value));
+}
+
+static void initialize_mock_gpu_mmio(kb_device_t *device)
+{
+    if (device->pci_id.vendor_id != 0x10de || device->bars[0] == 0) {
+        return;
+    }
+    mock_mmio_write32(device->bars[0], device->bar_sizes[0], 0x000000, 0xb77000a1u);
+    mock_mmio_write32(device->bars[0], device->bar_sizes[0], 0x000a00, 0x17700000u);
+}
+
 static void mock_destroy(kb_backend_t *backend)
 {
-    free(mock_from_backend(backend));
+    kb_linux_mock_backend_t *mock = mock_from_backend(backend);
+    for (unsigned i = 0; i < KB_MOCK_PCI_BAR_COUNT; i++) {
+        free(mock->device.bars[i]);
+    }
+    free(mock);
 }
 
 static kb_status_t mock_device_count(kb_backend_t *backend, size_t *out_count)
@@ -97,13 +126,13 @@ static kb_status_t mock_pci_bar_info(kb_device_t *device, unsigned bar_index, kb
     if (device == 0 || out_info == 0) {
         return KB_ERR_INVALID;
     }
-    if (bar_index != 0) {
+    if (bar_index >= KB_MOCK_PCI_BAR_COUNT || device->bars[bar_index] == 0) {
         return KB_ERR_NOT_FOUND;
     }
-    out_info->start = 0;
-    out_info->end = sizeof(device->bar0) - 1;
-    out_info->size = sizeof(device->bar0);
-    out_info->flags = 0;
+    out_info->start = device->bar_starts[bar_index];
+    out_info->end = device->bar_starts[bar_index] + device->bar_sizes[bar_index] - 1;
+    out_info->size = device->bar_sizes[bar_index];
+    out_info->flags = device->bar_flags[bar_index];
     out_info->present = 1;
     return KB_OK;
 }
@@ -113,13 +142,13 @@ static kb_status_t mock_map_bar(kb_device_t *device, unsigned bar_index, kb_mmio
     if (device == 0 || out_region == 0) {
         return KB_ERR_INVALID;
     }
-    if (bar_index != 0) {
+    if (bar_index >= KB_MOCK_PCI_BAR_COUNT || device->bars[bar_index] == 0) {
         return KB_ERR_NOT_FOUND;
     }
-    out_region->addr = device->bar0;
-    out_region->size = sizeof(device->bar0);
-    out_region->backend_phys = 0;
-    out_region->flags = 0;
+    out_region->addr = device->bars[bar_index];
+    out_region->size = device->bar_sizes[bar_index];
+    out_region->backend_phys = device->bar_starts[bar_index];
+    out_region->flags = device->bar_flags[bar_index];
     return KB_OK;
 }
 
@@ -268,6 +297,33 @@ static void configure_mock_pci_id_from_env(kb_linux_mock_backend_t *backend)
         backend->device.pci_id.subclass = (uint8_t)subclass;
         backend->device.pci_id.prog_if = (uint8_t)prog_if;
     }
+    if (backend->device.pci_id.vendor_id == 0x10de) {
+        if (backend->device.pci_id.subsystem_vendor_id == 0) {
+            backend->device.pci_id.subsystem_vendor_id = backend->device.pci_id.vendor_id;
+        }
+        if (backend->device.pci_id.subsystem_device_id == 0) {
+            if (backend->device.pci_id.device_id == 0x25b5 || backend->device.pci_id.device_id == 0x25b6) {
+                backend->device.pci_id.subsystem_device_id = 0x14a9;
+            } else {
+                backend->device.pci_id.subsystem_device_id = backend->device.pci_id.device_id;
+            }
+        }
+        if (backend->device.pci_id.revision == 0) {
+            backend->device.pci_id.revision = 0xa1;
+        }
+        backend->device.bar_starts[0] = 0x80000000ull;
+        backend->device.bar_sizes[0] = 16u * 1024u * 1024u;
+        backend->device.bar_flags[0] = KB_MOCK_IORESOURCE_MEM;
+        backend->device.bar_starts[1] = 0x90000000ull;
+        backend->device.bar_sizes[1] = 256u * 1024u * 1024u;
+        backend->device.bar_flags[1] = KB_MOCK_IORESOURCE_MEM;
+        backend->device.bar_starts[2] = 0xb0000000ull;
+        backend->device.bar_sizes[2] = 256u * 1024u * 1024u;
+        backend->device.bar_flags[2] = KB_MOCK_IORESOURCE_MEM;
+        backend->device.bar_starts[3] = 0xa0000000ull;
+        backend->device.bar_sizes[3] = 32u * 1024u * 1024u;
+        backend->device.bar_flags[3] = KB_MOCK_IORESOURCE_MEM;
+    }
 }
 
 static const kb_backend_ops_t mock_ops = {
@@ -313,7 +369,21 @@ kb_status_t kb_linux_mock_create(kb_backend_t **out_backend)
     backend->device.location.bus = 0;
     backend->device.location.device = 1;
     backend->device.location.function = 0;
+    backend->device.bar_sizes[0] = 4096;
+    backend->device.bar_starts[0] = 0;
+    backend->device.bar_flags[0] = 0;
     configure_mock_pci_id_from_env(backend);
+    for (unsigned i = 0; i < KB_MOCK_PCI_BAR_COUNT; i++) {
+        if (backend->device.bar_sizes[i] == 0) {
+            continue;
+        }
+        backend->device.bars[i] = calloc(1, backend->device.bar_sizes[i]);
+        if (backend->device.bars[i] == 0) {
+            mock_destroy(&backend->base);
+            return KB_ERR_NOMEM;
+        }
+    }
+    initialize_mock_gpu_mmio(&backend->device);
 
     *out_backend = &backend->base;
     return KB_OK;

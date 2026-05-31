@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "kobox/backend.h"
 
 #ifdef __cplusplus
@@ -11,6 +12,8 @@ extern "C" {
 void *kb_kmalloc(size_t size, unsigned int flags);
 void *kb_kzalloc(size_t size, unsigned int flags);
 void *kb_kmalloc_trace(void *cache, unsigned int flags, size_t size);
+void *kb_kmem_cache_create(const char *name, size_t size, size_t align, unsigned long flags, void *ctor);
+void kb_kmem_cache_destroy(void *cache);
 void *kb_kmem_cache_alloc(void *cache, unsigned int flags);
 void kb_kmem_cache_free(void *cache, void *ptr);
 void kb_kfree(void *ptr);
@@ -20,6 +23,7 @@ void kb_shim_set_backend(kb_backend_t *backend);
 unsigned long kb_shim_current_kernel_gs(void);
 int kb_shim_enter_kernel_gs(unsigned long kernel_gs, unsigned long *out_old_gs);
 void kb_shim_leave_kernel_gs(unsigned long old_gs);
+void *kb_module_lookup_exported_symbol(const char *name);
 
 int kb_request_threaded_irq(
     unsigned int irq,
@@ -32,10 +36,53 @@ void kb_free_irq(unsigned int irq, void *dev_id);
 void kb_free_all_irqs(void);
 int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
 int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
+int kb_handle_any_irq(uint64_t timeout_ns);
+int kb_handle_any_irq_no_work(uint64_t timeout_ns);
+int kb_irq_allocate_mapping(unsigned int backend_kind, unsigned int backend_vector, unsigned int *out_linux_irq);
+unsigned int kb_irq_backend_vector(unsigned int linux_irq);
+void kb_irq_clear_mappings(void);
+int kb_queue_work_on(int cpu, void *wq, void *work);
+int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay);
+int kb_mod_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay);
+int kb_flush_work(void *work);
+int kb_flush_delayed_work(void *dwork);
+int kb_cancel_work_sync(void *work);
+int kb_cancel_delayed_work(void *dwork);
+int kb_cancel_delayed_work_sync(void *dwork);
+void kb_tasklet_setup(void *tasklet, void (*callback)(void *tasklet));
+void kb_tasklet_schedule(void *tasklet);
+void kb_init_timer_key(void *timer, void (*callback)(void *timer), unsigned int flags, const char *name, void *key);
+int kb_mod_timer(void *timer, unsigned long expires);
+void kb_add_timer(void *timer);
+int kb_timer_delete(void *timer);
+unsigned long kb_schedule_timeout(unsigned long timeout);
+void kb_run_deferred_work(void);
+void kb_run_deferred_bottom_halves(void);
+void kb_register_jiffies_storage(void *storage);
+unsigned long kb_msecs_to_jiffies(unsigned int msecs);
+unsigned long kb_usecs_to_jiffies(unsigned int usecs);
+unsigned int kb_jiffies_to_msecs(unsigned long jiffies);
+unsigned int kb_jiffies_to_usecs(unsigned long jiffies);
+void kb_jiffies_to_timespec64(unsigned long jiffies, void *timespec64);
+int64_t kb_ktime_get(void);
+int64_t kb_ktime_get_with_offset(int offset);
+uint64_t kb_ktime_get_mono_fast_ns(void);
+void kb_ktime_get_raw_ts64(void *timespec64);
+void kb_ktime_get_real_ts64(void *timespec64);
+void kb_msleep(unsigned int msecs);
+void kb_usleep_range_state(unsigned long min, unsigned long max, unsigned int state);
+void kb_udelay(unsigned long usecs);
+void kb_const_udelay(unsigned long xloops);
+void kb_ndelay(unsigned long nsecs);
 
 void *kb_dma_alloc_attrs(void *dev, size_t size, uint64_t *dma_handle, unsigned int flags, unsigned long attrs);
 void kb_dma_free_attrs(void *dev, size_t size, void *cpu_addr, uint64_t dma_handle, unsigned long attrs);
 void *kb_dma_cpu_addr(uint64_t dma_addr, size_t *out_available);
+uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size_t size, int dir, unsigned long attrs);
+uint64_t kb_dma_map_single_attrs(void *dev, void *ptr, size_t size, int dir, unsigned long attrs);
+void kb_dma_unmap_page_attrs(void *dev, uint64_t dma_addr, size_t size, int dir, unsigned long attrs);
+void kb_dma_unmap_single_attrs(void *dev, uint64_t dma_addr, size_t size, int dir, unsigned long attrs);
+int kb_dma_mapping_error(void *dev, uint64_t dma_addr);
 
 int kb_pci_register_driver(void *driver, void *owner, const char *mod_name);
 void kb_pci_unregister_driver(void *driver);
@@ -43,6 +90,20 @@ int kb_pci_enable_device(void *dev);
 int kb_pcim_enable_device(void *dev);
 void kb_pci_disable_device(void *dev);
 void kb_pci_set_master(void *dev);
+int kb_pci_read_config_byte(void *dev, int where, uint8_t *value);
+int kb_pci_read_config_word(void *dev, int where, uint16_t *value);
+int kb_pci_read_config_dword(void *dev, int where, uint32_t *value);
+int kb_pci_write_config_byte(void *dev, int where, uint8_t value);
+int kb_pci_write_config_word(void *dev, int where, uint16_t value);
+int kb_pci_write_config_dword(void *dev, int where, uint32_t value);
+int kb_pci_find_capability(void *dev, int cap);
+int kb_pci_xhci_irq_pending(void);
+int kb_pci_enable_msi(void *dev);
+int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec);
+void kb_pci_disable_msi(void *dev);
+void kb_pci_disable_msix(void *dev);
+int kb_pci_msix_unmask_entries(void *dev, const uint16_t *entries, unsigned int count);
+void *kb_pci_get_class(unsigned int class, void *from);
 void *kb_pci_iomap(void *dev, int bar, unsigned long max);
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max);
 void kb_pci_iounmap(void *dev, void *addr);
@@ -52,6 +113,13 @@ uint8_t kb_ioread8(const void *addr);
 void kb_iowrite8(uint8_t value, void *addr);
 uint32_t kb_ioread32(const void *addr);
 void kb_iowrite32(uint32_t value, void *addr);
+void *kb_pci_dev_get(void *dev);
+void kb_pci_dev_put(void *dev);
+void kb_pci_d3cold_disable(void *dev);
+int kb_pci_choose_state(void *dev, int state);
+int kb_pci_set_power_state(void *dev, int state);
+int kb_pci_set_mwi(void *dev);
+const void *kb_pci_match_id(const void *id_table, void *dev);
 
 void kb_stack_chk_fail(void);
 
@@ -160,6 +228,7 @@ void kb_mutex_lock(void *lock);
 void kb_mutex_unlock(void *lock);
 int kb_mutex_trylock(void *lock);
 void kb_complete(void *completion);
+void kb_complete_all(void *completion);
 void kb_init_completion(void *completion);
 void kb_init_waitqueue_head(void *wq_head);
 void kb_init_swait_queue_head(void *wq_head);
@@ -171,6 +240,18 @@ int kb_return_one(void);
 void *kb_alloc_stub(void);
 void *kb_identity_ptr(void *ptr);
 const char *kb_empty_string(void);
+int kb_dev_set_name(void *dev, const char *fmt, ...);
+int kb_device_add(void *dev);
+int kb_device_register(void *dev);
+int kb_driver_register(void *driver);
+void kb_driver_unregister(void *driver);
+int kb_driver_attach(void *driver);
+int kb_bus_for_each_dev(void *bus, void *start, void *data, int (*fn)(void *dev, void *data));
+int kb_bus_for_each_drv(void *bus, void *start, void *data, int (*fn)(void *drv, void *data));
+void *kb_sysfs_get_dirent(void *parent, const char *name);
+void *kb_kernfs_find_and_get_ns(void *parent, const char *name, const void *ns);
+void *kb_blk_alloc_disk(int node, void *lock_class_key);
+void *kb_blk_mq_alloc_disk(void *tag_set, void *queuedata, void *lock_class_key);
 void *kb_blk_mq_init_queue(void *tag_set);
 void *kb_blk_mq_alloc_request(void *queue, unsigned int op, unsigned int flags);
 int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int length, unsigned int gfp);
@@ -182,6 +263,35 @@ void kb_blk_mq_end_request_batch(void *batch);
 void kb_blk_mq_free_request(void *request);
 int kb_nvme_io_smoke(void);
 void *kb_hwmon_device_register_with_info(void *dev, const char *name, void *data, const void *chip, const void *groups);
+int kb_usb_hcd_pci_probe(void *dev, const void *driver);
+void kb_usb_hcd_pci_remove(void *dev);
+void kb_usb_hcd_pci_shutdown(void *dev);
+int kb_usb_hcd_irq(int irq, void *hcd);
+int kb_usb_hcd_is_primary_hcd(void *hcd);
+int kb_usb_poll_root_hub(void *hcd);
+int kb_usb_poll_root_hubs(void);
+int kb_usb_add_hcd(void *hcd, unsigned int irqnum, unsigned long irqflags);
+void kb_usb_remove_hcd(void *hcd);
+void *kb_usb_create_shared_hcd(const void *driver, void *dev, const char *bus_name, void *primary_hcd);
+void kb_usb_put_hcd(void *hcd);
+void *kb_usb_hcd_pci_pm_ops_storage(void);
+void *kb_usb_xhci_tracepoint_storage(void);
+void *kb_usb_num_online_cpus_storage(void);
+void *kb_usb_pcpu_hot_storage(void);
+void *kb_usb_pm_suspend_target_state_storage(void);
+void kb_xhci_init_driver(void *driver, const void *overrides);
+int kb_xhci_gen_setup(void *hcd, void *xhci, const void *quirks);
+int kb_xhci_run(void *hcd);
+void kb_xhci_stop(void *hcd);
+void kb_xhci_shutdown(void *hcd);
+int kb_xhci_suspend(void *xhci, bool do_wakeup);
+int kb_xhci_resume(void *xhci, bool hibernated);
+int kb_xhci_ext_cap_init(void *xhci);
+int kb_xhci_update_hub_device(void *hcd, void *udev, void *tt, unsigned int devnum);
+int kb_xhci_find_slot_id_by_port(void *hcd, void *xhci, unsigned int port);
+uint32_t kb_xhci_port_state_to_neutral(uint32_t state);
+int kb_xhci_msi_irq(int irq, void *hcd);
+void kb_xhci_dbg_trace(void *xhci, void *trace, const char *fmt, ...);
 
 #ifdef __cplusplus
 }
