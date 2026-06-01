@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,7 @@ enum {
 
 #define KB_NVME_EXECUTE_ADMIN_TIMEOUT_NS UINT64_C(5000000000)
 #define KB_NVME_EXECUTE_IO_POLL_TIMEOUT_NS UINT64_C(1000000000)
+#define KB_NVME_EXECUTE_COMPLETION_SETTLE_NS UINT64_C(1000000)
 #define KB_NVME_EXECUTE_POLL_PAUSE_ITERS 64u
 #define KB_NVME_EXECUTE_SPIN_BEFORE_SLEEP 2048u
 
@@ -157,6 +159,17 @@ static int nvme_deadline_expired(uint64_t start_ns, uint64_t timeout_ns)
 static void nvme_completion_poll_pause(void)
 {
     for (volatile unsigned int i = 0; i < KB_NVME_EXECUTE_POLL_PAUSE_ITERS; i++) {
+    }
+}
+
+static void nvme_busy_wait_ns(uint64_t duration_ns)
+{
+    uint64_t start_ns = nvme_monotonic_ns();
+    if (start_ns == 0 || duration_ns == 0) {
+        return;
+    }
+    while (!nvme_deadline_expired(start_ns, duration_ns)) {
+        nvme_completion_poll_pause();
     }
 }
 
@@ -903,6 +916,12 @@ static int nvme_block_complete_execute(void *request)
                 (unsigned)read_volatile_u16(completion + 14));
         }
         return -110;
+    }
+
+    atomic_thread_fence(memory_order_acquire);
+    if (qid == 0) {
+        nvme_busy_wait_ns(KB_NVME_EXECUTE_COMPLETION_SETTLE_NS);
+        atomic_thread_fence(memory_order_acquire);
     }
 
     uint64_t result64 = read_volatile_u64(completion);
