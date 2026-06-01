@@ -33,6 +33,7 @@ enum {
     PACHA_SYSCALL_CAPSULE_PCI_CONFIG_READ = 0x79,
     PACHA_SYSCALL_CAPSULE_PCI_CONFIG_WRITE = 0x7a,
     PACHA_SYSCALL_CAPSULE_PCI_BAR_INFO = 0x7b,
+    PACHA_SYSCALL_CAPSULE_IRQ_POLL = 0x7c,
 };
 
 enum {
@@ -117,6 +118,7 @@ struct kb_device {
 
 struct kb_irq {
     uint64_t capsule;
+    uint64_t last_interrupt_count;
     unsigned vector;
     kb_irq_handler_t handler;
     void *ctx;
@@ -938,6 +940,39 @@ static void pacha_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t siz
     }
 }
 
+static uint64_t pacha_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+}
+
+static kb_status_t pacha_irq_poll_count(uint64_t irq_capsule, uint64_t observed_count, uint64_t *out_count)
+{
+    if (irq_capsule == 0 || out_count == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    uint64_t words[1] = {0};
+    long result = pacha_syscall5(
+        PACHA_SYSCALL_CAPSULE_IRQ_POLL,
+        irq_capsule,
+        observed_count,
+        (uint64_t)(uintptr_t)words,
+        1,
+        0);
+    if (result == 1) {
+        *out_count = words[0];
+        return KB_OK;
+    }
+    if (result == 2) {
+        return KB_ERR_NOT_FOUND;
+    }
+    return pacha_status_from_return(result);
+}
+
 static kb_status_t pacha_irq_register(
     kb_device_t *device,
     unsigned vector,
@@ -965,6 +1000,10 @@ static kb_status_t pacha_irq_register(
             backend->irqs[i].vector = vector;
             backend->irqs[i].handler = handler;
             backend->irqs[i].ctx = ctx;
+            uint64_t count = 0;
+            if (pacha_irq_poll_count((uint64_t)child, UINT64_MAX, &count) == KB_OK) {
+                backend->irqs[i].last_interrupt_count = count;
+            }
             *out_irq = &backend->irqs[i];
             return KB_OK;
         }
@@ -985,19 +1024,40 @@ static void pacha_irq_unregister(kb_device_t *device, kb_irq_t *irq)
 static kb_status_t pacha_irq_wait(kb_device_t *device, kb_irq_t *irq, uint64_t timeout_ns)
 {
     (void)device;
-    (void)irq;
-    (void)timeout_ns;
-    return KB_ERR_UNSUPPORTED;
+    if (irq == NULL || irq->capsule == 0) {
+        return KB_ERR_INVALID;
+    }
+
+    const uint64_t start = pacha_now_ns();
+    for (;;) {
+        uint64_t count = 0;
+        kb_status_t status = pacha_irq_poll_count(irq->capsule, irq->last_interrupt_count, &count);
+        if (status == KB_OK) {
+            irq->last_interrupt_count = count;
+            return KB_OK;
+        }
+        if (status != KB_ERR_NOT_FOUND) {
+            return status;
+        }
+        if (timeout_ns == 0) {
+            return KB_ERR_NOT_FOUND;
+        }
+        uint64_t now = pacha_now_ns();
+        if (start != 0 && now >= start && now - start >= timeout_ns) {
+            return KB_ERR_NOT_FOUND;
+        }
+        struct timespec delay = {
+            .tv_sec = 0,
+            .tv_nsec = 1000000,
+        };
+        (void)nanosleep(&delay, NULL);
+    }
 }
 
 static uint64_t pacha_monotonic_ns(kb_backend_t *backend)
 {
     (void)backend;
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return 0;
-    }
-    return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+    return pacha_now_ns();
 }
 
 static void pacha_log(kb_backend_t *backend, int level, const char *message)
