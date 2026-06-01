@@ -52,7 +52,6 @@ enum {
 
 #define KB_NVME_EXECUTE_ADMIN_TIMEOUT_NS UINT64_C(5000000000)
 #define KB_NVME_EXECUTE_IO_POLL_TIMEOUT_NS UINT64_C(1000000000)
-#define KB_NVME_EXECUTE_COMPLETION_SETTLE_NS UINT64_C(10000000)
 #define KB_NVME_EXECUTE_POLL_PAUSE_ITERS 64u
 #define KB_NVME_EXECUTE_SPIN_BEFORE_SLEEP 2048u
 
@@ -159,17 +158,6 @@ static int nvme_deadline_expired(uint64_t start_ns, uint64_t timeout_ns)
 static void nvme_completion_poll_pause(void)
 {
     for (volatile unsigned int i = 0; i < KB_NVME_EXECUTE_POLL_PAUSE_ITERS; i++) {
-    }
-}
-
-static void nvme_busy_wait_ns(uint64_t duration_ns)
-{
-    uint64_t start_ns = nvme_monotonic_ns();
-    if (start_ns == 0 || duration_ns == 0) {
-        return;
-    }
-    while (!nvme_deadline_expired(start_ns, duration_ns)) {
-        nvme_completion_poll_pause();
     }
 }
 
@@ -833,9 +821,7 @@ static int nvme_block_complete_execute(void *request)
 
     volatile unsigned char *completion = cq + ((size_t)head * 16u);
     uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
-    if (qid == 0) {
-        nvme_busy_wait_ns(KB_NVME_EXECUTE_COMPLETION_SETTLE_NS);
-    }
+    unsigned char *poll_bar = qid == 0 ? nvme_bar_from_queue(nvmeq) : NULL;
     if (qid != 0) {
         if (trace_nvme_enabled()) {
             size_t queue_index = shim_nvme_queue_index(nvmeq);
@@ -903,6 +889,9 @@ static int nvme_block_complete_execute(void *request)
         if (nvme_deadline_expired(wait_start_ns, wait_timeout_ns)) {
             break;
         }
+        if (poll_bar != NULL) {
+            (void)mmio_read32(poll_bar, KB_NVME_REG_CSTS);
+        }
         nvme_completion_poll_pause();
     }
     if (!completed) {
@@ -922,11 +911,6 @@ static int nvme_block_complete_execute(void *request)
     }
 
     atomic_thread_fence(memory_order_acquire);
-    if (qid == 0) {
-        nvme_busy_wait_ns(KB_NVME_EXECUTE_COMPLETION_SETTLE_NS);
-        atomic_thread_fence(memory_order_acquire);
-    }
-
     uint64_t result64 = read_volatile_u64(completion);
     kb_linux_block_request_set_result_status(request, result64, (uint16_t)(completion_status >> 1));
 
