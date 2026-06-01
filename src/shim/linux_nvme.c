@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
 #include "kobox/shim.h"
 #include "shim/linux_block.h"
 #include "shim/linux_nvme.h"
@@ -10,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 kb_backend_t *kb_shim_current_backend(void);
 
@@ -140,7 +145,12 @@ static int nvme_deadline_expired(uint64_t start_ns, uint64_t timeout_ns)
 
 static void nvme_completion_poll_pause(void)
 {
-    kb_usleep_range_state(KB_NVME_EXECUTE_POLL_SLEEP_US, KB_NVME_EXECUTE_POLL_SLEEP_US, 0);
+    struct timespec req = {
+        .tv_sec = 0,
+        .tv_nsec = (long)KB_NVME_EXECUTE_POLL_SLEEP_US * 1000L,
+    };
+    while (nanosleep(&req, &req) != 0) {
+    }
 }
 
 static void fill_io_pattern(unsigned char *buffer, unsigned int length, uint64_t lba, unsigned int blocks, unsigned int pattern)
