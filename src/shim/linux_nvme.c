@@ -49,6 +49,11 @@ enum {
     KB_NVME_IO_QUEUE_DEPTH = 64,
 };
 
+#define KB_NVME_EXECUTE_ADMIN_TIMEOUT_NS UINT64_C(5000000000)
+#define KB_NVME_EXECUTE_IO_POLL_TIMEOUT_NS UINT64_C(1000000000)
+#define KB_NVME_EXECUTE_POLL_SLEEP_US 50ul
+#define KB_NVME_EXECUTE_SPIN_BEFORE_SLEEP 2048u
+
 typedef struct nvme_io_smoke_case {
     uint64_t lba;
     unsigned int blocks;
@@ -117,6 +122,25 @@ static void *read_ptr(const void *ptr)
 static int trace_nvme_enabled(void)
 {
     return getenv("KOBOX_TRACE_NVME") != NULL;
+}
+
+static uint64_t nvme_monotonic_ns(void)
+{
+    return kb_ktime_get_mono_fast_ns();
+}
+
+static int nvme_deadline_expired(uint64_t start_ns, uint64_t timeout_ns)
+{
+    uint64_t now = nvme_monotonic_ns();
+    if (now == 0 || start_ns == 0 || now < start_ns) {
+        return 0;
+    }
+    return now - start_ns >= timeout_ns;
+}
+
+static void nvme_completion_poll_pause(void)
+{
+    kb_usleep_range_state(KB_NVME_EXECUTE_POLL_SLEEP_US, KB_NVME_EXECUTE_POLL_SLEEP_US, 0);
 }
 
 static void fill_io_pattern(unsigned char *buffer, unsigned int length, uint64_t lba, unsigned int blocks, unsigned int pattern)
@@ -802,12 +826,23 @@ static int nvme_block_complete_execute(void *request)
     }
 
     int completed = 0;
-    for (unsigned i = 0; i < 10000000u; i++) {
+    uint64_t wait_start_ns = nvme_monotonic_ns();
+    uint64_t wait_timeout_ns = qid == 0 ? KB_NVME_EXECUTE_ADMIN_TIMEOUT_NS : KB_NVME_EXECUTE_IO_POLL_TIMEOUT_NS;
+    unsigned int spins = 0;
+    for (;;) {
         uint16_t status = read_u16((const void *)(completion + 14));
         if ((status & 1u) == phase) {
             completed = 1;
             break;
         }
+        if (++spins < KB_NVME_EXECUTE_SPIN_BEFORE_SLEEP) {
+            continue;
+        }
+        spins = 0;
+        if (nvme_deadline_expired(wait_start_ns, wait_timeout_ns)) {
+            break;
+        }
+        nvme_completion_poll_pause();
     }
     if (!completed) {
         if (trace_nvme_enabled()) {
