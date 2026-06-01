@@ -151,6 +151,19 @@ static long pacha_syscall5(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, u
     return syscall((long)(pacha_native_syscall_tag | nr), a0, a1, a2, a3, a4);
 }
 
+static long pacha_syscall6(
+    uint64_t nr,
+    uint64_t a0,
+    uint64_t a1,
+    uint64_t a2,
+    uint64_t a3,
+    uint64_t a4,
+    uint64_t a5)
+{
+    errno = 0;
+    return syscall((long)(pacha_native_syscall_tag | nr), a0, a1, a2, a3, a4, a5);
+}
+
 static kb_status_t pacha_status_from_return(long result)
 {
     if (result == -1 && errno == ENOSYS) {
@@ -857,13 +870,14 @@ static kb_status_t pacha_dma_map(
     }
     uint64_t iova_hint = align_up_u64(backend->next_iova, page_size);
     backend->next_iova = iova_hint + bounce_size;
-    long child = pacha_syscall5(
+    long child = pacha_syscall6(
         PACHA_SYSCALL_CAPSULE_DERIVE_DMA_MAPPING,
         device->device_capsule,
         (uint64_t)(uintptr_t)mapped_cpu_addr,
         iova_hint,
         mapped_size,
-        dma_dir_to_pacha(direction));
+        dma_dir_to_pacha(direction),
+        0);
     if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_DMA_MAPPING)) {
         if (owns_mapped_cpu_addr) {
             free(mapped_cpu_addr);
