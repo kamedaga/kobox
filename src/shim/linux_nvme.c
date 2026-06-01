@@ -833,6 +833,9 @@ static int nvme_block_complete_execute(void *request)
 
     volatile unsigned char *completion = cq + ((size_t)head * 16u);
     uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
+    if (qid == 0) {
+        nvme_busy_wait_ns(KB_NVME_EXECUTE_COMPLETION_SETTLE_NS);
+    }
     if (qid != 0) {
         if (trace_nvme_enabled()) {
             size_t queue_index = shim_nvme_queue_index(nvmeq);
