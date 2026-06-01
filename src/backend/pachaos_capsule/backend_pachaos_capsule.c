@@ -49,6 +49,9 @@ enum {
     PACHA_DMA_FROM_DEVICE = 2,
     PACHA_DMA_BIDIRECTIONAL = 3,
     PACHA_IRQ_AUTO = 0,
+    PACHA_IRQ_INTX = 1,
+    PACHA_IRQ_MSI = 2,
+    PACHA_IRQ_MSIX = 3,
     PACHA_BAR_FLAG_IO = 0x01,
     PACHA_BAR_FLAG_MEM = 0x02,
     PACHA_BAR_FLAG_PREFETCHABLE = 0x04,
@@ -58,6 +61,13 @@ enum {
     KB_LINUX_IORESOURCE_MEM = 0x00000200,
     KB_LINUX_IORESOURCE_PREFETCH = 0x00002000,
     KB_LINUX_IORESOURCE_MEM_64 = 0x00100000,
+};
+
+enum {
+    KB_IRQ_BACKEND_KIND_SHIFT = 30,
+    KB_IRQ_BACKEND_VECTOR_MASK = 0x3fffffff,
+    KB_IRQ_BACKEND_KIND_MSI = 1,
+    KB_IRQ_BACKEND_KIND_MSIX = 2,
 };
 
 enum {
@@ -973,6 +983,27 @@ static kb_status_t pacha_irq_poll_count(uint64_t irq_capsule, uint64_t observed_
     return pacha_status_from_return(result);
 }
 
+static void pacha_decode_irq_vector(unsigned encoded_vector, uint64_t *out_kind, uint64_t *out_vector)
+{
+    unsigned backend_kind = encoded_vector >> KB_IRQ_BACKEND_KIND_SHIFT;
+    unsigned backend_vector = encoded_vector & KB_IRQ_BACKEND_VECTOR_MASK;
+
+    switch (backend_kind) {
+    case KB_IRQ_BACKEND_KIND_MSIX:
+        *out_kind = PACHA_IRQ_MSIX;
+        *out_vector = backend_vector;
+        return;
+    case KB_IRQ_BACKEND_KIND_MSI:
+        *out_kind = PACHA_IRQ_MSI;
+        *out_vector = backend_vector;
+        return;
+    default:
+        *out_kind = backend_vector == 0 ? PACHA_IRQ_INTX : PACHA_IRQ_AUTO;
+        *out_vector = backend_vector;
+        return;
+    }
+}
+
 static kb_status_t pacha_irq_register(
     kb_device_t *device,
     unsigned vector,
@@ -986,11 +1017,14 @@ static kb_status_t pacha_irq_register(
     kb_pachaos_capsule_backend_t *backend = device->backend;
     for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
         if (backend->irqs[i].capsule == 0) {
+            uint64_t irq_kind = PACHA_IRQ_AUTO;
+            uint64_t irq_vector = 0;
+            pacha_decode_irq_vector(vector, &irq_kind, &irq_vector);
             long child = pacha_syscall5(
                 PACHA_SYSCALL_CAPSULE_DERIVE_IRQ,
                 device->device_capsule,
-                PACHA_IRQ_AUTO,
-                vector,
+                irq_kind,
+                irq_vector,
                 0,
                 0);
             if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_IRQ)) {
