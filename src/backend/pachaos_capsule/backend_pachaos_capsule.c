@@ -61,6 +61,23 @@ enum {
     KB_LINUX_IORESOURCE_MEM = 0x00000200,
     KB_LINUX_IORESOURCE_PREFETCH = 0x00002000,
     KB_LINUX_IORESOURCE_MEM_64 = 0x00100000,
+    KB_PCI_COMMAND_OFFSET = 0x04,
+    KB_PCI_STATUS_OFFSET = 0x06,
+    KB_PCI_CAPABILITY_LIST_OFFSET = 0x34,
+    KB_PCI_STATUS_CAP_LIST = 0x0010,
+    KB_PCI_CAP_NEXT_MASK = 0xfc,
+    KB_PCI_CAP_ID_MSIX = 0x11,
+    KB_PCI_COMMAND_MEMORY_SPACE = 1u << 1,
+    KB_PCI_COMMAND_BUS_MASTER = 1u << 2,
+    KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK = 0x07ff,
+    KB_PCI_MSIX_CONTROL_FUNCTION_MASK = 1u << 14,
+    KB_PCI_MSIX_CONTROL_ENABLE = 1u << 15,
+    KB_PCI_MSIX_TABLE_BIR_MASK = 0x00000007,
+    KB_PCI_MSIX_ENTRY_SIZE = 16,
+    KB_PCI_MSIX_ENTRY_VECTOR_CTRL = 12,
+    KB_PCI_MSIX_ENTRY_CTRL_MASKED = 0x00000001,
+    PACHA_X86_MSI_ADDRESS_LOW = 0xFEE00000,
+    PACHA_DEVICE_INTERRUPT_VECTOR = 0x41,
 };
 
 enum {
@@ -590,6 +607,39 @@ static kb_status_t pacha_pci_config_write(kb_device_t *device, uint16_t offset, 
     return KB_OK;
 }
 
+static int pacha_pci_find_capability(kb_device_t *device, uint8_t cap_id, uint8_t *out_offset)
+{
+    if (device == NULL || out_offset == NULL) {
+        return 0;
+    }
+
+    uint16_t status = 0;
+    if (pacha_pci_config_read(device, KB_PCI_STATUS_OFFSET, &status, sizeof(status)) != KB_OK ||
+        (status & KB_PCI_STATUS_CAP_LIST) == 0) {
+        return 0;
+    }
+
+    uint8_t offset = 0;
+    if (pacha_pci_config_read(device, KB_PCI_CAPABILITY_LIST_OFFSET, &offset, sizeof(offset)) != KB_OK) {
+        return 0;
+    }
+    offset &= KB_PCI_CAP_NEXT_MASK;
+
+    for (unsigned depth = 0; depth < 48 && offset >= 0x40; depth++) {
+        uint8_t header[2] = {0};
+        if (pacha_pci_config_read(device, offset, header, sizeof(header)) != KB_OK) {
+            return 0;
+        }
+        if (header[0] == cap_id) {
+            *out_offset = offset;
+            return 1;
+        }
+        offset = header[1] & KB_PCI_CAP_NEXT_MASK;
+    }
+
+    return 0;
+}
+
 static kb_status_t capsule_pci_bar_info(kb_device_t *device, unsigned bar_index, kb_pci_bar_info_t *out_info)
 {
     if (device == NULL || out_info == NULL) {
@@ -750,6 +800,66 @@ static void pacha_unmap_bar(kb_device_t *device, kb_mmio_region_t *region)
         memset(mapping, 0, sizeof(*mapping));
     }
     memset(region, 0, sizeof(*region));
+}
+
+static kb_status_t pacha_configure_msix_entry(kb_device_t *device, unsigned entry)
+{
+    if (device == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    uint8_t cap = 0;
+    if (!pacha_pci_find_capability(device, KB_PCI_CAP_ID_MSIX, &cap)) {
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    uint16_t control = 0;
+    uint32_t table = 0;
+    if (pacha_pci_config_read(device, (uint16_t)(cap + 2u), &control, sizeof(control)) != KB_OK ||
+        pacha_pci_config_read(device, (uint16_t)(cap + 4u), &table, sizeof(table)) != KB_OK) {
+        return KB_ERR_IO;
+    }
+
+    unsigned table_size = (unsigned)((control & KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1u);
+    if (entry >= table_size) {
+        return KB_ERR_INVALID;
+    }
+
+    unsigned bar = table & KB_PCI_MSIX_TABLE_BIR_MASK;
+    uint64_t table_offset = (uint64_t)(table & ~((uint32_t)KB_PCI_MSIX_TABLE_BIR_MASK));
+    uint64_t entry_offset = table_offset + ((uint64_t)entry * KB_PCI_MSIX_ENTRY_SIZE);
+    if (entry_offset < table_offset) {
+        return KB_ERR_INVALID;
+    }
+
+    kb_mmio_region_t region;
+    kb_status_t status = pacha_map_bar(device, bar, &region);
+    if (status != KB_OK) {
+        return status;
+    }
+
+    if (entry_offset + KB_PCI_MSIX_ENTRY_SIZE > region.size) {
+        pacha_unmap_bar(device, &region);
+        return KB_ERR_INVALID;
+    }
+
+    volatile uint32_t *slot = (volatile uint32_t *)((unsigned char *)region.addr + entry_offset);
+    slot[KB_PCI_MSIX_ENTRY_VECTOR_CTRL / sizeof(uint32_t)] = KB_PCI_MSIX_ENTRY_CTRL_MASKED;
+    slot[0] = PACHA_X86_MSI_ADDRESS_LOW;
+    slot[1] = 0;
+    slot[2] = PACHA_DEVICE_INTERRUPT_VECTOR;
+    slot[KB_PCI_MSIX_ENTRY_VECTOR_CTRL / sizeof(uint32_t)] = 0;
+    pacha_unmap_bar(device, &region);
+
+    uint16_t command = 0;
+    if (pacha_pci_config_read(device, KB_PCI_COMMAND_OFFSET, &command, sizeof(command)) == KB_OK) {
+        command |= KB_PCI_COMMAND_MEMORY_SPACE | KB_PCI_COMMAND_BUS_MASTER;
+        (void)pacha_pci_config_write(device, KB_PCI_COMMAND_OFFSET, &command, sizeof(command));
+    }
+
+    control |= KB_PCI_MSIX_CONTROL_ENABLE;
+    control &= (uint16_t)~KB_PCI_MSIX_CONTROL_FUNCTION_MASK;
+    return pacha_pci_config_write(device, (uint16_t)(cap + 2u), &control, sizeof(control));
 }
 
 static kb_status_t pacha_dma_alloc(
@@ -1029,6 +1139,16 @@ static kb_status_t pacha_irq_register(
                 0);
             if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_IRQ)) {
                 return pacha_status_from_return(child);
+            }
+            if (irq_kind == PACHA_IRQ_MSIX) {
+                kb_status_t config_status = pacha_configure_msix_entry(device, (unsigned)irq_vector);
+                if (config_status != KB_OK) {
+                    close_capsule((uint64_t)child);
+                    return config_status;
+                }
+            } else if (irq_kind == PACHA_IRQ_MSI) {
+                close_capsule((uint64_t)child);
+                return KB_ERR_UNSUPPORTED;
             }
             backend->irqs[i].capsule = (uint64_t)child;
             backend->irqs[i].vector = vector;
