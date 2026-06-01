@@ -92,11 +92,15 @@ typedef struct kb_pachaos_mmio_mapping {
 
 typedef struct kb_pachaos_dma_mapping {
     void *cpu_addr;
+    void *mapped_cpu_addr;
     uint64_t size;
+    uint64_t mapped_size;
     uint64_t iova;
     uint64_t buffer_capsule;
     uint64_t mapping_capsule;
+    kb_dma_dir_t direction;
     int owns_cpu_addr;
+    int owns_mapped_cpu_addr;
 } kb_pachaos_dma_mapping_t;
 
 struct kb_device {
@@ -198,6 +202,24 @@ static kb_status_t capsule_query(uint64_t token, uint64_t words[PACHA_SNAPSHOT_W
     return KB_OK;
 }
 
+static kb_status_t capsule_snapshot_iova(uint64_t token, uint64_t expected_kind, uint64_t *out_iova)
+{
+    if (out_iova == NULL) {
+        return KB_ERR_INVALID;
+    }
+    uint64_t words[PACHA_SNAPSHOT_WORDS];
+    kb_status_t status = capsule_query(token, words);
+    if (status != KB_OK) {
+        return status;
+    }
+    if (words[PACHA_SNAPSHOT_KIND] != expected_kind || words[PACHA_SNAPSHOT_SIZE] == 0 ||
+        words[PACHA_SNAPSHOT_IOVA] == 0) {
+        return KB_ERR_INVALID;
+    }
+    *out_iova = words[PACHA_SNAPSHOT_IOVA];
+    return KB_OK;
+}
+
 static uint64_t align_up_u64(uint64_t value, uint64_t alignment)
 {
     if (alignment == 0) {
@@ -211,6 +233,19 @@ static uint64_t page_size_u64(void)
 {
     long value = sysconf(_SC_PAGESIZE);
     return value > 0 ? (uint64_t)value : 4096u;
+}
+
+static int dma_range_crosses_page(const void *ptr, uint64_t size)
+{
+    if (ptr == NULL || size == 0) {
+        return 0;
+    }
+    uint64_t page_size = page_size_u64();
+    uint64_t offset = (uint64_t)((uintptr_t)ptr & (uintptr_t)(page_size - 1u));
+    if (size > UINT64_MAX - offset) {
+        return 1;
+    }
+    return offset + size > page_size;
 }
 
 static kb_pachaos_capsule_backend_t *pacha_from_backend(kb_backend_t *backend)
@@ -316,21 +351,14 @@ static uint64_t dma_dir_to_pacha(kb_dma_dir_t direction)
 
 static kb_status_t remember_dma_mapping(
     kb_pachaos_capsule_backend_t *backend,
-    void *cpu_addr,
-    uint64_t size,
-    uint64_t iova,
-    uint64_t buffer_capsule,
-    uint64_t mapping_capsule,
-    int owns_cpu_addr)
+    const kb_pachaos_dma_mapping_t *mapping)
 {
+    if (backend == NULL || mapping == NULL || mapping->size == 0 || mapping->iova == 0) {
+        return KB_ERR_INVALID;
+    }
     for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
         if (backend->dma_mappings[i].size == 0) {
-            backend->dma_mappings[i].cpu_addr = cpu_addr;
-            backend->dma_mappings[i].size = size;
-            backend->dma_mappings[i].iova = iova;
-            backend->dma_mappings[i].buffer_capsule = buffer_capsule;
-            backend->dma_mappings[i].mapping_capsule = mapping_capsule;
-            backend->dma_mappings[i].owns_cpu_addr = owns_cpu_addr;
+            backend->dma_mappings[i] = *mapping;
             return KB_OK;
         }
     }
@@ -363,6 +391,9 @@ static void pacha_destroy(kb_backend_t *backend)
         if (mapping->size != 0) {
             close_capsule(mapping->mapping_capsule);
             close_capsule(mapping->buffer_capsule);
+            if (mapping->owns_mapped_cpu_addr) {
+                free(mapping->mapped_cpu_addr);
+            }
             if (mapping->owns_cpu_addr) {
                 free(mapping->cpu_addr);
             }
@@ -703,12 +734,14 @@ static kb_status_t pacha_dma_alloc(
     kb_dma_dir_t direction,
     kb_dma_buffer_t *out_buffer)
 {
-    (void)direction;
     if (device == NULL || out_buffer == NULL || size == 0 || size > (uint64_t)SIZE_MAX) {
         return KB_ERR_INVALID;
     }
     uint64_t page_size = page_size_u64();
     uint64_t effective_alignment = alignment > page_size ? alignment : page_size;
+    if (size > UINT64_MAX - (effective_alignment - 1u)) {
+        return KB_ERR_INVALID;
+    }
     uint64_t alloc_size = align_up_u64(size, effective_alignment);
     if (alloc_size > (uint64_t)SIZE_MAX) {
         return KB_ERR_INVALID;
@@ -721,20 +754,39 @@ static kb_status_t pacha_dma_alloc(
     memset(ptr, 0, (size_t)alloc_size);
 
     kb_pachaos_capsule_backend_t *backend = device->backend;
-    uint64_t iova = align_up_u64(backend->next_iova, effective_alignment);
-    backend->next_iova = iova + alloc_size;
+    uint64_t iova_hint = align_up_u64(backend->next_iova, effective_alignment);
+    backend->next_iova = iova_hint + alloc_size;
     long child = pacha_syscall5(
         PACHA_SYSCALL_CAPSULE_DERIVE_DMA_BUFFER,
         device->device_capsule,
         (uint64_t)(uintptr_t)ptr,
-        iova,
+        iova_hint,
         alloc_size,
         0);
     if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_DMA_BUFFER)) {
         free(ptr);
         return pacha_status_from_return(child);
     }
-    kb_status_t status = remember_dma_mapping(backend, ptr, alloc_size, iova, (uint64_t)child, 0, 1);
+    uint64_t iova = 0;
+    kb_status_t status = capsule_snapshot_iova((uint64_t)child, PACHA_CAPSULE_KIND_DMA_BUFFER, &iova);
+    if (status != KB_OK) {
+        close_capsule((uint64_t)child);
+        free(ptr);
+        return status;
+    }
+    kb_pachaos_dma_mapping_t mapping = {
+        .cpu_addr = ptr,
+        .mapped_cpu_addr = ptr,
+        .size = alloc_size,
+        .mapped_size = alloc_size,
+        .iova = iova,
+        .buffer_capsule = (uint64_t)child,
+        .mapping_capsule = 0,
+        .direction = direction,
+        .owns_cpu_addr = 1,
+        .owns_mapped_cpu_addr = 0,
+    };
+    status = remember_dma_mapping(backend, &mapping);
     if (status != KB_OK) {
         close_capsule((uint64_t)child);
         free(ptr);
@@ -756,6 +808,9 @@ static void pacha_dma_free(kb_device_t *device, kb_dma_buffer_t *buffer)
     if (mapping != NULL) {
         close_capsule(mapping->mapping_capsule);
         close_capsule(mapping->buffer_capsule);
+        if (mapping->owns_mapped_cpu_addr) {
+            free(mapping->mapped_cpu_addr);
+        }
         if (mapping->owns_cpu_addr) {
             free(mapping->cpu_addr);
         }
@@ -771,27 +826,77 @@ static kb_status_t pacha_dma_map(
     kb_dma_dir_t direction,
     uint64_t *out_dma_addr)
 {
-    if (device == NULL || cpu_addr == NULL || size == 0 || out_dma_addr == NULL) {
+    if (device == NULL || cpu_addr == NULL || size == 0 || size > (uint64_t)SIZE_MAX || out_dma_addr == NULL) {
         return KB_ERR_INVALID;
     }
     uint64_t page_size = page_size_u64();
-    uint64_t map_size = align_up_u64(size, page_size);
+    if (size > UINT64_MAX - (page_size - 1u)) {
+        return KB_ERR_INVALID;
+    }
+    uint64_t bounce_size = align_up_u64(size, page_size);
+    if (bounce_size == 0 || bounce_size > (uint64_t)SIZE_MAX) {
+        return KB_ERR_INVALID;
+    }
     kb_pachaos_capsule_backend_t *backend = device->backend;
-    uint64_t iova = align_up_u64(backend->next_iova, page_size);
-    backend->next_iova = iova + map_size;
+    void *mapped_cpu_addr = cpu_addr;
+    uint64_t mapped_size = size;
+    int owns_mapped_cpu_addr = 0;
+    if (dma_range_crosses_page(cpu_addr, size)) {
+        void *bounce = NULL;
+        if (posix_memalign(&bounce, (size_t)page_size, (size_t)bounce_size) != 0) {
+            return KB_ERR_NOMEM;
+        }
+        if (direction == KB_DMA_TO_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
+            memcpy(bounce, cpu_addr, (size_t)size);
+        } else {
+            memset(bounce, 0, (size_t)bounce_size);
+        }
+        mapped_cpu_addr = bounce;
+        mapped_size = size;
+        owns_mapped_cpu_addr = 1;
+    }
+    uint64_t iova_hint = align_up_u64(backend->next_iova, page_size);
+    backend->next_iova = iova_hint + bounce_size;
     long child = pacha_syscall5(
         PACHA_SYSCALL_CAPSULE_DERIVE_DMA_MAPPING,
         device->device_capsule,
-        (uint64_t)(uintptr_t)cpu_addr,
-        iova,
-        map_size,
+        (uint64_t)(uintptr_t)mapped_cpu_addr,
+        iova_hint,
+        mapped_size,
         dma_dir_to_pacha(direction));
     if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_DMA_MAPPING)) {
+        if (owns_mapped_cpu_addr) {
+            free(mapped_cpu_addr);
+        }
         return pacha_status_from_return(child);
     }
-    kb_status_t status = remember_dma_mapping(backend, cpu_addr, map_size, iova, 0, (uint64_t)child, 0);
+    uint64_t iova = 0;
+    kb_status_t status = capsule_snapshot_iova((uint64_t)child, PACHA_CAPSULE_KIND_DMA_MAPPING, &iova);
     if (status != KB_OK) {
         close_capsule((uint64_t)child);
+        if (owns_mapped_cpu_addr) {
+            free(mapped_cpu_addr);
+        }
+        return status;
+    }
+    kb_pachaos_dma_mapping_t mapping = {
+        .cpu_addr = cpu_addr,
+        .mapped_cpu_addr = mapped_cpu_addr,
+        .size = size,
+        .mapped_size = mapped_size,
+        .iova = iova,
+        .buffer_capsule = 0,
+        .mapping_capsule = (uint64_t)child,
+        .direction = direction,
+        .owns_cpu_addr = 0,
+        .owns_mapped_cpu_addr = owns_mapped_cpu_addr,
+    };
+    status = remember_dma_mapping(backend, &mapping);
+    if (status != KB_OK) {
+        close_capsule((uint64_t)child);
+        if (owns_mapped_cpu_addr) {
+            free(mapped_cpu_addr);
+        }
         return status;
     }
     *out_dma_addr = iova;
@@ -801,13 +906,20 @@ static kb_status_t pacha_dma_map(
 static void pacha_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction)
 {
     (void)size;
-    (void)direction;
     if (device == NULL) {
         return;
     }
     kb_pachaos_dma_mapping_t *mapping = find_dma_mapping(device->backend, dma_addr);
     if (mapping != NULL) {
         close_capsule(mapping->mapping_capsule);
+        int copy_back = direction == KB_DMA_FROM_DEVICE || direction == KB_DMA_BIDIRECTIONAL ||
+            mapping->direction == KB_DMA_FROM_DEVICE || mapping->direction == KB_DMA_BIDIRECTIONAL;
+        if (mapping->owns_mapped_cpu_addr && copy_back) {
+            memcpy(mapping->cpu_addr, mapping->mapped_cpu_addr, (size_t)mapping->size);
+        }
+        if (mapping->owns_mapped_cpu_addr) {
+            free(mapping->mapped_cpu_addr);
+        }
         memset(mapping, 0, sizeof(*mapping));
     }
 }
