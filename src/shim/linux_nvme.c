@@ -77,10 +77,26 @@ static uint16_t read_u16(const void *ptr)
     return value;
 }
 
+static uint16_t read_volatile_u16(const volatile void *ptr)
+{
+    const volatile uint8_t *p = ptr;
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
 static uint64_t read_u64(const void *ptr)
 {
     uint64_t value;
     memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+static uint64_t read_volatile_u64(const volatile void *ptr)
+{
+    const volatile uint8_t *p = ptr;
+    uint64_t value = 0;
+    for (unsigned int i = 0; i < 8u; i++) {
+        value |= (uint64_t)p[i] << (i * 8u);
+    }
     return value;
 }
 
@@ -151,6 +167,32 @@ static void nvme_completion_poll_pause(void)
     };
     while (nanosleep(&req, &req) != 0) {
     }
+}
+
+static int nvme_completion_matches_request(
+    const volatile unsigned char *completion,
+    uint8_t phase,
+    uint32_t request_tag,
+    uint8_t request_gen,
+    uint16_t *out_status)
+{
+    uint16_t status = read_volatile_u16(completion + 14);
+    if ((status & 1u) != phase) {
+        return 0;
+    }
+
+    uint16_t command_id = read_volatile_u16(completion + 12);
+    if ((command_id & 0x0fffu) != (request_tag & 0x0fffu)) {
+        return 0;
+    }
+    if (((command_id >> 12) & 0xfu) != (request_gen & 0xfu)) {
+        return 0;
+    }
+
+    if (out_status != NULL) {
+        *out_status = status;
+    }
+    return 1;
 }
 
 static void fill_io_pattern(unsigned char *buffer, unsigned int length, uint64_t lba, unsigned int blocks, unsigned int pattern)
@@ -836,12 +878,14 @@ static int nvme_block_complete_execute(void *request)
     }
 
     int completed = 0;
+    uint32_t request_tag = kb_linux_block_request_tag(request);
+    uint8_t request_gen = kb_linux_block_request_generation(request);
+    uint16_t completion_status = 0;
     uint64_t wait_start_ns = nvme_monotonic_ns();
     uint64_t wait_timeout_ns = qid == 0 ? KB_NVME_EXECUTE_ADMIN_TIMEOUT_NS : KB_NVME_EXECUTE_IO_POLL_TIMEOUT_NS;
     unsigned int spins = 0;
     for (;;) {
-        uint16_t status = read_u16((const void *)(completion + 14));
-        if ((status & 1u) == phase) {
+        if (nvme_completion_matches_request(completion, phase, request_tag, request_gen, &completion_status)) {
             completed = 1;
             break;
         }
@@ -856,14 +900,22 @@ static int nvme_block_complete_execute(void *request)
     }
     if (!completed) {
         if (trace_nvme_enabled()) {
-            fprintf(stderr, "kobox nvme: blk_execute_rq timeout request=%p head=%u phase=%u\n", request, head, phase);
+            fprintf(
+                stderr,
+                "kobox nvme: blk_execute_rq timeout request=%p head=%u phase=%u tag=%u gen=%u cid=0x%x status=0x%x\n",
+                request,
+                head,
+                phase,
+                request_tag,
+                request_gen,
+                (unsigned)read_volatile_u16(completion + 12),
+                (unsigned)read_volatile_u16(completion + 14));
         }
         return -110;
     }
 
-    uint64_t result64 = read_u64((const void *)completion);
-    uint16_t status = read_u16((const void *)(completion + 14));
-    kb_linux_block_request_set_result_status(request, result64, (uint16_t)(status >> 1));
+    uint64_t result64 = read_volatile_u64(completion);
+    kb_linux_block_request_set_result_status(request, result64, (uint16_t)(completion_status >> 1));
 
     head++;
     if (head == depth) {
@@ -875,13 +927,13 @@ static int nvme_block_complete_execute(void *request)
     if (cq_head_db != NULL) {
         *cq_head_db = head;
     }
-    kb_linux_block_request_mark_complete(request, (unsigned)(status >> 1));
+    kb_linux_block_request_mark_complete(request, (unsigned)(completion_status >> 1));
     if (trace_nvme_enabled()) {
         fprintf(
             stderr,
             "kobox nvme: blk_execute_rq complete request=%p status=0x%x result=0x%llx next_head=%u\n",
             request,
-            (unsigned)(status >> 1),
+            (unsigned)(completion_status >> 1),
             (unsigned long long)result64,
             head);
     }
