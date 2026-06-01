@@ -64,6 +64,27 @@ cmake -S . -B .artifacts/build -DCMAKE_C_COMPILER=clang
 cmake --build .artifacts/build
 ctest --test-dir .artifacts/build
 ```
+
+## PachaOS Capsule backend
+
+`pachaos_capsule` is the first PachaOS backend surface. It creates a Kobox
+backend from a PachaOS `DeviceCapsule` token and uses explicit PachaOS native
+syscall escape calls for Capsule operations.
+
+```sh
+KOBOX_PACHAOS_DEVICE_CAPSULE=0xca12000000000001 kobox-ls-devices pachaos
+kobox-run --backend=pachaos --capsule=0xca12000000000001 run driver.ko
+```
+
+The backend currently wires the Kobox backend operations to Capsule query,
+MMIO derivation, DMA buffer/mapping derivation, IRQ derivation, and Capsule
+close. PCI identity and BAR sizes can be supplied with environment variables
+until the PachaOS Capsule ABI grows config/BAR info calls:
+
+```sh
+KOBOX_PACHAOS_PCI_ID=8086:10d3:02:00:00
+KOBOX_PACHAOS_BAR0_SIZE=0x1000
+```
 ## Roadmap
 
 1. NVMe — complete

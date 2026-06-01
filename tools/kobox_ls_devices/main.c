@@ -1,6 +1,7 @@
 #include "kobox/backend.h"
 #include "kobox/backend_linux_sysfs.h"
 #include "kobox/backend_linux_vfio.h"
+#include "kobox/backend_pachaos_capsule.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -31,11 +32,17 @@ int main(int argc, char **argv)
 {
     const char *backend_name = "sysfs";
     const char *pci_bdf = NULL;
+    const char *capsule_text = NULL;
     if (argc == 3 && strcmp(argv[1], "vfio") == 0) {
         backend_name = "vfio";
         pci_bdf = argv[2];
+    } else if (argc == 3 && strcmp(argv[1], "pachaos") == 0) {
+        backend_name = "pachaos";
+        capsule_text = argv[2];
+    } else if (argc == 2 && strcmp(argv[1], "pachaos") == 0) {
+        backend_name = "pachaos";
     } else if (argc != 1) {
-        fprintf(stderr, "usage: kobox-ls-devices [vfio <BDF>]\n");
+        fprintf(stderr, "usage: kobox-ls-devices [vfio <BDF>|pachaos [DeviceCapsule]]\n");
         return 1;
     }
 
@@ -43,11 +50,21 @@ int main(int argc, char **argv)
     kb_status_t status = KB_OK;
     if (strcmp(backend_name, "vfio") == 0) {
         status = kb_linux_vfio_create(pci_bdf, &backend);
+    } else if (strcmp(backend_name, "pachaos") == 0) {
+        if (capsule_text != NULL) {
+            uint64_t capsule = 0;
+            status = kb_pachaos_capsule_parse_token(capsule_text, &capsule);
+            if (status == KB_OK) {
+                status = kb_pachaos_capsule_create(capsule, &backend);
+            }
+        } else {
+            status = kb_pachaos_capsule_create_from_env(&backend);
+        }
     } else {
         status = kb_linux_sysfs_create(&backend);
     }
     if (status != KB_OK) {
-        fprintf(stderr, "linux_%s backend failed: %s (%d)\n", backend_name, status_name(status), status);
+        fprintf(stderr, "%s backend failed: %s (%d)\n", backend_name, status_name(status), status);
         return 1;
     }
 

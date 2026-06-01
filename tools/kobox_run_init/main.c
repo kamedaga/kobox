@@ -5,6 +5,7 @@
 #include "kobox/backend.h"
 #include "kobox/backend_linux_mock.h"
 #include "kobox/backend_linux_vfio.h"
+#include "kobox/backend_pachaos_capsule.h"
 #include "kobox/module.h"
 #include "kobox/shim.h"
 #include "subsystem/input/input.h"
@@ -15,8 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && defined(__GLIBC__)
 #include <execinfo.h>
+#endif
+#if !defined(_WIN32)
 #include <signal.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -33,7 +36,7 @@ typedef struct loaded_input_module {
     kb_module_t *module;
 } loaded_input_module_t;
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && defined(__GLIBC__)
 static void crash_handler(int signo, siginfo_t *info, void *ucontext)
 {
     void *frames[64];
@@ -189,6 +192,7 @@ int main(int argc, char **argv)
     const char *path = NULL;
     const char *backend_name = "mock";
     const char *pci_bdf = NULL;
+    const char *capsule_text = NULL;
     const char *dep_paths[KB_RUN_DEPS_MAX];
     size_t dep_count = 0;
     unsigned long drain_ms = 0;
@@ -201,6 +205,11 @@ int main(int argc, char **argv)
         }
         if (strncmp(argv[argi], "--pci=", 6) == 0) {
             pci_bdf = argv[argi] + 6;
+            argi++;
+            continue;
+        }
+        if (strncmp(argv[argi], "--capsule=", 10) == 0) {
+            capsule_text = argv[argi] + 10;
             argi++;
             continue;
         }
@@ -218,7 +227,7 @@ int main(int argc, char **argv)
             argi++;
             continue;
         }
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio|pachaos --pci=<BDF> --capsule=<DeviceCapsule> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
         return 1;
     }
 
@@ -227,7 +236,7 @@ int main(int argc, char **argv)
     } else if (argi + 2 == argc && strcmp(argv[argi], "run") == 0) {
         path = argv[argi + 1];
     } else {
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio --pci=<BDF> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
+        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio|pachaos --pci=<BDF> --capsule=<DeviceCapsule> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
         return 1;
     }
 
@@ -249,6 +258,16 @@ int main(int argc, char **argv)
             return 3;
         }
         status = kb_linux_vfio_create(pci_bdf, &backend);
+    } else if (strcmp(backend_name, "pachaos") == 0 || strcmp(backend_name, "pachaos_capsule") == 0) {
+        if (capsule_text != NULL) {
+            uint64_t capsule = 0;
+            status = kb_pachaos_capsule_parse_token(capsule_text, &capsule);
+            if (status == KB_OK) {
+                status = kb_pachaos_capsule_create(capsule, &backend);
+            }
+        } else {
+            status = kb_pachaos_capsule_create_from_env(&backend);
+        }
     } else {
         free(data);
         fprintf(stderr, "unknown backend: %s\n", backend_name);

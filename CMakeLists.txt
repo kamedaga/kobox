@@ -14,6 +14,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(kobox_runtime STATIC
     src/backend/backend.c
     src/backend/linux_mock/backend_linux_mock.c
+    src/backend/pachaos_capsule/backend_pachaos_capsule.c
     src/backend/linux_sysfs/backend_linux_sysfs.c
     src/backend/linux_vfio/backend_linux_vfio.c
     src/loader/elf_reader.c
