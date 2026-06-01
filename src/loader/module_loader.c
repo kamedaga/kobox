@@ -1733,11 +1733,6 @@ static int kb_scnprintf_shim(char *buf, size_t size, const char *fmt, ...)
     return written;
 }
 
-static const char *kb_unknown_string_shim(void)
-{
-    return "unknown";
-}
-
 static void *kb_devm_ioremap_shim(void *dev, uint64_t phys_addr, size_t size)
 {
     (void)dev;
@@ -1920,6 +1915,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"dma_map_sg_attrs", (void *)(uintptr_t)&kb_return_zero},
     {"dma_map_single_attrs", (void *)(uintptr_t)&kb_dma_map_single_attrs},
     {"dma_mapping_error", (void *)(uintptr_t)&kb_dma_mapping_error},
+    {"dma_max_mapping_size", (void *)(uintptr_t)&kb_dma_max_mapping_size},
     {"dma_opt_mapping_size", (void *)(uintptr_t)&kb_return_zero},
     {"dma_pci_p2pdma_supported", (void *)(uintptr_t)&kb_return_zero},
     {"dma_pool_alloc", (void *)(uintptr_t)&kb_dma_pool_alloc},
@@ -1998,11 +1994,17 @@ static const shim_symbol_t shim_symbols[] = {
     {"sg_init_table", (void *)(uintptr_t)&kb_sg_init_one},
     {"sg_alloc_table_from_pages_segment", (void *)(uintptr_t)&kb_return_zero},
     {"sg_free_table", (void *)(uintptr_t)&kb_noop},
-    {"sg_next", (void *)(uintptr_t)&kb_return_zero},
+    {"sg_miter_next", (void *)(uintptr_t)&kb_sg_miter_next},
+    {"sg_miter_skip", (void *)(uintptr_t)&kb_sg_miter_skip},
+    {"sg_miter_start", (void *)(uintptr_t)&kb_sg_miter_start},
+    {"sg_miter_stop", (void *)(uintptr_t)&kb_sg_miter_stop},
+    {"sg_nents", (void *)(uintptr_t)&kb_sg_nents},
+    {"sg_next", (void *)(uintptr_t)&kb_sg_next},
     {"sysfs_streq", (void *)(uintptr_t)&kb_return_zero},
     {"sysfs_update_group", (void *)(uintptr_t)&kb_return_zero},
     {"wait_for_completion", (void *)(uintptr_t)&kb_wait_for_completion},
     {"wait_for_completion_interruptible", (void *)(uintptr_t)&kb_wait_for_completion},
+    {"wait_for_completion_interruptible_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"wait_for_completion_io_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"strlen", (void *)(uintptr_t)&strlen},
     {"strchr", (void *)(uintptr_t)&strchr},
@@ -2123,37 +2125,38 @@ static const shim_symbol_t shim_symbols[] = {
     {"blk_freeze_queue_start", (void *)(uintptr_t)&kb_noop},
     {"blk_integrity_register", (void *)(uintptr_t)&kb_return_zero},
     {"blk_integrity_unregister", (void *)(uintptr_t)&kb_noop},
-    {"blk_mark_disk_dead", (void *)(uintptr_t)&kb_noop},
+    {"blk_mark_disk_dead", (void *)(uintptr_t)&kb_blk_mark_disk_dead},
     {"blk_mq_alloc_request", (void *)(uintptr_t)&kb_blk_mq_alloc_request},
     {"blk_mq_alloc_request_hctx", (void *)(uintptr_t)&kb_blk_mq_alloc_request},
-    {"blk_mq_alloc_tag_set", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_alloc_tag_set", (void *)(uintptr_t)&kb_blk_mq_alloc_tag_set},
     {"blk_mq_complete_request", (void *)(uintptr_t)&kb_blk_mq_complete_request},
     {"blk_mq_complete_request_remote", (void *)(uintptr_t)&kb_blk_mq_complete_request_remote},
     {"blk_mq_delay_kick_requeue_list", (void *)(uintptr_t)&kb_noop},
-    {"blk_mq_destroy_queue", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_destroy_queue", (void *)(uintptr_t)&kb_blk_mq_destroy_queue},
     {"blk_mq_end_request", (void *)(uintptr_t)&kb_blk_mq_end_request},
     {"blk_mq_end_request_batch", (void *)(uintptr_t)&kb_blk_mq_end_request_batch},
     {"blk_mq_free_request", (void *)(uintptr_t)&kb_blk_mq_free_request},
-    {"blk_mq_free_tag_set", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_free_tag_set", (void *)(uintptr_t)&kb_blk_mq_free_tag_set},
     {"blk_mq_freeze_queue", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_freeze_queue_wait", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_freeze_queue_wait_timeout", (void *)(uintptr_t)&kb_return_zero},
     {"blk_mq_init_queue", (void *)(uintptr_t)&kb_blk_mq_init_queue},
-    {"blk_mq_map_queues", (void *)(uintptr_t)&kb_return_zero},
-    {"blk_mq_pci_map_queues", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_map_queues", (void *)(uintptr_t)&kb_blk_mq_map_queues},
+    {"blk_mq_pci_map_queues", (void *)(uintptr_t)&kb_blk_mq_pci_map_queues},
     {"blk_mq_quiesce_queue", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_quiesce_tagset", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_requeue_request", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_start_request", (void *)(uintptr_t)&kb_blk_mq_start_request},
-    {"blk_mq_tagset_busy_iter", (void *)(uintptr_t)&kb_noop},
-    {"blk_mq_tagset_wait_completed_request", (void *)(uintptr_t)&kb_noop},
+    {"blk_mq_tagset_busy_iter", (void *)(uintptr_t)&kb_blk_mq_tagset_busy_iter},
+    {"blk_mq_tagset_wait_completed_request", (void *)(uintptr_t)&kb_blk_mq_tagset_wait_completed_request},
     {"blk_mq_unfreeze_queue", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_unquiesce_queue", (void *)(uintptr_t)&kb_noop},
     {"blk_mq_unquiesce_tagset", (void *)(uintptr_t)&kb_noop},
-    {"blk_mq_update_nr_hw_queues", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_mq_update_nr_hw_queues", (void *)(uintptr_t)&kb_blk_mq_update_nr_hw_queues},
     {"blk_mq_wait_quiesce_done", (void *)(uintptr_t)&kb_noop},
     {"blk_op_str", (void *)(uintptr_t)&kb_empty_string},
     {"blk_put_queue", (void *)(uintptr_t)&kb_blk_put_queue},
+    {"blk_queue_bounce_limit", (void *)(uintptr_t)&kb_blk_queue_bounce_limit},
     {"blk_queue_chunk_sectors", (void *)(uintptr_t)&kb_blk_queue_chunk_sectors},
     {"blk_queue_dma_alignment", (void *)(uintptr_t)&kb_blk_queue_dma_alignment},
     {"blk_queue_flag_set", (void *)(uintptr_t)&kb_blk_queue_flag_set},
@@ -2167,17 +2170,18 @@ static const shim_symbol_t shim_symbols[] = {
     {"blk_queue_max_write_zeroes_sectors", (void *)(uintptr_t)&kb_blk_queue_max_write_zeroes_sectors},
     {"blk_queue_max_zone_append_sectors", (void *)(uintptr_t)&kb_blk_queue_max_zone_append_sectors},
     {"blk_queue_physical_block_size", (void *)(uintptr_t)&kb_blk_queue_physical_block_size},
+    {"blk_queue_update_dma_alignment", (void *)(uintptr_t)&kb_blk_queue_update_dma_alignment},
     {"blk_queue_virt_boundary", (void *)(uintptr_t)&kb_blk_queue_virt_boundary},
     {"blk_queue_write_cache", (void *)(uintptr_t)&kb_blk_queue_write_cache},
-    {"blk_revalidate_disk_zones", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_revalidate_disk_zones", (void *)(uintptr_t)&kb_blk_revalidate_disk_zones},
     {"blk_rq_is_poll", (void *)(uintptr_t)&kb_return_zero},
     {"blk_rq_map_kern", (void *)(uintptr_t)&kb_blk_rq_map_kern},
     {"blk_rq_map_user_io", (void *)(uintptr_t)&kb_return_zero},
     {"blk_rq_map_user_iov", (void *)(uintptr_t)&kb_return_zero},
     {"blk_rq_poll", (void *)(uintptr_t)&kb_return_zero},
     {"blk_rq_unmap_user", (void *)(uintptr_t)&kb_noop},
-    {"blk_set_stacking_limits", (void *)(uintptr_t)&kb_noop},
-    {"blk_stack_limits", (void *)(uintptr_t)&kb_return_zero},
+    {"blk_set_stacking_limits", (void *)(uintptr_t)&kb_blk_set_stacking_limits},
+    {"blk_stack_limits", (void *)(uintptr_t)&kb_blk_stack_limits},
     {"blk_status_to_errno", (void *)(uintptr_t)&kb_blk_status_to_errno},
     {"blk_steal_bios", (void *)(uintptr_t)&kb_noop},
     {"blk_sync_queue", (void *)(uintptr_t)&kb_noop},
@@ -2224,9 +2228,9 @@ static const shim_symbol_t shim_symbols[] = {
     {"device_initialize", (void *)(uintptr_t)&kb_noop},
     {"device_remove_file_self", (void *)(uintptr_t)&kb_return_zero},
     {"disable_irq", (void *)(uintptr_t)&kb_disable_irq_nosync},
-    {"disk_set_zoned", (void *)(uintptr_t)&kb_return_zero},
+    {"disk_set_zoned", (void *)(uintptr_t)&kb_disk_set_zoned},
     {"disk_uevent", (void *)(uintptr_t)&kb_noop},
-    {"disk_update_readahead", (void *)(uintptr_t)&kb_noop},
+    {"disk_update_readahead", (void *)(uintptr_t)&kb_disk_update_readahead},
     {"dmi_match", (void *)(uintptr_t)&kb_return_zero},
     {"dmi_get_system_info", (void *)(uintptr_t)&kb_empty_string},
     {"__drm_atomic_helper_crtc_destroy_state", (void *)(uintptr_t)&kb_noop},
@@ -2504,9 +2508,24 @@ static const shim_symbol_t shim_symbols[] = {
     {"set_pages_array_wb", (void *)(uintptr_t)&kb_return_zero},
     {"seq_lseek", (void *)(uintptr_t)&kb_return_zero},
     {"seq_printf", (void *)(uintptr_t)&kb_return_zero},
+    {"seq_putc", (void *)(uintptr_t)&kb_return_zero},
     {"seq_puts", (void *)(uintptr_t)&kb_return_zero},
     {"seq_read", (void *)(uintptr_t)&kb_return_zero},
     {"seq_read_iter", (void *)(uintptr_t)&kb_return_zero},
+    {"scsi_add_host_with_dma", (void *)(uintptr_t)&kb_scsi_add_host_with_dma},
+    {"scsi_done", (void *)(uintptr_t)&kb_scsi_done},
+    {"scsi_done_direct", (void *)(uintptr_t)&kb_scsi_done},
+    {"scsi_eh_prep_cmnd", (void *)(uintptr_t)&kb_scsi_eh_prep_cmnd},
+    {"scsi_eh_restore_cmnd", (void *)(uintptr_t)&kb_scsi_eh_restore_cmnd},
+    {"scsi_host_alloc", (void *)(uintptr_t)&kb_scsi_host_alloc},
+    {"scsi_host_put", (void *)(uintptr_t)&kb_scsi_host_put},
+    {"scsi_is_host_device", (void *)(uintptr_t)&kb_scsi_is_host_device},
+    {"scsi_normalize_sense", (void *)(uintptr_t)&kb_scsi_normalize_sense},
+    {"scsi_remove_host", (void *)(uintptr_t)&kb_scsi_remove_host},
+    {"scsi_report_bus_reset", (void *)(uintptr_t)&kb_scsi_report_bus_reset},
+    {"scsi_report_device_reset", (void *)(uintptr_t)&kb_scsi_report_device_reset},
+    {"scsi_scan_host", (void *)(uintptr_t)&kb_scsi_scan_host},
+    {"scsi_sense_desc_find", (void *)(uintptr_t)&kb_scsi_sense_desc_find},
     {"single_open", (void *)(uintptr_t)&kb_return_zero},
     {"single_release", (void *)(uintptr_t)&kb_return_zero},
     {"simple_strtoul", (void *)(uintptr_t)&strtoul},
@@ -2743,27 +2762,35 @@ static const shim_symbol_t shim_symbols[] = {
     {"usb_amd_quirk_pll_disable", (void *)(uintptr_t)&kb_noop},
     {"usb_amd_quirk_pll_enable", (void *)(uintptr_t)&kb_noop},
     {"usb_asmedia_modifyflowcontrol", (void *)(uintptr_t)&kb_noop},
-    {"usb_decode_interval", (void *)(uintptr_t)&kb_return_zero},
+    {"usb_decode_interval", (void *)(uintptr_t)&kb_usb_decode_interval},
+    {"usb_deregister", (void *)(uintptr_t)&kb_usb_deregister},
+    {"usb_deregister_dev", (void *)(uintptr_t)&kb_usb_deregister_dev},
     {"usb_disable_xhci_ports", (void *)(uintptr_t)&kb_return_zero},
     {"usb_disabled", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_ep_type_string", (void *)(uintptr_t)&kb_unknown_string_shim},
-    {"usb_hc_died", (void *)(uintptr_t)&kb_noop},
-    {"usb_hcd_amd_remote_wakeup_quirk", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_hcd_check_unlink_urb", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_hcd_end_port_resume", (void *)(uintptr_t)&kb_noop},
-    {"usb_hcd_giveback_urb", (void *)(uintptr_t)&kb_noop},
-    {"usb_hcd_link_urb_to_ep", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_hcd_map_urb_for_dma", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_hcd_poll_rh_status", (void *)(uintptr_t)&kb_noop},
-    {"usb_hcd_resume_root_hub", (void *)(uintptr_t)&kb_noop},
-    {"usb_hcd_start_port_resume", (void *)(uintptr_t)&kb_noop},
-    {"usb_hcd_unlink_urb_from_ep", (void *)(uintptr_t)&kb_noop},
-    {"usb_hcd_unmap_urb_for_dma", (void *)(uintptr_t)&kb_noop},
-    {"usb_hub_clear_tt_buffer", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_root_hub_lost_power", (void *)(uintptr_t)&kb_noop},
-    {"usb_speed_string", (void *)(uintptr_t)&kb_unknown_string_shim},
-    {"usb_state_string", (void *)(uintptr_t)&kb_unknown_string_shim},
-    {"usb_wakeup_notification", (void *)(uintptr_t)&kb_noop},
+    {"usb_ep_type_string", (void *)(uintptr_t)&kb_usb_ep_type_string},
+    {"usb_find_common_endpoints", (void *)(uintptr_t)&kb_usb_find_common_endpoints},
+    {"usb_find_interface", (void *)(uintptr_t)&kb_usb_find_interface},
+    {"usb_hc_died", (void *)(uintptr_t)&kb_usb_hc_died},
+    {"usb_hcd_amd_remote_wakeup_quirk", (void *)(uintptr_t)&kb_usb_hcd_amd_remote_wakeup_quirk},
+    {"usb_hcd_check_unlink_urb", (void *)(uintptr_t)&kb_usb_hcd_check_unlink_urb},
+    {"usb_hcd_end_port_resume", (void *)(uintptr_t)&kb_usb_hcd_end_port_resume},
+    {"usb_hcd_giveback_urb", (void *)(uintptr_t)&kb_usb_hcd_giveback_urb},
+    {"usb_hcd_link_urb_to_ep", (void *)(uintptr_t)&kb_usb_hcd_link_urb_to_ep},
+    {"usb_hcd_map_urb_for_dma", (void *)(uintptr_t)&kb_usb_hcd_map_urb_for_dma},
+    {"usb_hcd_poll_rh_status", (void *)(uintptr_t)&kb_usb_hcd_poll_rh_status},
+    {"usb_hcd_resume_root_hub", (void *)(uintptr_t)&kb_usb_hcd_resume_root_hub},
+    {"usb_hcd_start_port_resume", (void *)(uintptr_t)&kb_usb_hcd_start_port_resume},
+    {"usb_hcd_unlink_urb_from_ep", (void *)(uintptr_t)&kb_usb_hcd_unlink_urb_from_ep},
+    {"usb_hcd_unmap_urb_for_dma", (void *)(uintptr_t)&kb_usb_hcd_unmap_urb_for_dma},
+    {"usb_hub_clear_tt_buffer", (void *)(uintptr_t)&kb_usb_hub_clear_tt_buffer},
+    {"usb_kill_urb", (void *)(uintptr_t)&kb_usb_kill_urb},
+    {"usb_register_driver", (void *)(uintptr_t)&kb_usb_register_driver},
+    {"usb_root_hub_lost_power", (void *)(uintptr_t)&kb_usb_root_hub_lost_power},
+    {"usb_speed_string", (void *)(uintptr_t)&kb_usb_speed_string},
+    {"usb_state_string", (void *)(uintptr_t)&kb_usb_state_string},
+    {"usb_submit_urb", (void *)(uintptr_t)&kb_usb_submit_urb},
+    {"usb_unlink_urb", (void *)(uintptr_t)&kb_usb_unlink_urb},
+    {"usb_wakeup_notification", (void *)(uintptr_t)&kb_usb_wakeup_notification},
     {"wait_for_completion_killable_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"wait_for_completion_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"yield", (void *)(uintptr_t)&kb_noop},
@@ -3228,9 +3255,11 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
         strcmp(name, "power_group_name") == 0 ||
         strcmp(name, "screen_info") == 0 ||
         strcmp(name, "sme_me_mask") == 0 ||
+        strcmp(name, "system_freezable_wq") == 0 ||
         strcmp(name, "system_power_efficient_wq") == 0 ||
         strcmp(name, "system_wq") == 0 || strcmp(name, "page_offset_base") == 0 ||
         strcmp(name, "phys_base") == 0 || strcmp(name, "vmemmap_base") == 0 ||
+        strcmp(name, "param_ops_string") == 0 ||
         strcmp(name, "param_ops_ullong") == 0 ||
         strcmp(name, "usb_debug_root") == 0 ||
         strcmp(name, "uuid_null") == 0 ||
@@ -3730,6 +3759,18 @@ static int trace_internal_symbol_enabled(const char *name)
     return 0;
 }
 
+static int should_interpose_exported_symbol(const char *name)
+{
+    return strcmp(name, "usb_deregister") == 0 ||
+           strcmp(name, "usb_deregister_dev") == 0 ||
+           strcmp(name, "usb_find_common_endpoints") == 0 ||
+           strcmp(name, "usb_find_interface") == 0 ||
+           strcmp(name, "usb_kill_urb") == 0 ||
+           strcmp(name, "usb_register_driver") == 0 ||
+           strcmp(name, "usb_submit_urb") == 0 ||
+           strcmp(name, "usb_unlink_urb") == 0;
+}
+
 static int relocation_is_direct_call(const uint8_t *target)
 {
     return target != 0 && target[-1] == 0xe8;
@@ -3773,7 +3814,13 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
             return KB_OK;
         }
 
-        void *address = lookup_exported_symbol(symbol.name);
+        void *address = 0;
+        if (should_interpose_exported_symbol(symbol.name)) {
+            address = lookup_module_shim_symbol(module, symbol.name);
+        }
+        if (address == 0) {
+            address = lookup_exported_symbol(symbol.name);
+        }
         if (address == 0) {
             address = lookup_module_shim_symbol(module, symbol.name);
         }

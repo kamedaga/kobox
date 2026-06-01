@@ -34,11 +34,34 @@ typedef struct kb_block_disk_snapshot {
     uint32_t read_only;
     uint32_t notify_count;
     uint32_t put_count;
+    uint32_t dead;
+    uint32_t zoned_model;
+    uint32_t readahead_update_count;
+    uint32_t zone_revalidate_count;
+    uint64_t read_count;
+    uint64_t write_count;
+    uint64_t bytes_read;
+    uint64_t bytes_written;
 } kb_block_disk_snapshot_t;
+
+typedef int (*kb_block_disk_read_fn)(void *ctx, uint64_t sector, void *buffer, size_t byte_count);
+typedef int (*kb_block_disk_write_fn)(void *ctx, uint64_t sector, const void *buffer, size_t byte_count);
+
+typedef struct kb_block_tagset_snapshot {
+    void *tag_set;
+    void *tag_array;
+    uint32_t prepared_count;
+    uint32_t nr_hw_queues;
+    uint32_t map_queues_count;
+    uint32_t pci_map_queues_count;
+    uint32_t busy_iter_count;
+    uint32_t wait_completed_count;
+} kb_block_tagset_snapshot_t;
 
 void *kb_block_subsystem_queue_alloc(void *tag_set);
 void *kb_block_subsystem_queue_tag_set(const void *queue);
 void kb_block_subsystem_queue_put(void *queue);
+void kb_block_subsystem_queue_destroy(void *queue);
 void kb_block_subsystem_queue_set_logical_block_size(void *queue, uint32_t size);
 void kb_block_subsystem_queue_set_physical_block_size(void *queue, uint32_t size);
 void kb_block_subsystem_queue_set_io_min(void *queue, uint32_t size);
@@ -64,11 +87,29 @@ void kb_block_subsystem_disk_put(void *disk);
 void kb_block_subsystem_disk_set_capacity(void *disk, uint64_t sectors);
 int kb_block_subsystem_disk_set_capacity_and_notify(void *disk, uint64_t sectors);
 void kb_block_subsystem_disk_set_read_only(void *disk, int read_only);
+void kb_block_subsystem_disk_mark_dead(void *disk);
+void kb_block_subsystem_disk_set_zoned(void *disk, uint32_t model);
+void kb_block_subsystem_disk_update_readahead(void *disk);
+int kb_block_subsystem_disk_revalidate_zones(void *disk);
 int kb_block_subsystem_disk_snapshot(const void *disk, kb_block_disk_snapshot_t *out_snapshot);
+void kb_block_subsystem_disk_set_io(
+    void *disk,
+    void *ctx,
+    kb_block_disk_read_fn read_fn,
+    kb_block_disk_write_fn write_fn);
+int kb_block_subsystem_disk_read(void *disk, uint64_t sector, void *buffer, size_t byte_count);
+int kb_block_subsystem_disk_write(void *disk, uint64_t sector, const void *buffer, size_t byte_count);
 
 void *kb_block_subsystem_block_device_alloc(void);
 void kb_block_subsystem_object_free(void *object);
 
+int kb_block_subsystem_tagset_prepare(void *tag_set);
+void kb_block_subsystem_tagset_free(void *tag_set);
+void kb_block_subsystem_tagset_set_hw_queues(void *tag_set, uint32_t nr_hw_queues);
+void kb_block_subsystem_tagset_note_map_queues(void *tag_set, int pci);
+void kb_block_subsystem_tagset_note_busy_iter(void *tag_set);
+void kb_block_subsystem_tagset_note_wait_completed(void *tag_set);
+int kb_block_subsystem_tagset_snapshot(void *tag_set, kb_block_tagset_snapshot_t *out_snapshot);
 void *kb_block_subsystem_tagset_array(void *tag_set);
 uint32_t kb_block_subsystem_tagset_alloc_tag(void *tag_set, size_t queue_index);
 int kb_block_subsystem_tagset_bind_request(void *tag_set, size_t queue_index, uint32_t tag, void *request);

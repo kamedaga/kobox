@@ -68,7 +68,7 @@ ctest --test-dir .artifacts/build
 ## ロードマップ
 
 1. NVMe — 対応完了
-2. USB (xHCI) — USB HID が bind し、subsystem/input に device 登録
+2. USB (xHCI) — 対応完了 v1: HID + Mass Storage(BOT/SCSI/block I/O)、multi-device 
 3. Network (e1000e / r8169) — PCI + DMA shim を流用
 4. SATA (AHCI) — NVMe とストレージ shim を共通化
 5. NVIDIA GPU — 一部重要な関数が未実装だが初期化に成功

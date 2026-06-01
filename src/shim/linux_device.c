@@ -151,6 +151,8 @@ static int probe_device_with_driver(void *dev, void *driver)
     }
     if (result != 0) {
         write_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET, NULL);
+    } else {
+        kb_usb_observe_linux_device(dev);
     }
     return result;
 }
@@ -210,6 +212,7 @@ int kb_device_add(void *dev)
     if (trace_device_enabled()) {
         fprintf(stderr, "kobox device: add dev=%p bus=%p\n", dev, read_ptr(dev, KB_LINUX_6_8_DEVICE_BUS_OFFSET));
     }
+    kb_usb_observe_linux_device(dev);
     attach_device(dev);
     return 0;
 }

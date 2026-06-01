@@ -16,6 +16,10 @@ qemu_usb_device="${KOBOX_QEMU_USB_DEVICE:-}"
 expect_usb_device="${KOBOX_EXPECT_USB_DEVICE:-0}"
 enable_usb_hid="${KOBOX_ENABLE_USB_HID:-0}"
 expect_usb_hid="${KOBOX_EXPECT_USB_HID:-0}"
+enable_usb_storage="${KOBOX_ENABLE_USB_STORAGE:-0}"
+expect_usb_storage="${KOBOX_EXPECT_USB_STORAGE:-0}"
+usb_storage_image="${KOBOX_USB_STORAGE_IMAGE:-$work_dir/usb-storage.img}"
+usb_storage_count="${KOBOX_USB_STORAGE_COUNT:-1}"
 run_drain_ms="${KOBOX_RUN_DRAIN_MS:-0}"
 run_trace_internal="${KOBOX_RUN_TRACE_INTERNAL:-}"
 run_trace_xhci="${KOBOX_RUN_TRACE_XHCI:-}"
@@ -29,10 +33,38 @@ run_trace_shim_calls="${KOBOX_RUN_TRACE_SHIM_CALLS:-}"
 run_trace_shim_calls_top="${KOBOX_RUN_TRACE_SHIM_CALLS_TOP:-}"
 run_crash_stack="${KOBOX_RUN_CRASH_STACK:-}"
 run_input_summary="${KOBOX_RUN_INPUT_SUMMARY:-$expect_usb_hid}"
+run_usb_storage_summary="${KOBOX_RUN_USB_STORAGE_SUMMARY:-$expect_usb_storage}"
+run_usb_storage_io_smoke="${KOBOX_RUN_USB_STORAGE_IO_SMOKE:-$expect_usb_storage}"
 run_enable_sysfs_dirent="${KOBOX_RUN_ENABLE_SYSFS_DIRENT:-}"
 run_enable_usb_event_inject="${KOBOX_RUN_ENABLE_USB_EVENT_INJECT:-${KOBOX_ENABLE_USB_EVENT_INJECT:-}}"
 
 mkdir -p "$debs_dir" "$work_dir"
+
+case "$usb_storage_count" in
+    ''|*[!0-9]*)
+        echo "invalid KOBOX_USB_STORAGE_COUNT: $usb_storage_count" >&2
+        exit 1
+        ;;
+esac
+if [ "$usb_storage_count" -lt 1 ]; then
+    usb_storage_count=1
+fi
+
+usb_storage_image_for_index() {
+    index="$1"
+    if [ "$index" -eq 0 ]; then
+        printf '%s\n' "$usb_storage_image"
+        return
+    fi
+    case "$usb_storage_image" in
+        *.*)
+            printf '%s-%s.%s\n' "${usb_storage_image%.*}" "$index" "${usb_storage_image##*.}"
+            ;;
+        *)
+            printf '%s-%s\n' "$usb_storage_image" "$index"
+            ;;
+    esac
+}
 
 fetch_deb() {
     pkg="$1"
@@ -75,6 +107,13 @@ if [ "$enable_usb_hid" = "1" ] || [ "$expect_usb_hid" = "1" ]; then
             exit 0
         fi
     done
+fi
+if [ "$enable_usb_storage" = "1" ] || [ "$expect_usb_storage" = "1" ]; then
+    rel=kernel/drivers/usb/storage/usb-storage.ko
+    if [ ! -f "$usb_stack_root/$rel" ]; then
+        echo "skip qemu vfio xhci stack smoke: missing $usb_stack_root/$rel" >&2
+        exit 0
+    fi
 fi
 
 fetch_deb "$kernel_pkg"
@@ -159,6 +198,18 @@ if [ "$enable_usb_hid" = "1" ] || [ "$expect_usb_hid" = "1" ]; then
     cp "$usb_stack_root/kernel/drivers/hid/hid-generic.ko" "$root_dir/usr/lib/kobox/hid-generic.ko"
     cp "$usb_stack_root/kernel/drivers/hid/usbhid/usbhid.ko" "$root_dir/usr/lib/kobox/usbhid.ko"
 fi
+if [ "$enable_usb_storage" = "1" ] || [ "$expect_usb_storage" = "1" ]; then
+    cp "$usb_stack_root/kernel/drivers/usb/storage/usb-storage.ko" "$root_dir/usr/lib/kobox/usb-storage.ko"
+    storage_index=0
+    while [ "$storage_index" -lt "$usb_storage_count" ]; do
+        image=$(usb_storage_image_for_index "$storage_index")
+        if [ ! -f "$image" ]; then
+            mkdir -p "$(dirname "$image")"
+            dd if=/dev/zero of="$image" bs=1M count=16 >/dev/null 2>&1
+        fi
+        storage_index=$((storage_index + 1))
+    done
+fi
 
 cat >"$root_dir/init" <<'INIT'
 #!/bin/sh
@@ -228,6 +279,8 @@ KOBOX_TRACE_SHIM_CALLS="@RUN_TRACE_SHIM_CALLS@" \
 KOBOX_TRACE_SHIM_CALLS_TOP="@RUN_TRACE_SHIM_CALLS_TOP@" \
 KOBOX_CRASH_STACK="@RUN_CRASH_STACK@" \
 KOBOX_INPUT_SUMMARY="@RUN_INPUT_SUMMARY@" \
+KOBOX_USB_STORAGE_SUMMARY="@RUN_USB_STORAGE_SUMMARY@" \
+KOBOX_USB_STORAGE_IO_SMOKE="@RUN_USB_STORAGE_IO_SMOKE@" \
 KOBOX_ENABLE_SYSFS_DIRENT="@RUN_ENABLE_SYSFS_DIRENT@" \
 KOBOX_ENABLE_USB_EVENT_INJECT="@RUN_ENABLE_USB_EVENT_INJECT@" \
     timeout 45 /usr/bin/kobox-run \
@@ -236,6 +289,7 @@ KOBOX_ENABLE_USB_EVENT_INJECT="@RUN_ENABLE_USB_EVENT_INJECT@" \
         --drain-ms="@RUN_DRAIN_MS@" \
         --dep=/usr/lib/kobox/usbcore.ko \
         @RUN_USB_HID_DEPS@ \
+        @RUN_USB_STORAGE_DEPS@ \
         --dep=/usr/lib/kobox/xhci-hcd.ko \
         run /usr/lib/kobox/xhci-pci.ko
 status=$?
@@ -259,6 +313,8 @@ trace_shim_calls_escaped=$(printf '%s' "$run_trace_shim_calls" | sed 's/[\/&]/\\
 trace_shim_calls_top_escaped=$(printf '%s' "$run_trace_shim_calls_top" | sed 's/[\/&]/\\&/g')
 crash_stack_escaped=$(printf '%s' "$run_crash_stack" | sed 's/[\/&]/\\&/g')
 input_summary_escaped=$(printf '%s' "$run_input_summary" | sed 's/[\/&]/\\&/g')
+usb_storage_summary_escaped=$(printf '%s' "$run_usb_storage_summary" | sed 's/[\/&]/\\&/g')
+usb_storage_io_smoke_escaped=$(printf '%s' "$run_usb_storage_io_smoke" | sed 's/[\/&]/\\&/g')
 enable_sysfs_dirent_escaped=$(printf '%s' "$run_enable_sysfs_dirent" | sed 's/[\/&]/\\&/g')
 enable_usb_event_inject_escaped=$(printf '%s' "$run_enable_usb_event_inject" | sed 's/[\/&]/\\&/g')
 usb_hid_deps=""
@@ -266,6 +322,11 @@ if [ "$enable_usb_hid" = "1" ] || [ "$expect_usb_hid" = "1" ]; then
     usb_hid_deps="--dep=/usr/lib/kobox/hid.ko --dep=/usr/lib/kobox/hid-generic.ko --dep=/usr/lib/kobox/usbhid.ko"
 fi
 usb_hid_deps_escaped=$(printf '%s' "$usb_hid_deps" | sed 's/[\/&]/\\&/g')
+usb_storage_deps=""
+if [ "$enable_usb_storage" = "1" ] || [ "$expect_usb_storage" = "1" ]; then
+    usb_storage_deps="--dep=/usr/lib/kobox/usb-storage.ko"
+fi
+usb_storage_deps_escaped=$(printf '%s' "$usb_storage_deps" | sed 's/[\/&]/\\&/g')
 sed -i "s/@RUN_TRACE_INTERNAL@/$trace_internal_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_XHCI@/$trace_xhci_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_IRQ@/$trace_irq_escaped/g" "$root_dir/init"
@@ -278,12 +339,26 @@ sed -i "s/@RUN_TRACE_SHIM_CALLS@/$trace_shim_calls_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_TRACE_SHIM_CALLS_TOP@/$trace_shim_calls_top_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_CRASH_STACK@/$crash_stack_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_INPUT_SUMMARY@/$input_summary_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_STORAGE_SUMMARY@/$usb_storage_summary_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_STORAGE_IO_SMOKE@/$usb_storage_io_smoke_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_ENABLE_SYSFS_DIRENT@/$enable_sysfs_dirent_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_ENABLE_USB_EVENT_INJECT@/$enable_usb_event_inject_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_USB_HID_DEPS@/$usb_hid_deps_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_STORAGE_DEPS@/$usb_storage_deps_escaped/g" "$root_dir/init"
 
 initramfs="$work_dir/initramfs.cpio"
 (cd "$root_dir" && find . -print | "$cpio_bin" -o -H newc --quiet >"$initramfs")
+
+qemu_usb_storage_args=""
+if [ "$enable_usb_storage" = "1" ] || [ "$expect_usb_storage" = "1" ]; then
+    storage_index=0
+    while [ "$storage_index" -lt "$usb_storage_count" ]; do
+        image=$(usb_storage_image_for_index "$storage_index")
+        drive_id="usbstick$storage_index"
+        qemu_usb_storage_args="$qemu_usb_storage_args -drive file=$image,if=none,format=raw,id=$drive_id -device usb-storage,drive=$drive_id,bus=xhci0.0"
+        storage_index=$((storage_index + 1))
+    done
+fi
 
 rm -f "$serial_log" "$qemu_stderr"
 qemu-system-x86_64 \
@@ -297,6 +372,7 @@ qemu-system-x86_64 \
     -device intel-iommu,intremap=on \
     -device qemu-xhci,id=xhci0 \
     ${qemu_usb_device:+-device "$qemu_usb_device"} \
+    ${qemu_usb_storage_args} \
     -no-reboot \
     -display none \
     -serial "file:$serial_log" \
@@ -320,4 +396,25 @@ fi
 if [ "$expect_usb_hid" = "1" ]; then
     grep -Eq "hid-generic|USB HID|input:" "$serial_log"
     grep -q "kobox-input: device" "$serial_log"
+fi
+if [ "$expect_usb_storage" = "1" ]; then
+    grep -q "dependency /usr/lib/kobox/usb-storage.ko init_module returned 0" "$serial_log"
+    grep -q "kobox-usb-storage-io:" "$serial_log"
+    grep -q "kobox-usb-storage-scsi:" "$serial_log"
+    grep -q "kobox-usb-storage-bot:" "$serial_log"
+    grep -q "kobox-usb-storage:" "$serial_log"
+    storage_io_count=$(grep -c "^kobox-usb-storage-io:" "$serial_log" || true)
+    storage_scsi_count=$(grep -c "^kobox-usb-storage-scsi:" "$serial_log" || true)
+    storage_bot_count=$(grep -c "^kobox-usb-storage-bot:" "$serial_log" || true)
+    storage_summary_count=$(grep -c "^kobox-usb-storage:" "$serial_log" || true)
+    if [ "$storage_io_count" -lt "$usb_storage_count" ] ||
+        [ "$storage_scsi_count" -lt "$usb_storage_count" ] ||
+        [ "$storage_bot_count" -lt "$usb_storage_count" ] ||
+        [ "$storage_summary_count" -lt "$usb_storage_count" ]
+    then
+        echo "expected at least $usb_storage_count USB storage smoke lines, got io=$storage_io_count scsi=$storage_scsi_count bot=$storage_bot_count summary=$storage_summary_count" >&2
+        exit 1
+    fi
+    ! grep -q "device descriptor read/.*error" "$serial_log"
+    ! grep -q "unable to enumerate USB device" "$serial_log"
 fi

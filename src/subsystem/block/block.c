@@ -18,6 +18,7 @@ typedef struct kb_block_queue_state {
     void *tag_set;
     kb_block_queue_limits_t limits;
     uint32_t put_count;
+    uint32_t destroy_count;
     struct kb_block_queue_state *next;
 } kb_block_queue_state_t;
 
@@ -33,6 +34,17 @@ typedef struct kb_block_disk_state {
     uint32_t read_only;
     uint32_t notify_count;
     uint32_t put_count;
+    uint32_t dead;
+    uint32_t zoned_model;
+    uint32_t readahead_update_count;
+    uint32_t zone_revalidate_count;
+    void *io_ctx;
+    kb_block_disk_read_fn read_fn;
+    kb_block_disk_write_fn write_fn;
+    uint64_t read_count;
+    uint64_t write_count;
+    uint64_t bytes_read;
+    uint64_t bytes_written;
     struct kb_block_disk_state *next;
 } kb_block_disk_state_t;
 
@@ -50,6 +62,12 @@ typedef struct kb_block_tagset_state {
     kb_block_mq_tags_t tags[KB_BLOCK_SUBSYSTEM_QUEUE_MAX];
     void *rqs[KB_BLOCK_SUBSYSTEM_QUEUE_MAX][KB_BLOCK_SUBSYSTEM_TAGS_PER_QUEUE];
     uint32_t next_tag[KB_BLOCK_SUBSYSTEM_QUEUE_MAX];
+    uint32_t prepared_count;
+    uint32_t nr_hw_queues;
+    uint32_t map_queues_count;
+    uint32_t pci_map_queues_count;
+    uint32_t busy_iter_count;
+    uint32_t wait_completed_count;
     struct kb_block_tagset_state *next;
 } kb_block_tagset_state_t;
 
@@ -60,7 +78,7 @@ static kb_block_queue_state_t *queues;
 static kb_block_disk_state_t *disks;
 static uint32_t next_disk_number = 1;
 
-static kb_block_tagset_state_t *tagset_state_for(void *tag_set)
+static kb_block_tagset_state_t *tagset_state_find(void *tag_set)
 {
     if (tag_set == NULL) {
         return NULL;
@@ -71,21 +89,46 @@ static kb_block_tagset_state_t *tagset_state_for(void *tag_set)
             return state;
         }
     }
+    return NULL;
+}
+
+static kb_block_tagset_state_t *tagset_state_for(void *tag_set)
+{
+    kb_block_tagset_state_t *existing = tagset_state_find(tag_set);
+    if (existing != NULL || tag_set == NULL) {
+        return existing;
+    }
 
     kb_block_tagset_state_t *state = calloc(1, sizeof(*state));
     if (state == NULL) {
         return NULL;
     }
     state->tag_set = tag_set;
+    state->nr_hw_queues = 1;
     for (size_t i = 0; i < KB_BLOCK_SUBSYSTEM_QUEUE_MAX; i++) {
         state->tag_array[i] = &state->tags[i];
         state->tags[i].nr_tags = KB_BLOCK_SUBSYSTEM_TAGS_PER_QUEUE;
+        state->tags[i].active_queues = 1;
         state->tags[i].rqs = state->rqs[i];
         state->next_tag[i] = 1;
     }
     state->next = tagsets;
     tagsets = state;
     return state;
+}
+
+static void tagset_state_remove(void *tag_set)
+{
+    kb_block_tagset_state_t **link = &tagsets;
+    while (*link != NULL) {
+        kb_block_tagset_state_t *state = *link;
+        if (state->tag_set == tag_set) {
+            *link = state->next;
+            free(state);
+            return;
+        }
+        link = &state->next;
+    }
 }
 
 static kb_block_queue_state_t *queue_state_for(const void *queue)
@@ -172,6 +215,47 @@ static void disk_state_remove(void *disk)
     }
 }
 
+static uint32_t disk_logical_block_size(const kb_block_disk_state_t *state)
+{
+    if (state == NULL) {
+        return 512;
+    }
+    kb_block_queue_state_t *queue = queue_state_for(state->queue);
+    if (queue == NULL || queue->limits.logical_block_size == 0) {
+        return 512;
+    }
+    return queue->limits.logical_block_size;
+}
+
+static int disk_io_range_valid(const kb_block_disk_state_t *state, uint64_t sector, size_t byte_count)
+{
+    if (state == NULL || byte_count == 0) {
+        return -22;
+    }
+
+    uint64_t offset = 0;
+    if (__builtin_mul_overflow(sector, 512ull, &offset)) {
+        return -34;
+    }
+    uint64_t end = 0;
+    if (__builtin_add_overflow(offset, (uint64_t)byte_count, &end)) {
+        return -34;
+    }
+    uint64_t capacity_bytes = 0;
+    if (__builtin_mul_overflow(state->capacity_sectors, 512ull, &capacity_bytes)) {
+        return -34;
+    }
+    if (end > capacity_bytes) {
+        return -34;
+    }
+
+    uint32_t logical_block_size = disk_logical_block_size(state);
+    if ((offset % logical_block_size) != 0 || (byte_count % logical_block_size) != 0) {
+        return -22;
+    }
+    return 0;
+}
+
 void *kb_block_subsystem_queue_alloc(void *tag_set)
 {
     kb_block_queue_t *queue = calloc(1, KB_BLOCK_SUBSYSTEM_OBJECT_SIZE);
@@ -201,6 +285,14 @@ void kb_block_subsystem_queue_put(void *queue)
     kb_block_queue_state_t *state = queue_state_for(queue);
     if (state != NULL) {
         state->put_count++;
+    }
+}
+
+void kb_block_subsystem_queue_destroy(void *queue)
+{
+    kb_block_queue_state_t *state = queue_state_for(queue);
+    if (state != NULL) {
+        state->destroy_count++;
     }
 }
 
@@ -415,6 +507,41 @@ void kb_block_subsystem_disk_set_read_only(void *disk, int read_only)
     }
 }
 
+void kb_block_subsystem_disk_mark_dead(void *disk)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state != NULL) {
+        state->dead = 1;
+        state->registered = 0;
+    }
+}
+
+void kb_block_subsystem_disk_set_zoned(void *disk, uint32_t model)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state != NULL) {
+        state->zoned_model = model;
+    }
+}
+
+void kb_block_subsystem_disk_update_readahead(void *disk)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state != NULL) {
+        state->readahead_update_count++;
+    }
+}
+
+int kb_block_subsystem_disk_revalidate_zones(void *disk)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state == NULL) {
+        return -22;
+    }
+    state->zone_revalidate_count++;
+    return 0;
+}
+
 int kb_block_subsystem_disk_snapshot(const void *disk, kb_block_disk_snapshot_t *out_snapshot)
 {
     kb_block_disk_state_t *state = disk_state_for(disk);
@@ -432,7 +559,83 @@ int kb_block_subsystem_disk_snapshot(const void *disk, kb_block_disk_snapshot_t 
     out_snapshot->read_only = state->read_only;
     out_snapshot->notify_count = state->notify_count;
     out_snapshot->put_count = state->put_count;
+    out_snapshot->dead = state->dead;
+    out_snapshot->zoned_model = state->zoned_model;
+    out_snapshot->readahead_update_count = state->readahead_update_count;
+    out_snapshot->zone_revalidate_count = state->zone_revalidate_count;
+    out_snapshot->read_count = state->read_count;
+    out_snapshot->write_count = state->write_count;
+    out_snapshot->bytes_read = state->bytes_read;
+    out_snapshot->bytes_written = state->bytes_written;
     return 0;
+}
+
+void kb_block_subsystem_disk_set_io(
+    void *disk,
+    void *ctx,
+    kb_block_disk_read_fn read_fn,
+    kb_block_disk_write_fn write_fn)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state == NULL) {
+        return;
+    }
+    state->io_ctx = ctx;
+    state->read_fn = read_fn;
+    state->write_fn = write_fn;
+}
+
+int kb_block_subsystem_disk_read(void *disk, uint64_t sector, void *buffer, size_t byte_count)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state == NULL || buffer == NULL) {
+        return -22;
+    }
+    if (state->dead || !state->registered) {
+        return -19;
+    }
+    int valid = disk_io_range_valid(state, sector, byte_count);
+    if (valid != 0) {
+        return valid;
+    }
+    if (state->read_fn == NULL) {
+        return -95;
+    }
+
+    int result = state->read_fn(state->io_ctx, sector, buffer, byte_count);
+    if (result == 0) {
+        state->read_count++;
+        state->bytes_read += byte_count;
+    }
+    return result;
+}
+
+int kb_block_subsystem_disk_write(void *disk, uint64_t sector, const void *buffer, size_t byte_count)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state == NULL || buffer == NULL) {
+        return -22;
+    }
+    if (state->dead || !state->registered) {
+        return -19;
+    }
+    if (state->read_only) {
+        return -30;
+    }
+    int valid = disk_io_range_valid(state, sector, byte_count);
+    if (valid != 0) {
+        return valid;
+    }
+    if (state->write_fn == NULL) {
+        return -95;
+    }
+
+    int result = state->write_fn(state->io_ctx, sector, buffer, byte_count);
+    if (result == 0) {
+        state->write_count++;
+        state->bytes_written += byte_count;
+    }
+    return result;
 }
 
 void *kb_block_subsystem_block_device_alloc(void)
@@ -445,6 +648,85 @@ void kb_block_subsystem_object_free(void *object)
     disk_state_remove(object);
     queue_state_remove(object);
     free(object);
+}
+
+int kb_block_subsystem_tagset_prepare(void *tag_set)
+{
+    kb_block_tagset_state_t *state = tagset_state_for(tag_set);
+    if (state == NULL) {
+        return -12;
+    }
+    state->prepared_count++;
+    return 0;
+}
+
+void kb_block_subsystem_tagset_free(void *tag_set)
+{
+    tagset_state_remove(tag_set);
+}
+
+void kb_block_subsystem_tagset_set_hw_queues(void *tag_set, uint32_t nr_hw_queues)
+{
+    kb_block_tagset_state_t *state = tagset_state_for(tag_set);
+    if (state == NULL) {
+        return;
+    }
+    if (nr_hw_queues == 0) {
+        nr_hw_queues = 1;
+    }
+    if (nr_hw_queues > KB_BLOCK_SUBSYSTEM_QUEUE_MAX) {
+        nr_hw_queues = KB_BLOCK_SUBSYSTEM_QUEUE_MAX;
+    }
+    state->nr_hw_queues = nr_hw_queues;
+    for (size_t i = 0; i < KB_BLOCK_SUBSYSTEM_QUEUE_MAX; i++) {
+        state->tags[i].active_queues = i < nr_hw_queues ? 1u : 0u;
+    }
+}
+
+void kb_block_subsystem_tagset_note_map_queues(void *tag_set, int pci)
+{
+    kb_block_tagset_state_t *state = tagset_state_for(tag_set);
+    if (state == NULL) {
+        return;
+    }
+    if (pci) {
+        state->pci_map_queues_count++;
+    } else {
+        state->map_queues_count++;
+    }
+}
+
+void kb_block_subsystem_tagset_note_busy_iter(void *tag_set)
+{
+    kb_block_tagset_state_t *state = tagset_state_for(tag_set);
+    if (state != NULL) {
+        state->busy_iter_count++;
+    }
+}
+
+void kb_block_subsystem_tagset_note_wait_completed(void *tag_set)
+{
+    kb_block_tagset_state_t *state = tagset_state_for(tag_set);
+    if (state != NULL) {
+        state->wait_completed_count++;
+    }
+}
+
+int kb_block_subsystem_tagset_snapshot(void *tag_set, kb_block_tagset_snapshot_t *out_snapshot)
+{
+    kb_block_tagset_state_t *state = tagset_state_find(tag_set);
+    if (state == NULL || out_snapshot == NULL) {
+        return -22;
+    }
+    out_snapshot->tag_set = state->tag_set;
+    out_snapshot->tag_array = state->tag_array;
+    out_snapshot->prepared_count = state->prepared_count;
+    out_snapshot->nr_hw_queues = state->nr_hw_queues;
+    out_snapshot->map_queues_count = state->map_queues_count;
+    out_snapshot->pci_map_queues_count = state->pci_map_queues_count;
+    out_snapshot->busy_iter_count = state->busy_iter_count;
+    out_snapshot->wait_completed_count = state->wait_completed_count;
+    return 0;
 }
 
 void *kb_block_subsystem_tagset_array(void *tag_set)

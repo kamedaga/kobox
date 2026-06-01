@@ -1,4 +1,5 @@
 #include "kobox/shim.h"
+#include "subsystem/dma/dma.h"
 #include "subsystem/usb/usb.h"
 
 #include <stdarg.h>
@@ -7,8 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+kb_backend_t *kb_shim_current_backend(void);
+
 enum {
     KB_USB_HCD_STORAGE_SIZE = 4096,
+    KB_LINUX_6_8_DEVICE_PARENT_OFFSET = 0x40,
+    KB_LINUX_6_8_DEVICE_TYPE_OFFSET = 0x58,
+    KB_LINUX_6_8_DEVICE_DRIVER_OFFSET = 0x68,
     KB_LINUX_6_8_PCI_DEV_DRIVER_DATA_OFFSET = 0x140,
     KB_LINUX_6_8_USB_HCD_ROOT_HUB_OFFSET = 0x060,
     KB_LINUX_6_8_USB_HCD_SHARED_HCD_OFFSET = 0x210,
@@ -19,11 +25,41 @@ enum {
     KB_LINUX_6_8_HC_DRIVER_HUB_STATUS_DATA_OFFSET = 0x98,
     KB_LINUX_6_8_HC_DRIVER_HUB_CONTROL_OFFSET = 0xa0,
     KB_LINUX_6_8_USB_DEVICE_ACTCONFIG_OFFSET = 0x3b0,
+    KB_LINUX_6_8_USB_CONFIG_DESC_NUM_INTERFACES_OFFSET = 0x04,
+    KB_LINUX_6_8_USB_CONFIG_DESC_CONFIGURATION_VALUE_OFFSET = 0x05,
     KB_LINUX_6_8_USB_HOST_CONFIG_INTERFACE0_OFFSET = 0x98,
+    KB_LINUX_6_8_USB_INTERFACE_CUR_ALTSETTING_OFFSET = 0x08,
+    KB_LINUX_6_8_USB_INTERFACE_DEV_OFFSET = 0x50,
     KB_LINUX_6_8_USB_INTERFACE_DRIVER_DATA_OFFSET = 0x0c8,
+    KB_LINUX_6_8_USB_INTERFACE_DESC_NUMBER_OFFSET = 0x02,
+    KB_LINUX_6_8_USB_INTERFACE_DESC_ALTSETTING_OFFSET = 0x03,
+    KB_LINUX_6_8_USB_INTERFACE_DESC_ENDPOINT_COUNT_OFFSET = 0x04,
+    KB_LINUX_6_8_USB_INTERFACE_DESC_CLASS_OFFSET = 0x05,
+    KB_LINUX_6_8_USB_INTERFACE_DESC_SUBCLASS_OFFSET = 0x06,
+    KB_LINUX_6_8_USB_INTERFACE_DESC_PROTOCOL_OFFSET = 0x07,
+    KB_LINUX_6_8_USB_HOST_INTERFACE_ENDPOINT_OFFSET = 0x18,
+    KB_LINUX_6_8_USB_ENDPOINT_DESC_ADDRESS_OFFSET = 0x02,
+    KB_LINUX_6_8_USB_ENDPOINT_DESC_ATTRIBUTES_OFFSET = 0x03,
+    KB_LINUX_6_8_USB_ENDPOINT_DESC_MAX_PACKET_OFFSET = 0x04,
+    KB_LINUX_6_8_USB_ENDPOINT_DESC_INTERVAL_OFFSET = 0x06,
     KB_LINUX_6_8_USB_HUB_HDEV_OFFSET = 0x008,
     KB_LINUX_6_8_USB_HUB_EVENT_BITS_OFFSET = 0x060,
+    KB_LINUX_6_8_URB_STATUS_OFFSET = 0x058,
+    KB_LINUX_6_8_URB_TRANSFER_FLAGS_OFFSET = 0x05c,
+    KB_LINUX_6_8_URB_TRANSFER_BUFFER_OFFSET = 0x060,
+    KB_LINUX_6_8_URB_TRANSFER_DMA_OFFSET = 0x068,
+    KB_LINUX_6_8_URB_TRANSFER_BUFFER_LENGTH_OFFSET = 0x080,
+    KB_LINUX_6_8_URB_ACTUAL_LENGTH_OFFSET = 0x084,
+    KB_LINUX_6_8_URB_SETUP_PACKET_OFFSET = 0x088,
+    KB_LINUX_6_8_URB_SETUP_DMA_OFFSET = 0x090,
+    KB_LINUX_6_8_URB_COMPLETE_OFFSET = 0x0b0,
     KB_USB_REQ_GET_PORT_STATUS = 0xa300,
+    KB_USB_URB_NO_TRANSFER_DMA_MAP = 0x0004,
+    KB_USB_URB_DIR_IN = 0x0200,
+    KB_USB_URB_DMA_MAP_SINGLE = 0x00010000,
+    KB_USB_URB_SETUP_MAP_SINGLE = 0x00100000,
+    KB_USB_CONTROL_SETUP_SIZE = 8,
+    KB_USB_CONFIG_INTERFACE_MAX = 32,
 };
 
 static unsigned char usb_hcd_pci_pm_ops[256];
@@ -42,6 +78,98 @@ static int usb_event_injection_enabled(void)
 {
     const char *value = getenv("KOBOX_ENABLE_USB_EVENT_INJECT");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static void *usb_read_ptr_field(const void *base, size_t offset)
+{
+    void *value = NULL;
+    if (base != NULL) {
+        memcpy(&value, (const unsigned char *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static uint8_t usb_read_u8_field(const void *base, size_t offset)
+{
+    uint8_t value = 0;
+    if (base != NULL) {
+        memcpy(&value, (const unsigned char *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static uint16_t usb_read_le16_field(const void *base, size_t offset)
+{
+    const unsigned char *p = (const unsigned char *)base;
+    if (p == NULL) {
+        return 0;
+    }
+    return (uint16_t)(p[offset] | ((uint16_t)p[offset + 1] << 8));
+}
+
+static uint32_t usb_read_u32_field(const void *base, size_t offset)
+{
+    uint32_t value = 0;
+    if (base != NULL) {
+        memcpy(&value, (const unsigned char *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static uint64_t usb_read_u64_field(const void *base, size_t offset)
+{
+    uint64_t value = 0;
+    if (base != NULL) {
+        memcpy(&value, (const unsigned char *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static void usb_write_u32_field(void *base, size_t offset, uint32_t value)
+{
+    if (base != NULL) {
+        memcpy((unsigned char *)base + offset, &value, sizeof(value));
+    }
+}
+
+static void usb_write_int_field(void *base, size_t offset, int value)
+{
+    if (base != NULL) {
+        memcpy((unsigned char *)base + offset, &value, sizeof(value));
+    }
+}
+
+static void usb_write_u64_field(void *base, size_t offset, uint64_t value)
+{
+    if (base != NULL) {
+        memcpy((unsigned char *)base + offset, &value, sizeof(value));
+    }
+}
+
+static kb_dma_dir_t usb_urb_dma_direction(uint32_t transfer_flags)
+{
+    return (transfer_flags & KB_USB_URB_DIR_IN) != 0 ? KB_DMA_FROM_DEVICE : KB_DMA_TO_DEVICE;
+}
+
+static int usb_status_from_kb_status(kb_status_t status)
+{
+    switch (status) {
+    case KB_OK:
+        return 0;
+    case KB_ERR_INVALID:
+        return -22;
+    case KB_ERR_NOT_FOUND:
+        return -19;
+    case KB_ERR_DENIED:
+        return -13;
+    case KB_ERR_NOMEM:
+        return -12;
+    case KB_ERR_UNSUPPORTED:
+        return -95;
+    case KB_ERR_IO:
+    default:
+        return -5;
+    }
 }
 
 static int usb_hub_ready_for_events(void *hub)
@@ -84,6 +212,33 @@ static void *usb_root_hub_for_hcd(void *hcd)
     return root_hub;
 }
 
+typedef struct usb_root_hub_mark_ctx {
+    void *root_hub;
+    void (*mark)(void *hcd);
+} usb_root_hub_mark_ctx_t;
+
+static int usb_mark_hcd_for_root_hub_record(kb_usb_hcd_record_t *record, void *ctx)
+{
+    usb_root_hub_mark_ctx_t *mark_ctx = ctx;
+    if (record == NULL || mark_ctx == NULL || mark_ctx->mark == NULL) {
+        return 0;
+    }
+    if (usb_root_hub_for_hcd(record->hcd) == mark_ctx->root_hub) {
+        mark_ctx->mark(record->hcd);
+        return 1;
+    }
+    return 0;
+}
+
+static void usb_mark_hcd_for_root_hub(void *root_hub, void (*mark)(void *hcd))
+{
+    usb_root_hub_mark_ctx_t ctx = {
+        .root_hub = root_hub,
+        .mark = mark,
+    };
+    (void)kb_usb_subsystem_for_each_hcd(usb_mark_hcd_for_root_hub_record, &ctx);
+}
+
 static void *usb_hub_for_root_hub(void *root_hub)
 {
     void *(*hub_to_struct_hub)(void *) =
@@ -117,6 +272,162 @@ static void *usb_hub_for_root_hub(void *root_hub)
         (const unsigned char *)interface0 + KB_LINUX_6_8_USB_INTERFACE_DRIVER_DATA_OFFSET,
         sizeof(hub));
     return hub;
+}
+
+static void usb_observe_endpoint(void *udev, void *interface, void *endpoint)
+{
+    if (endpoint == NULL) {
+        return;
+    }
+
+    const uint8_t address = usb_read_u8_field(endpoint, KB_LINUX_6_8_USB_ENDPOINT_DESC_ADDRESS_OFFSET);
+    const uint8_t attributes = usb_read_u8_field(endpoint, KB_LINUX_6_8_USB_ENDPOINT_DESC_ATTRIBUTES_OFFSET);
+    kb_usb_endpoint_update_t update = {
+        .udev = udev,
+        .interface = interface,
+        .endpoint = endpoint,
+        .address = address,
+        .attributes = attributes,
+        .interval = usb_read_u8_field(endpoint, KB_LINUX_6_8_USB_ENDPOINT_DESC_INTERVAL_OFFSET),
+        .type = (uint8_t)(attributes & 0x03u),
+        .direction_in = (uint8_t)((address & 0x80u) != 0),
+        .max_packet_size = usb_read_le16_field(endpoint, KB_LINUX_6_8_USB_ENDPOINT_DESC_MAX_PACKET_OFFSET),
+    };
+    (void)kb_usb_subsystem_endpoint_observe(&update);
+}
+
+typedef struct usb_altsetting_match {
+    void *altsetting;
+    kb_usb_interface_snapshot_t interface;
+    int found;
+} usb_altsetting_match_t;
+
+static int usb_match_interface_altsetting(const kb_usb_interface_snapshot_t *snapshot, void *ctx)
+{
+    usb_altsetting_match_t *match = ctx;
+    if (snapshot == NULL || match == NULL || snapshot->cur_altsetting != match->altsetting) {
+        return 0;
+    }
+    match->interface = *snapshot;
+    match->found = 1;
+    return 1;
+}
+
+static void usb_observe_endpoint_for_altsetting(void *altsetting, void *endpoint)
+{
+    if (altsetting == NULL || endpoint == NULL) {
+        return;
+    }
+    usb_altsetting_match_t match = {
+        .altsetting = altsetting,
+    };
+    (void)kb_usb_subsystem_for_each_interface(usb_match_interface_altsetting, &match);
+    if (match.found) {
+        usb_observe_endpoint(match.interface.udev, match.interface.interface, endpoint);
+    }
+}
+
+static void usb_observe_interface(void *udev, void *interface, void *driver_hint)
+{
+    if (interface == NULL) {
+        return;
+    }
+
+    void *cur_altsetting =
+        usb_read_ptr_field(interface, KB_LINUX_6_8_USB_INTERFACE_CUR_ALTSETTING_OFFSET);
+    void *linux_device = (unsigned char *)interface + KB_LINUX_6_8_USB_INTERFACE_DEV_OFFSET;
+    void *driver = driver_hint != NULL ? driver_hint : usb_read_ptr_field(linux_device, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET);
+    kb_usb_interface_update_t update = {
+        .udev = udev,
+        .interface = interface,
+        .linux_device = linux_device,
+        .parent_linux_device = usb_read_ptr_field(linux_device, KB_LINUX_6_8_DEVICE_PARENT_OFFSET),
+        .driver = driver,
+        .driver_data = usb_read_ptr_field(interface, KB_LINUX_6_8_USB_INTERFACE_DRIVER_DATA_OFFSET),
+        .cur_altsetting = cur_altsetting,
+    };
+
+    if (cur_altsetting != NULL) {
+        update.interface_number =
+            usb_read_u8_field(cur_altsetting, KB_LINUX_6_8_USB_INTERFACE_DESC_NUMBER_OFFSET);
+        update.alternate_setting =
+            usb_read_u8_field(cur_altsetting, KB_LINUX_6_8_USB_INTERFACE_DESC_ALTSETTING_OFFSET);
+        update.endpoint_count =
+            usb_read_u8_field(cur_altsetting, KB_LINUX_6_8_USB_INTERFACE_DESC_ENDPOINT_COUNT_OFFSET);
+        update.interface_class =
+            usb_read_u8_field(cur_altsetting, KB_LINUX_6_8_USB_INTERFACE_DESC_CLASS_OFFSET);
+        update.interface_subclass =
+            usb_read_u8_field(cur_altsetting, KB_LINUX_6_8_USB_INTERFACE_DESC_SUBCLASS_OFFSET);
+        update.interface_protocol =
+            usb_read_u8_field(cur_altsetting, KB_LINUX_6_8_USB_INTERFACE_DESC_PROTOCOL_OFFSET);
+    }
+
+    (void)kb_usb_subsystem_interface_observe(&update);
+
+    void *endpoint = usb_read_ptr_field(cur_altsetting, KB_LINUX_6_8_USB_HOST_INTERFACE_ENDPOINT_OFFSET);
+    if (endpoint != NULL && update.endpoint_count != 0) {
+        usb_observe_endpoint(udev, interface, endpoint);
+    }
+}
+
+static void usb_observe_device_graph_with_devnum(void *hcd, void *udev, uint32_t devnum)
+{
+    if (udev == NULL) {
+        return;
+    }
+
+    void *config = usb_read_ptr_field(udev, KB_LINUX_6_8_USB_DEVICE_ACTCONFIG_OFFSET);
+    uint8_t interface_count = 0;
+    uint8_t configuration_value = 0;
+    if (config != NULL) {
+        interface_count = usb_read_u8_field(config, KB_LINUX_6_8_USB_CONFIG_DESC_NUM_INTERFACES_OFFSET);
+        configuration_value =
+            usb_read_u8_field(config, KB_LINUX_6_8_USB_CONFIG_DESC_CONFIGURATION_VALUE_OFFSET);
+    }
+
+    kb_usb_device_update_t update = {
+        .hcd = hcd,
+        .udev = udev,
+        .active_config = config,
+        .devnum = devnum,
+        .configuration_value = configuration_value,
+        .interface_count = interface_count,
+    };
+    (void)kb_usb_subsystem_device_observe(&update);
+
+    size_t limit = interface_count;
+    if (limit > KB_USB_CONFIG_INTERFACE_MAX) {
+        limit = KB_USB_CONFIG_INTERFACE_MAX;
+    }
+    for (size_t i = 0; i < limit; i++) {
+        void *interface = usb_read_ptr_field(
+            (const unsigned char *)config + KB_LINUX_6_8_USB_HOST_CONFIG_INTERFACE0_OFFSET,
+            i * sizeof(void *));
+        usb_observe_interface(udev, interface, NULL);
+    }
+}
+
+static void usb_observe_device_graph(void *hcd, void *udev)
+{
+    usb_observe_device_graph_with_devnum(hcd, udev, 0);
+}
+
+void kb_usb_observe_linux_device(void *dev)
+{
+    if (dev == NULL) {
+        return;
+    }
+
+    void *usb_if_device_type = kb_module_lookup_exported_symbol("usb_if_device_type");
+    if (usb_if_device_type == NULL) {
+        return;
+    }
+
+    void *device_type = usb_read_ptr_field(dev, KB_LINUX_6_8_DEVICE_TYPE_OFFSET);
+    if (device_type == usb_if_device_type) {
+        void *interface = (unsigned char *)dev - KB_LINUX_6_8_USB_INTERFACE_DEV_OFFSET;
+        usb_observe_interface(NULL, interface, NULL);
+    }
 }
 
 static int usb_root_hub_status_data(void *hcd, unsigned char status[8])
@@ -306,7 +617,7 @@ static void kick_root_hub_if_changed(void *hcd)
 int kb_usb_hcd_irq(int irq, void *hcd)
 {
     (void)irq;
-    (void)hcd;
+    kb_usb_subsystem_hcd_note_irq(hcd);
     return 1;
 }
 
@@ -331,8 +642,11 @@ int kb_usb_poll_root_hub(void *hcd)
     if (hcd == NULL) {
         return 0;
     }
+    kb_usb_subsystem_hcd_note_root_hub_poll(hcd);
     trace_root_hub_state("poll_root_hub", hcd);
+    usb_observe_device_graph(hcd, usb_root_hub_for_hcd(hcd));
     if (resume_root_hub != NULL) {
+        kb_usb_subsystem_hcd_note_root_hub_resume(hcd);
         resume_root_hub(hcd);
     }
     kick_root_hub_if_changed(hcd);
@@ -344,8 +658,11 @@ int kb_usb_poll_root_hub(void *hcd)
         if (trace_usb_enabled()) {
             fprintf(stderr, "kobox usb: poll_shared_root_hub hcd=%p shared=%p\n", hcd, shared_hcd);
         }
+        kb_usb_subsystem_hcd_note_root_hub_poll(shared_hcd);
         trace_root_hub_state("poll_shared_root_hub", shared_hcd);
+        usb_observe_device_graph(shared_hcd, usb_root_hub_for_hcd(shared_hcd));
         if (resume_root_hub != NULL) {
+            kb_usb_subsystem_hcd_note_root_hub_resume(shared_hcd);
             resume_root_hub(shared_hcd);
         }
         kick_root_hub_if_changed(shared_hcd);
@@ -518,6 +835,369 @@ void *kb_usb_pm_suspend_target_state_storage(void)
     return &usb_pm_suspend_target_state;
 }
 
+void kb_usb_hc_died(void *hcd)
+{
+    kb_usb_subsystem_hcd_note_died(hcd);
+}
+
+int kb_usb_hcd_amd_remote_wakeup_quirk(void *hcd)
+{
+    kb_usb_subsystem_hcd_note_remote_wakeup_quirk(hcd);
+    return 0;
+}
+
+int kb_usb_hcd_check_unlink_urb(void *hcd, void *urb, int status)
+{
+    return kb_usb_subsystem_urb_check_unlink(hcd, urb, status);
+}
+
+void kb_usb_hcd_end_port_resume(void *hcd)
+{
+    kb_usb_subsystem_hcd_note_port_resume_end(hcd);
+}
+
+void kb_usb_hcd_giveback_urb(void *hcd, void *urb, int status)
+{
+    if (urb != NULL) {
+        uint32_t transfer_length = usb_read_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_BUFFER_LENGTH_OFFSET);
+        uint32_t actual_length = usb_read_u32_field(urb, KB_LINUX_6_8_URB_ACTUAL_LENGTH_OFFSET);
+        uint32_t transfer_flags = usb_read_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_FLAGS_OFFSET);
+        usb_write_int_field(urb, KB_LINUX_6_8_URB_STATUS_OFFSET, status);
+        if (status == 0 &&
+            actual_length == 0 &&
+            transfer_length != 0 &&
+            (transfer_flags & KB_USB_URB_DIR_IN) == 0)
+        {
+            usb_write_u32_field(urb, KB_LINUX_6_8_URB_ACTUAL_LENGTH_OFFSET, transfer_length);
+        }
+    }
+    kb_usb_subsystem_urb_giveback(hcd, urb, status);
+    void *complete_ptr = usb_read_ptr_field(urb, KB_LINUX_6_8_URB_COMPLETE_OFFSET);
+    void (*complete)(void *) = NULL;
+    memcpy(&complete, &complete_ptr, sizeof(complete));
+    if (complete != NULL) {
+        complete(urb);
+    }
+}
+
+int kb_usb_hcd_link_urb_to_ep(void *hcd, void *urb)
+{
+    return kb_usb_subsystem_urb_link(hcd, urb);
+}
+
+int kb_usb_hcd_map_urb_for_dma(void *hcd, void *urb, unsigned int mem_flags)
+{
+    if (hcd == NULL || urb == NULL) {
+        return -22;
+    }
+
+    uint32_t transfer_flags = usb_read_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_FLAGS_OFFSET);
+    uint32_t transfer_length = usb_read_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_BUFFER_LENGTH_OFFSET);
+    uint32_t actual_length = usb_read_u32_field(urb, KB_LINUX_6_8_URB_ACTUAL_LENGTH_OFFSET);
+    void *transfer_buffer = usb_read_ptr_field(urb, KB_LINUX_6_8_URB_TRANSFER_BUFFER_OFFSET);
+    void *setup_packet = usb_read_ptr_field(urb, KB_LINUX_6_8_URB_SETUP_PACKET_OFFSET);
+    uint64_t transfer_dma = usb_read_u64_field(urb, KB_LINUX_6_8_URB_TRANSFER_DMA_OFFSET);
+    uint64_t setup_dma = usb_read_u64_field(urb, KB_LINUX_6_8_URB_SETUP_DMA_OFFSET);
+    uint32_t dma_map_flags = 0;
+
+    kb_backend_t *backend = kb_shim_current_backend();
+    kb_device_t *device = kb_subsystem_dma_default_device(backend);
+    if (device == NULL) {
+        return -19;
+    }
+
+    if (transfer_length != 0 && (transfer_flags & KB_USB_URB_NO_TRANSFER_DMA_MAP) == 0) {
+        if (transfer_buffer == NULL) {
+            return -22;
+        }
+        kb_status_t map_status = KB_ERR_INVALID;
+        transfer_dma = kb_subsystem_dma_map(
+            backend,
+            device,
+            transfer_buffer,
+            transfer_length,
+            usb_urb_dma_direction(transfer_flags),
+            &map_status);
+        if (map_status != KB_OK) {
+            return usb_status_from_kb_status(map_status);
+        }
+        usb_write_u64_field(urb, KB_LINUX_6_8_URB_TRANSFER_DMA_OFFSET, transfer_dma);
+        transfer_flags |= KB_USB_URB_DMA_MAP_SINGLE;
+        dma_map_flags |= KB_USB_URB_DMA_MAP_SINGLE;
+    }
+
+    if (setup_packet != NULL && (transfer_flags & KB_USB_URB_SETUP_MAP_SINGLE) == 0) {
+        kb_status_t map_status = KB_ERR_INVALID;
+        setup_dma = kb_subsystem_dma_map(
+            backend,
+            device,
+            setup_packet,
+            KB_USB_CONTROL_SETUP_SIZE,
+            KB_DMA_TO_DEVICE,
+            &map_status);
+        if (map_status != KB_OK) {
+            if ((dma_map_flags & KB_USB_URB_DMA_MAP_SINGLE) != 0) {
+                kb_subsystem_dma_unmap(
+                    backend,
+                    device,
+                    transfer_dma,
+                    transfer_length,
+                    usb_urb_dma_direction(transfer_flags));
+            }
+            return usb_status_from_kb_status(map_status);
+        }
+        usb_write_u64_field(urb, KB_LINUX_6_8_URB_SETUP_DMA_OFFSET, setup_dma);
+        transfer_flags |= KB_USB_URB_SETUP_MAP_SINGLE;
+        dma_map_flags |= KB_USB_URB_SETUP_MAP_SINGLE;
+    }
+
+    usb_write_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_FLAGS_OFFSET, transfer_flags);
+    kb_usb_urb_dma_update_t update = {
+        .transfer_buffer = transfer_buffer,
+        .setup_packet = setup_packet,
+        .transfer_dma = transfer_dma,
+        .setup_dma = setup_dma,
+        .transfer_buffer_length = transfer_length,
+        .actual_length = actual_length,
+        .transfer_flags = transfer_flags,
+        .dma_map_flags = dma_map_flags,
+        .mem_flags = mem_flags,
+    };
+    return kb_usb_subsystem_urb_map_dma(hcd, urb, &update);
+}
+
+void kb_usb_hcd_poll_rh_status(void *hcd)
+{
+    kb_usb_subsystem_hcd_note_root_hub_poll(hcd);
+}
+
+void kb_usb_hcd_resume_root_hub(void *hcd)
+{
+    kb_usb_subsystem_hcd_note_root_hub_resume(hcd);
+}
+
+void kb_usb_hcd_start_port_resume(void *hcd)
+{
+    kb_usb_subsystem_hcd_note_port_resume_start(hcd);
+}
+
+void kb_usb_hcd_unlink_urb_from_ep(void *hcd, void *urb)
+{
+    kb_usb_subsystem_urb_unlink(hcd, urb, 0);
+}
+
+void kb_usb_hcd_unmap_urb_for_dma(void *hcd, void *urb)
+{
+    if (urb != NULL) {
+        uint32_t transfer_flags = usb_read_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_FLAGS_OFFSET);
+        uint32_t transfer_length = usb_read_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_BUFFER_LENGTH_OFFSET);
+        uint64_t transfer_dma = usb_read_u64_field(urb, KB_LINUX_6_8_URB_TRANSFER_DMA_OFFSET);
+        uint64_t setup_dma = usb_read_u64_field(urb, KB_LINUX_6_8_URB_SETUP_DMA_OFFSET);
+        kb_backend_t *backend = kb_shim_current_backend();
+        kb_device_t *device = kb_subsystem_dma_default_device(backend);
+        if (device != NULL) {
+            if ((transfer_flags & KB_USB_URB_DMA_MAP_SINGLE) != 0 && transfer_length != 0) {
+                kb_subsystem_dma_unmap(
+                    backend,
+                    device,
+                    transfer_dma,
+                    transfer_length,
+                    usb_urb_dma_direction(transfer_flags));
+                transfer_flags &= ~((uint32_t)KB_USB_URB_DMA_MAP_SINGLE);
+            }
+            if ((transfer_flags & KB_USB_URB_SETUP_MAP_SINGLE) != 0) {
+                kb_subsystem_dma_unmap(
+                    backend,
+                    device,
+                    setup_dma,
+                    KB_USB_CONTROL_SETUP_SIZE,
+                    KB_DMA_TO_DEVICE);
+                transfer_flags &= ~((uint32_t)KB_USB_URB_SETUP_MAP_SINGLE);
+            }
+            usb_write_u32_field(urb, KB_LINUX_6_8_URB_TRANSFER_FLAGS_OFFSET, transfer_flags);
+        }
+    }
+    kb_usb_subsystem_urb_unmap_dma(hcd, urb);
+}
+
+void kb_usb_root_hub_lost_power(void *root_hub)
+{
+    usb_mark_hcd_for_root_hub(root_hub, kb_usb_subsystem_hcd_note_lost_power);
+}
+
+int kb_usb_hub_clear_tt_buffer(void *udev, int pipe)
+{
+    (void)udev;
+    (void)pipe;
+    return 0;
+}
+
+void kb_usb_wakeup_notification(void *hdev, unsigned int portnum)
+{
+    (void)portnum;
+    usb_mark_hcd_for_root_hub(hdev, kb_usb_subsystem_hcd_note_wakeup_notification);
+}
+
+int kb_usb_decode_interval(void *udev, void *ep)
+{
+    (void)udev;
+    (void)ep;
+    return 1;
+}
+
+const char *kb_usb_ep_type_string(int type)
+{
+    switch (type) {
+    case 0:
+        return "Control";
+    case 1:
+        return "Isoc";
+    case 2:
+        return "Bulk";
+    case 3:
+        return "Interrupt";
+    default:
+        return "Unknown";
+    }
+}
+
+const char *kb_usb_speed_string(int speed)
+{
+    switch (speed) {
+    case 1:
+        return "low-speed";
+    case 2:
+        return "full-speed";
+    case 3:
+        return "high-speed";
+    case 4:
+        return "wireless";
+    case 5:
+        return "super-speed";
+    case 6:
+        return "super-speed-plus";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+const char *kb_usb_state_string(int state)
+{
+    switch (state) {
+    case 0:
+        return "not attached";
+    case 1:
+        return "attached";
+    case 2:
+        return "powered";
+    case 3:
+        return "reconnecting";
+    case 4:
+        return "unauthenticated";
+    case 5:
+        return "default";
+    case 6:
+        return "addressed";
+    case 7:
+        return "configured";
+    case 8:
+        return "suspended";
+    default:
+        return "unknown";
+    }
+}
+
+int kb_usb_register_driver(void *driver, void *owner, const char *mod_name)
+{
+    int (*real_register)(void *, void *, const char *) =
+        (int (*)(void *, void *, const char *))kb_module_lookup_exported_symbol("usb_register_driver");
+    int result = real_register != NULL ? real_register(driver, owner, mod_name) : -19;
+    kb_usb_subsystem_driver_register(driver, owner, mod_name, result);
+    return result;
+}
+
+void kb_usb_deregister(void *driver)
+{
+    void (*real_deregister)(void *) = (void (*)(void *))kb_module_lookup_exported_symbol("usb_deregister");
+    if (real_deregister != NULL) {
+        real_deregister(driver);
+    }
+    kb_usb_subsystem_driver_deregister(driver);
+}
+
+void kb_usb_deregister_dev(void *interface, const void *class_driver)
+{
+    void (*real_deregister_dev)(void *, const void *) =
+        (void (*)(void *, const void *))kb_module_lookup_exported_symbol("usb_deregister_dev");
+    usb_observe_interface(NULL, interface, NULL);
+    if (real_deregister_dev != NULL) {
+        real_deregister_dev(interface, class_driver);
+    }
+}
+
+void *kb_usb_find_interface(void *driver, int minor)
+{
+    void *(*real_find_interface)(void *, int) =
+        (void *(*)(void *, int))kb_module_lookup_exported_symbol("usb_find_interface");
+    void *interface = real_find_interface != NULL ? real_find_interface(driver, minor) : NULL;
+    usb_observe_interface(NULL, interface, driver);
+    return interface;
+}
+
+int kb_usb_find_common_endpoints(
+    void *altsetting,
+    void **bulk_in,
+    void **bulk_out,
+    void **int_in,
+    void **int_out)
+{
+    int (*real_find_common_endpoints)(void *, void **, void **, void **, void **) =
+        (int (*)(void *, void **, void **, void **, void **))
+            kb_module_lookup_exported_symbol("usb_find_common_endpoints");
+    int result = real_find_common_endpoints != NULL ?
+        real_find_common_endpoints(altsetting, bulk_in, bulk_out, int_in, int_out) :
+        -19;
+    if (bulk_in != NULL) {
+        usb_observe_endpoint_for_altsetting(altsetting, *bulk_in);
+    }
+    if (bulk_out != NULL) {
+        usb_observe_endpoint_for_altsetting(altsetting, *bulk_out);
+    }
+    if (int_in != NULL) {
+        usb_observe_endpoint_for_altsetting(altsetting, *int_in);
+    }
+    if (int_out != NULL) {
+        usb_observe_endpoint_for_altsetting(altsetting, *int_out);
+    }
+    return result;
+}
+
+int kb_usb_submit_urb(void *urb, unsigned int mem_flags)
+{
+    int (*real_submit_urb)(void *, unsigned int) =
+        (int (*)(void *, unsigned int))kb_module_lookup_exported_symbol("usb_submit_urb");
+    int result = real_submit_urb != NULL ? real_submit_urb(urb, mem_flags) : -19;
+    kb_usb_subsystem_urb_submit(NULL, urb, mem_flags, result);
+    return result;
+}
+
+int kb_usb_unlink_urb(void *urb)
+{
+    int (*real_unlink_urb)(void *) = (int (*)(void *))kb_module_lookup_exported_symbol("usb_unlink_urb");
+    int result = real_unlink_urb != NULL ? real_unlink_urb(urb) : -19;
+    kb_usb_subsystem_urb_unlink(NULL, urb, result);
+    return result;
+}
+
+void kb_usb_kill_urb(void *urb)
+{
+    void (*real_kill_urb)(void *) = (void (*)(void *))kb_module_lookup_exported_symbol("usb_kill_urb");
+    if (real_kill_urb != NULL) {
+        real_kill_urb(urb);
+    }
+    kb_usb_subsystem_urb_kill(NULL, urb);
+}
+
 void kb_xhci_init_driver(void *driver, const void *overrides)
 {
     (void)driver;
@@ -570,10 +1250,8 @@ int kb_xhci_ext_cap_init(void *xhci)
 
 int kb_xhci_update_hub_device(void *hcd, void *udev, void *tt, unsigned int devnum)
 {
-    (void)hcd;
-    (void)udev;
     (void)tt;
-    (void)devnum;
+    usb_observe_device_graph_with_devnum(hcd, udev, devnum);
     return 0;
 }
 

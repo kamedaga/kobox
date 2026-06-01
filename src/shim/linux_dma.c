@@ -181,6 +181,12 @@ int kb_dma_mapping_error(void *dev, uint64_t dma_addr)
     return kb_subsystem_dma_mapping_error(dma_addr);
 }
 
+size_t kb_dma_max_mapping_size(void *dev)
+{
+    (void)dev;
+    return (size_t)1 << 30;
+}
+
 void *dma_alloc_attrs(void *dev, size_t size, uint64_t *dma_handle, unsigned int flags, unsigned long attrs)
 {
     return kb_dma_alloc_attrs(dev, size, dma_handle, flags, attrs);

@@ -23,6 +23,8 @@ add_library(kobox_runtime STATIC
     src/subsystem/input/input.c
     src/subsystem/nvme/nvme.c
     src/subsystem/pci/pci.c
+    src/subsystem/scsi/scsi.c
+    src/subsystem/usb/storage.c
     src/subsystem/usb/usb.c
     src/shim/linux_context.c
     src/shim/linux_block.c
@@ -38,6 +40,7 @@ add_library(kobox_runtime STATIC
     src/shim/linux_pci.c
     src/shim/linux_platform.c
     src/shim/linux_printk.c
+    src/shim/linux_scsi.c
     src/shim/linux_stubs.c
     src/shim/linux_sync.c
     src/shim/linux_usb.c
@@ -155,6 +158,8 @@ add_test(NAME kobox-smoke COMMAND kobox-smoke)
 
 add_executable(kobox-usb-subsystem-smoke
     tests/usb_subsystem_smoke.c
+    src/subsystem/block/block.c
+    src/subsystem/usb/storage.c
     src/subsystem/usb/usb.c
 )
 

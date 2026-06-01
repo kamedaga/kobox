@@ -8,6 +8,7 @@
 #include "kobox/module.h"
 #include "kobox/shim.h"
 #include "subsystem/input/input.h"
+#include "subsystem/usb/storage.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -389,9 +390,30 @@ int main(int argc, char **argv)
         }
     }
     drain_after_init(backend, drain_ms);
+    const char *usb_storage_io_smoke = getenv("KOBOX_USB_STORAGE_IO_SMOKE");
+    if (usb_storage_io_smoke != NULL && usb_storage_io_smoke[0] != '\0' && strcmp(usb_storage_io_smoke, "0") != 0) {
+        int storage_io_result = kb_usb_storage_subsystem_run_io_smoke(stdout);
+        if (storage_io_result != 0) {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            kb_backend_destroy(backend);
+            free(data);
+            fprintf(stderr, "usb storage io smoke failed: %d\n", storage_io_result);
+            return 10;
+        }
+    }
     const char *input_summary = getenv("KOBOX_INPUT_SUMMARY");
     if (input_summary != NULL && input_summary[0] != '\0' && strcmp(input_summary, "0") != 0) {
         kb_input_subsystem_print_summary(stdout);
+    }
+    const char *usb_storage_summary = getenv("KOBOX_USB_STORAGE_SUMMARY");
+    if (usb_storage_summary != NULL && usb_storage_summary[0] != '\0' && strcmp(usb_storage_summary, "0") != 0) {
+        kb_usb_storage_subsystem_print_summary(stdout);
     }
 
     status = kb_module_call_cleanup(module);

@@ -183,6 +183,9 @@ void *kb_linux_block_tag_set_driver_data(void *tag_set)
 
 static int shim_blk_tagset_prepare(void *tag_set)
 {
+    if (kb_block_subsystem_tagset_prepare(tag_set) != 0) {
+        return -12;
+    }
     void *tag_array = kb_block_subsystem_tagset_array(tag_set);
     if (tag_array == NULL) {
         return -12;
@@ -408,6 +411,43 @@ void *kb_blk_mq_init_queue(void *tag_set)
         fprintf(stderr, "kobox blk-mq: init_queue tag_set=%p queue=%p\n", tag_set, (void *)queue);
     }
     return queue;
+}
+
+int kb_blk_mq_alloc_tag_set(void *tag_set)
+{
+    if (tag_set == NULL) {
+        return -22;
+    }
+    int result = shim_blk_tagset_prepare(tag_set);
+    if (result != 0) {
+        return result;
+    }
+    const kb_linux_block_driver_ops_t *driver_ops = block_driver_ops_for_tag_set(tag_set);
+    if (driver_ops != NULL && driver_ops->track_tag_set != NULL) {
+        driver_ops->track_tag_set(tag_set);
+    }
+    if (trace_block_enabled()) {
+        fprintf(stderr, "kobox blk-mq: alloc_tag_set tag_set=%p driver=%s\n",
+            tag_set,
+            driver_ops == NULL || driver_ops->name == NULL ? "(unknown)" : driver_ops->name);
+    }
+    return 0;
+}
+
+void kb_blk_mq_free_tag_set(void *tag_set)
+{
+    if (trace_block_enabled()) {
+        fprintf(stderr, "kobox blk-mq: free_tag_set tag_set=%p\n", tag_set);
+    }
+    kb_block_subsystem_tagset_free(tag_set);
+}
+
+void kb_blk_mq_destroy_queue(void *queue)
+{
+    if (trace_block_enabled()) {
+        fprintf(stderr, "kobox blk-mq: destroy_queue queue=%p\n", queue);
+    }
+    kb_block_subsystem_queue_destroy(queue);
 }
 
 void *kb_blk_mq_alloc_request(void *queue, unsigned int op, unsigned int flags)
@@ -810,6 +850,36 @@ int kb_blk_status_to_errno(unsigned int status)
     }
 }
 
+void kb_blk_mq_map_queues(void *queue_map)
+{
+    (void)queue_map;
+}
+
+int kb_blk_mq_pci_map_queues(void *queue_map, void *pdev, int offset)
+{
+    (void)queue_map;
+    (void)pdev;
+    (void)offset;
+    return 0;
+}
+
+void kb_blk_mq_tagset_busy_iter(void *tag_set, void *fn, void *priv)
+{
+    (void)fn;
+    (void)priv;
+    kb_block_subsystem_tagset_note_busy_iter(tag_set);
+}
+
+void kb_blk_mq_tagset_wait_completed_request(void *tag_set)
+{
+    kb_block_subsystem_tagset_note_wait_completed(tag_set);
+}
+
+void kb_blk_mq_update_nr_hw_queues(void *tag_set, unsigned int nr_hw_queues)
+{
+    kb_block_subsystem_tagset_set_hw_queues(tag_set, nr_hw_queues);
+}
+
 void kb_blk_put_queue(void *queue)
 {
     kb_block_subsystem_queue_put(queue);
@@ -890,6 +960,17 @@ void kb_blk_queue_write_cache(void *queue, bool write_cache, bool fua)
     kb_block_subsystem_queue_set_write_cache(queue, write_cache, fua);
 }
 
+void kb_blk_queue_bounce_limit(void *queue, uint64_t dma_mask)
+{
+    (void)queue;
+    (void)dma_mask;
+}
+
+void kb_blk_queue_update_dma_alignment(void *queue, int mask)
+{
+    kb_block_subsystem_queue_set_dma_alignment(queue, (uint32_t)mask);
+}
+
 int kb_device_add_disk(void *parent, void *disk, void *groups)
 {
     return kb_block_subsystem_disk_register(parent, disk, groups);
@@ -898,6 +979,40 @@ int kb_device_add_disk(void *parent, void *disk, void *groups)
 void kb_del_gendisk(void *disk)
 {
     kb_block_subsystem_disk_unregister(disk);
+}
+
+void kb_blk_mark_disk_dead(void *disk)
+{
+    kb_block_subsystem_disk_mark_dead(disk);
+}
+
+int kb_blk_revalidate_disk_zones(void *disk, void *update_driver_data)
+{
+    (void)update_driver_data;
+    return kb_block_subsystem_disk_revalidate_zones(disk);
+}
+
+void kb_blk_set_stacking_limits(void *limits)
+{
+    (void)limits;
+}
+
+int kb_blk_stack_limits(void *top, void *bottom, unsigned int start)
+{
+    (void)top;
+    (void)bottom;
+    (void)start;
+    return 0;
+}
+
+void kb_disk_set_zoned(void *disk, unsigned int model)
+{
+    kb_block_subsystem_disk_set_zoned(disk, model);
+}
+
+void kb_disk_update_readahead(void *disk)
+{
+    kb_block_subsystem_disk_update_readahead(disk);
 }
 
 void kb_put_disk(void *disk)

@@ -66,8 +66,8 @@ ctest --test-dir .artifacts/build
 ```
 ## Roadmap
 
-1. NVMe — single .ko, PCI + DMA + IRQ shim foundation
-2. USB (xHCI) — multi .ko loading, subsystem support
+1. NVMe — complete
+2. USB (xHCI) — complete v1: HID + Mass Storage(BOT/SCSI/block I/O)、multi-device smoke
 3. Network (e1000e / r8169) — reuse PCI + DMA shim
 4. SATA (AHCI) — storage shim shared with NVMe
 5. NVIDIA GPU — the final boss
