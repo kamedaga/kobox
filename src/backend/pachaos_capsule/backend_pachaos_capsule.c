@@ -30,6 +30,9 @@ enum {
     PACHA_SYSCALL_CAPSULE_DERIVE_DMA_MAPPING_FROM_BUFFER = 0x74,
     PACHA_SYSCALL_CAPSULE_DERIVE_IRQ = 0x75,
     PACHA_SYSCALL_CAPSULE_CLOSE = 0x78,
+    PACHA_SYSCALL_CAPSULE_PCI_CONFIG_READ = 0x79,
+    PACHA_SYSCALL_CAPSULE_PCI_CONFIG_WRITE = 0x7a,
+    PACHA_SYSCALL_CAPSULE_PCI_BAR_INFO = 0x7b,
 };
 
 enum {
@@ -45,7 +48,23 @@ enum {
     PACHA_DMA_FROM_DEVICE = 2,
     PACHA_DMA_BIDIRECTIONAL = 3,
     PACHA_IRQ_AUTO = 0,
-    PACHA_IORESOURCE_MEM = 0x00000200,
+    PACHA_BAR_FLAG_IO = 0x01,
+    PACHA_BAR_FLAG_MEM = 0x02,
+    PACHA_BAR_FLAG_PREFETCHABLE = 0x04,
+    PACHA_BAR_FLAG_64BIT = 0x08,
+    PACHA_MMIO_MAP_FLAG_REPLACE_EXISTING = 0x01,
+    KB_LINUX_IORESOURCE_IO = 0x00000100,
+    KB_LINUX_IORESOURCE_MEM = 0x00000200,
+    KB_LINUX_IORESOURCE_PREFETCH = 0x00002000,
+    KB_LINUX_IORESOURCE_MEM_64 = 0x00100000,
+};
+
+enum {
+    PACHA_BAR_INFO_START = 0,
+    PACHA_BAR_INFO_END = 1,
+    PACHA_BAR_INFO_SIZE = 2,
+    PACHA_BAR_INFO_FLAGS = 3,
+    PACHA_BAR_INFO_WORDS = 4,
 };
 
 enum {
@@ -64,8 +83,9 @@ enum {
 typedef struct kb_pachaos_capsule_backend kb_pachaos_capsule_backend_t;
 
 typedef struct kb_pachaos_mmio_mapping {
-    void *addr;
-    uint64_t size;
+    void *map_addr;
+    void *region_addr;
+    uint64_t map_size;
     uint64_t capsule;
     unsigned bar_index;
 } kb_pachaos_mmio_mapping_t;
@@ -86,6 +106,7 @@ struct kb_device {
     uint64_t rights;
     kb_pci_id_t pci_id;
     kb_pci_location_t location;
+    uint64_t bar_starts[KB_PACHAOS_PCI_BAR_COUNT];
     uint64_t bar_sizes[KB_PACHAOS_PCI_BAR_COUNT];
     uint64_t bar_flags[KB_PACHAOS_PCI_BAR_COUNT];
 };
@@ -261,10 +282,12 @@ static void configure_bar_info_from_env(struct kb_device *device)
 {
     for (unsigned i = 0; i < KB_PACHAOS_PCI_BAR_COUNT; i++) {
         char name[64];
+        snprintf(name, sizeof(name), "KOBOX_PACHAOS_BAR%u_START", i);
+        device->bar_starts[i] = parse_u64_env(name, 0);
         snprintf(name, sizeof(name), "KOBOX_PACHAOS_BAR%u_SIZE", i);
         device->bar_sizes[i] = parse_u64_env(name, 0);
         snprintf(name, sizeof(name), "KOBOX_PACHAOS_BAR%u_FLAGS", i);
-        device->bar_flags[i] = parse_u64_env(name, device->bar_sizes[i] != 0 ? PACHA_IORESOURCE_MEM : 0);
+        device->bar_flags[i] = parse_u64_env(name, device->bar_sizes[i] != 0 ? KB_LINUX_IORESOURCE_MEM : 0);
     }
 }
 
@@ -347,9 +370,9 @@ static void pacha_destroy(kb_backend_t *backend)
     }
     for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
         kb_pachaos_mmio_mapping_t *mapping = &pacha->mmio_mappings[i];
-        if (mapping->size != 0) {
+        if (mapping->map_size != 0) {
             close_capsule(mapping->capsule);
-            munmap(mapping->addr, (size_t)mapping->size);
+            munmap(mapping->map_addr, (size_t)mapping->map_size);
         }
     }
     for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
@@ -404,13 +427,48 @@ static void write_le16(unsigned char *dst, uint16_t value)
     dst[1] = (unsigned char)((value >> 8) & 0xffu);
 }
 
-static kb_status_t pacha_pci_config_read(kb_device_t *device, uint16_t offset, void *dst, size_t len)
+static uint16_t read_le16(const unsigned char *src)
+{
+    return (uint16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
+}
+
+static uint64_t pacha_bar_flags_to_linux(uint64_t flags)
+{
+    uint64_t out = 0;
+    if ((flags & PACHA_BAR_FLAG_IO) != 0) {
+        out |= KB_LINUX_IORESOURCE_IO;
+    }
+    if ((flags & PACHA_BAR_FLAG_MEM) != 0) {
+        out |= KB_LINUX_IORESOURCE_MEM;
+    }
+    if ((flags & PACHA_BAR_FLAG_PREFETCHABLE) != 0) {
+        out |= KB_LINUX_IORESOURCE_PREFETCH;
+    }
+    if ((flags & PACHA_BAR_FLAG_64BIT) != 0) {
+        out |= KB_LINUX_IORESOURCE_MEM_64;
+    }
+    return out;
+}
+
+static kb_status_t capsule_pci_config_read(kb_device_t *device, uint16_t offset, void *dst, size_t len)
 {
     if (device == NULL || dst == NULL || len == 0 || offset >= KB_PACHAOS_PCI_CONFIG_SIZE ||
         len > KB_PACHAOS_PCI_CONFIG_SIZE || offset + len > KB_PACHAOS_PCI_CONFIG_SIZE) {
         return KB_ERR_INVALID;
     }
 
+    long result = pacha_syscall5(
+        PACHA_SYSCALL_CAPSULE_PCI_CONFIG_READ,
+        device->device_capsule,
+        offset,
+        (uint64_t)(uintptr_t)dst,
+        len,
+        0);
+    return pacha_status_from_return(result);
+}
+
+static kb_status_t synthetic_pci_config_read(kb_device_t *device, uint16_t offset, void *dst, size_t len)
+{
     unsigned char config[KB_PACHAOS_PCI_CONFIG_SIZE];
     memset(config, 0, sizeof(config));
     write_le16(&config[0x00], device->pci_id.vendor_id);
@@ -425,27 +483,115 @@ static kb_status_t pacha_pci_config_read(kb_device_t *device, uint16_t offset, v
     return KB_OK;
 }
 
+static void configure_pci_id_from_config(struct kb_device *device)
+{
+    unsigned char config[64];
+    if (capsule_pci_config_read(device, 0, config, sizeof(config)) != KB_OK) {
+        return;
+    }
+    device->pci_id.vendor_id = read_le16(&config[0x00]);
+    device->pci_id.device_id = read_le16(&config[0x02]);
+    device->pci_id.revision = config[0x08];
+    device->pci_id.prog_if = config[0x09];
+    device->pci_id.subclass = config[0x0a];
+    device->pci_id.class_code = config[0x0b];
+    device->pci_id.subsystem_vendor_id = read_le16(&config[0x2c]);
+    device->pci_id.subsystem_device_id = read_le16(&config[0x2e]);
+}
+
+static kb_status_t pacha_pci_config_read(kb_device_t *device, uint16_t offset, void *dst, size_t len)
+{
+    kb_status_t status = capsule_pci_config_read(device, offset, dst, len);
+    if (status == KB_OK) {
+        return KB_OK;
+    }
+    if (status != KB_ERR_UNSUPPORTED) {
+        return status;
+    }
+    return synthetic_pci_config_read(device, offset, dst, len);
+}
+
 static kb_status_t pacha_pci_config_write(kb_device_t *device, uint16_t offset, const void *src, size_t len)
 {
-    (void)device;
-    (void)src;
+    if (device == NULL || src == NULL) {
+        return KB_ERR_INVALID;
+    }
     if (len != 0 && (offset >= KB_PACHAOS_PCI_CONFIG_SIZE || len > KB_PACHAOS_PCI_CONFIG_SIZE ||
         offset + len > KB_PACHAOS_PCI_CONFIG_SIZE)) {
         return KB_ERR_INVALID;
     }
+    long result = pacha_syscall5(
+        PACHA_SYSCALL_CAPSULE_PCI_CONFIG_WRITE,
+        device->device_capsule,
+        offset,
+        (uint64_t)(uintptr_t)src,
+        len,
+        0);
+    kb_status_t status = pacha_status_from_return(result);
+    if (status == KB_OK || status != KB_ERR_UNSUPPORTED) {
+        return status;
+    }
+    return KB_OK;
+}
+
+static kb_status_t capsule_pci_bar_info(kb_device_t *device, unsigned bar_index, kb_pci_bar_info_t *out_info)
+{
+    if (device == NULL || out_info == NULL) {
+        return KB_ERR_INVALID;
+    }
+    if (bar_index >= KB_PACHAOS_PCI_BAR_COUNT) {
+        return KB_ERR_INVALID;
+    }
+
+    uint64_t words[PACHA_BAR_INFO_WORDS];
+    long result = pacha_syscall5(
+        PACHA_SYSCALL_CAPSULE_PCI_BAR_INFO,
+        device->device_capsule,
+        bar_index,
+        (uint64_t)(uintptr_t)words,
+        PACHA_BAR_INFO_WORDS,
+        0);
+    if (result != PACHA_BAR_INFO_WORDS) {
+        kb_status_t status = pacha_status_from_return(result);
+        return status == KB_ERR_INVALID ? KB_ERR_NOT_FOUND : status;
+    }
+
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->start = words[PACHA_BAR_INFO_START];
+    out_info->end = words[PACHA_BAR_INFO_END];
+    out_info->size = words[PACHA_BAR_INFO_SIZE];
+    out_info->flags = pacha_bar_flags_to_linux(words[PACHA_BAR_INFO_FLAGS]);
+    if (out_info->flags == 0 && out_info->size != 0) {
+        out_info->flags = KB_LINUX_IORESOURCE_MEM;
+    }
+    out_info->present = out_info->size != 0;
+    if (!out_info->present) {
+        return KB_ERR_NOT_FOUND;
+    }
+
+    device->bar_starts[bar_index] = out_info->start;
+    device->bar_sizes[bar_index] = out_info->size;
+    device->bar_flags[bar_index] = out_info->flags;
     return KB_OK;
 }
 
 static kb_status_t pacha_pci_bar_info(kb_device_t *device, unsigned bar_index, kb_pci_bar_info_t *out_info)
 {
+    kb_status_t status = capsule_pci_bar_info(device, bar_index, out_info);
+    if (status == KB_OK) {
+        return KB_OK;
+    }
+    if (status != KB_ERR_UNSUPPORTED) {
+        return status;
+    }
     if (device == NULL || out_info == NULL) {
         return KB_ERR_INVALID;
     }
     if (bar_index >= KB_PACHAOS_PCI_BAR_COUNT || device->bar_sizes[bar_index] == 0) {
         return KB_ERR_NOT_FOUND;
     }
-    out_info->start = 0;
-    out_info->end = device->bar_sizes[bar_index] - 1u;
+    out_info->start = device->bar_starts[bar_index];
+    out_info->end = device->bar_starts[bar_index] + device->bar_sizes[bar_index] - 1u;
     out_info->size = device->bar_sizes[bar_index];
     out_info->flags = device->bar_flags[bar_index];
     out_info->present = 1;
@@ -454,15 +600,17 @@ static kb_status_t pacha_pci_bar_info(kb_device_t *device, unsigned bar_index, k
 
 static kb_status_t remember_mmio_mapping(
     kb_pachaos_capsule_backend_t *backend,
-    void *addr,
-    uint64_t size,
+    void *map_addr,
+    void *region_addr,
+    uint64_t map_size,
     uint64_t capsule,
     unsigned bar_index)
 {
     for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
-        if (backend->mmio_mappings[i].size == 0) {
-            backend->mmio_mappings[i].addr = addr;
-            backend->mmio_mappings[i].size = size;
+        if (backend->mmio_mappings[i].map_size == 0) {
+            backend->mmio_mappings[i].map_addr = map_addr;
+            backend->mmio_mappings[i].region_addr = region_addr;
+            backend->mmio_mappings[i].map_size = map_size;
             backend->mmio_mappings[i].capsule = capsule;
             backend->mmio_mappings[i].bar_index = bar_index;
             return KB_OK;
@@ -474,7 +622,7 @@ static kb_status_t remember_mmio_mapping(
 static kb_pachaos_mmio_mapping_t *find_mmio_mapping(kb_pachaos_capsule_backend_t *backend, void *addr)
 {
     for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
-        if (backend->mmio_mappings[i].size != 0 && backend->mmio_mappings[i].addr == addr) {
+        if (backend->mmio_mappings[i].map_size != 0 && backend->mmio_mappings[i].region_addr == addr) {
             return &backend->mmio_mappings[i];
         }
     }
@@ -486,41 +634,51 @@ static kb_status_t pacha_map_bar(kb_device_t *device, unsigned bar_index, kb_mmi
     if (device == NULL || out_region == NULL || bar_index >= KB_PACHAOS_PCI_BAR_COUNT) {
         return KB_ERR_INVALID;
     }
-    uint64_t size = device->bar_sizes[bar_index];
-    if (size == 0) {
-        size = page_size_u64();
+    kb_pci_bar_info_t info;
+    kb_status_t info_status = pacha_pci_bar_info(device, bar_index, &info);
+    if (info_status != KB_OK) {
+        return info_status;
     }
-    size = align_up_u64(size, page_size_u64());
-    if (size > (uint64_t)SIZE_MAX) {
+    if ((info.flags & KB_LINUX_IORESOURCE_MEM) == 0 || info.size == 0) {
+        return KB_ERR_INVALID;
+    }
+    uint64_t page_size = page_size_u64();
+    uint64_t page_offset = info.start & (page_size - 1u);
+    if (info.size > UINT64_MAX - page_offset) {
+        return KB_ERR_INVALID;
+    }
+    uint64_t map_size = align_up_u64(page_offset + info.size, page_size);
+    if (map_size == 0 || map_size > (uint64_t)SIZE_MAX) {
         return KB_ERR_INVALID;
     }
 
-    void *addr = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (addr == MAP_FAILED) {
+    void *map_addr = mmap(NULL, (size_t)map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map_addr == MAP_FAILED) {
         return KB_ERR_NOMEM;
     }
     long child = pacha_syscall5(
         PACHA_SYSCALL_CAPSULE_DERIVE_MMIO,
         device->device_capsule,
         bar_index,
-        (uint64_t)(uintptr_t)addr,
-        size,
-        0);
+        (uint64_t)(uintptr_t)map_addr,
+        map_size,
+        PACHA_MMIO_MAP_FLAG_REPLACE_EXISTING);
     if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_MMIO)) {
-        munmap(addr, (size_t)size);
+        munmap(map_addr, (size_t)map_size);
         return pacha_status_from_return(child);
     }
 
-    kb_status_t status = remember_mmio_mapping(device->backend, addr, size, (uint64_t)child, bar_index);
+    void *region_addr = (void *)((unsigned char *)map_addr + page_offset);
+    kb_status_t status = remember_mmio_mapping(device->backend, map_addr, region_addr, map_size, (uint64_t)child, bar_index);
     if (status != KB_OK) {
         close_capsule((uint64_t)child);
-        munmap(addr, (size_t)size);
+        munmap(map_addr, (size_t)map_size);
         return status;
     }
-    out_region->addr = addr;
-    out_region->size = size;
+    out_region->addr = region_addr;
+    out_region->size = info.size;
     out_region->backend_phys = (uint64_t)child;
-    out_region->flags = (uint32_t)device->bar_flags[bar_index];
+    out_region->flags = (uint32_t)info.flags;
     return KB_OK;
 }
 
@@ -532,7 +690,7 @@ static void pacha_unmap_bar(kb_device_t *device, kb_mmio_region_t *region)
     kb_pachaos_mmio_mapping_t *mapping = find_mmio_mapping(device->backend, region->addr);
     if (mapping != NULL) {
         close_capsule(mapping->capsule);
-        munmap(mapping->addr, (size_t)mapping->size);
+        munmap(mapping->map_addr, (size_t)mapping->map_size);
         memset(mapping, 0, sizeof(*mapping));
     }
     memset(region, 0, sizeof(*region));
@@ -790,6 +948,7 @@ kb_status_t kb_pachaos_capsule_create(uint64_t device_capsule, kb_backend_t **ou
     backend->device.device_id = snapshot[PACHA_SNAPSHOT_DEVICE];
     backend->device.rights = snapshot[PACHA_SNAPSHOT_RIGHTS];
     configure_location_from_device_id(&backend->device);
+    configure_pci_id_from_config(&backend->device);
     configure_pci_id_from_env(&backend->device);
     configure_bar_info_from_env(&backend->device);
     *out_backend = &backend->base;
