@@ -1298,6 +1298,52 @@ void kb_usb_kill_urb(void *urb)
     kb_usb_subsystem_urb_kill(NULL, urb);
 }
 
+int kb_usb_control_msg_trace(
+    void *dev,
+    unsigned int pipe,
+    uint8_t request,
+    uint8_t requesttype,
+    uint16_t value,
+    uint16_t index,
+    void *data,
+    uint16_t size,
+    int timeout)
+{
+    int (*real_control_msg)(
+        void *,
+        unsigned int,
+        uint8_t,
+        uint8_t,
+        uint16_t,
+        uint16_t,
+        void *,
+        uint16_t,
+        int) =
+        (int (*)(void *, unsigned int, uint8_t, uint8_t, uint16_t, uint16_t, void *, uint16_t, int))
+            kb_module_lookup_exported_symbol("usb_control_msg");
+    const int trace = trace_usb_hub_enabled();
+    if (trace) {
+        fprintf(stderr,
+            "kobox usb: control_msg dev=%p pipe=0x%x req=0x%02x type=0x%02x value=0x%04x index=0x%04x data=%p size=%u timeout=%d\n",
+            dev,
+            pipe,
+            (unsigned)request,
+            (unsigned)requesttype,
+            (unsigned)value,
+            (unsigned)index,
+            data,
+            (unsigned)size,
+            timeout);
+    }
+    int result = real_control_msg != NULL ?
+        real_control_msg(dev, pipe, request, requesttype, value, index, data, size, timeout) :
+        -19;
+    if (trace) {
+        fprintf(stderr, "kobox usb: control_msg result=%d\n", result);
+    }
+    return result;
+}
+
 void kb_xhci_init_driver(void *driver, const void *overrides)
 {
     (void)driver;

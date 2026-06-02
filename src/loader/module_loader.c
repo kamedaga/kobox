@@ -2791,6 +2791,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"usb_submit_urb", (void *)(uintptr_t)&kb_usb_submit_urb},
     {"usb_unlink_urb", (void *)(uintptr_t)&kb_usb_unlink_urb},
     {"usb_wakeup_notification", (void *)(uintptr_t)&kb_usb_wakeup_notification},
+    {"kobox_usb_control_msg_trace", (void *)(uintptr_t)&kb_usb_control_msg_trace},
     {"wait_for_completion_killable_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"wait_for_completion_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"yield", (void *)(uintptr_t)&kb_noop},
@@ -3736,6 +3737,9 @@ static void *lookup_internal_symbol_override(kb_module_t *module, const char *na
         strcmp(name, "usb_disable_usb2_hardware_lpm") == 0)
     {
         return lookup_module_shim_symbol(module, "crc32_le");
+    }
+    if (strcmp(name, "usb_control_msg") == 0) {
+        return lookup_module_shim_symbol(module, "kobox_usb_control_msg_trace");
     }
     return 0;
 }

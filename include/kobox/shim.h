@@ -373,6 +373,16 @@ int kb_usb_find_common_endpoints(void *altsetting, void **bulk_in, void **bulk_o
 int kb_usb_submit_urb(void *urb, unsigned int mem_flags);
 int kb_usb_unlink_urb(void *urb);
 void kb_usb_kill_urb(void *urb);
+int kb_usb_control_msg_trace(
+    void *dev,
+    unsigned int pipe,
+    uint8_t request,
+    uint8_t requesttype,
+    uint16_t value,
+    uint16_t index,
+    void *data,
+    uint16_t size,
+    int timeout);
 void kb_xhci_init_driver(void *driver, const void *overrides);
 int kb_xhci_gen_setup(void *hcd, void *xhci, const void *quirks);
 int kb_xhci_run(void *hcd);
