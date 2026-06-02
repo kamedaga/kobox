@@ -89,6 +89,12 @@ static int trace_usb_hub_enabled(void)
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
+static int trace_usb_control_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_USB_CONTROL");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
 static int usb_event_injection_enabled(void)
 {
     const char *value = getenv("KOBOX_ENABLE_USB_EVENT_INJECT");
@@ -1321,7 +1327,7 @@ int kb_usb_control_msg_trace(
         int) =
         (int (*)(void *, unsigned int, uint8_t, uint8_t, uint16_t, uint16_t, void *, uint16_t, int))
             kb_module_lookup_exported_symbol("usb_control_msg");
-    const int trace = trace_usb_hub_enabled();
+    const int trace = trace_usb_control_enabled();
     if (trace) {
         fprintf(stderr,
             "kobox usb: control_msg dev=%p pipe=0x%x req=0x%02x type=0x%02x value=0x%04x index=0x%04x data=%p size=%u timeout=%d\n",
