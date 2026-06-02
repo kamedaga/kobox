@@ -231,7 +231,7 @@ int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (xhci_pending) {
+        if (status == KB_OK && xhci_pending) {
             poll_root_hub_for_irq(entry);
         }
         entry->handler = handler;
@@ -295,7 +295,7 @@ int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (xhci_pending) {
+        if (status == KB_OK && xhci_pending) {
             poll_root_hub_for_irq(entry);
         }
         kb_run_deferred_work();
@@ -325,7 +325,7 @@ static int handle_any_irq(uint64_t timeout_ns, int run_work)
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (xhci_pending) {
+        if (status == KB_OK && xhci_pending) {
             poll_root_hub_for_irq(entry);
         }
         if (trace_irq_enabled()) {
