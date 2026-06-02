@@ -674,7 +674,7 @@ static int kick_root_hub_if_changed(void *hcd)
         return 0;
     }
 
-    int kicked = 0;
+    int handled = inject_events && hub != NULL && hub_ready;
     if (inject_events && hub != NULL && hub_ready && event.bits != 0) {
         unsigned long existing_bits = 0;
         memcpy(
@@ -720,9 +720,8 @@ static int kick_root_hub_if_changed(void *hcd)
     }
     if (inject_events && hub != NULL && hub_ready && event.new_bits != 0) {
         kick_hub_wq(root_hub);
-        kicked = 1;
     }
-    return kicked;
+    return handled;
 }
 
 int kb_usb_hcd_irq(int irq, void *hcd)
