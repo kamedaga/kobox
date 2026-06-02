@@ -16,9 +16,6 @@
 
 enum {
     KB_PACHAOS_PCI_BAR_COUNT = 6,
-    KB_PACHAOS_DMA_MAPPING_MAX = 128,
-    KB_PACHAOS_MMIO_MAPPING_MAX = 32,
-    KB_PACHAOS_IRQ_MAX = 32,
     KB_PACHAOS_PCI_CONFIG_SIZE = 256,
     KB_PACHAOS_MMIO_MAP_ATTEMPTS = 8,
 };
@@ -162,6 +159,7 @@ typedef struct kb_pachaos_mmio_mapping {
     uint64_t map_size;
     uint64_t capsule;
     unsigned bar_index;
+    struct kb_pachaos_mmio_mapping *next;
 } kb_pachaos_mmio_mapping_t;
 
 typedef struct kb_pachaos_dma_mapping {
@@ -175,6 +173,7 @@ typedef struct kb_pachaos_dma_mapping {
     kb_dma_dir_t direction;
     int owns_cpu_addr;
     int owns_mapped_cpu_addr;
+    struct kb_pachaos_dma_mapping *next;
 } kb_pachaos_dma_mapping_t;
 
 struct kb_device {
@@ -190,20 +189,22 @@ struct kb_device {
 };
 
 struct kb_irq {
+    kb_pachaos_capsule_backend_t *backend;
     uint64_t capsule;
     uint64_t last_interrupt_count;
     unsigned vector;
     kb_irq_handler_t handler;
     void *ctx;
+    struct kb_irq *next;
 };
 
 struct kb_pachaos_capsule_backend {
     kb_backend_t base;
     struct kb_device device;
     uint64_t next_iova;
-    kb_pachaos_mmio_mapping_t mmio_mappings[KB_PACHAOS_MMIO_MAPPING_MAX];
-    kb_pachaos_dma_mapping_t dma_mappings[KB_PACHAOS_DMA_MAPPING_MAX];
-    struct kb_irq irqs[KB_PACHAOS_IRQ_MAX];
+    kb_pachaos_mmio_mapping_t *mmio_mappings;
+    kb_pachaos_dma_mapping_t *dma_mappings;
+    kb_irq_t *irqs;
 };
 
 static uint64_t pacha_now_ns(void);
@@ -212,6 +213,7 @@ static kb_status_t pacha_pci_config_write(kb_device_t *device, uint16_t offset, 
 static int pacha_pci_find_capability(kb_device_t *device, uint8_t cap_id, uint8_t *out_offset);
 static kb_status_t pacha_map_bar(kb_device_t *device, unsigned bar_index, kb_mmio_region_t *out_region);
 static void pacha_unmap_bar(kb_device_t *device, kb_mmio_region_t *region);
+static void close_capsule(uint64_t capsule);
 static const kb_backend_ops_t pacha_ops;
 
 static const uint64_t pacha_native_syscall_tag = 0x50414348ca000000ull;
@@ -523,24 +525,48 @@ static kb_status_t remember_dma_mapping(
     if (backend == NULL || mapping == NULL || mapping->size == 0 || mapping->iova == 0) {
         return KB_ERR_INVALID;
     }
-    for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
-        if (backend->dma_mappings[i].size == 0) {
-            backend->dma_mappings[i] = *mapping;
-            return KB_OK;
-        }
+    kb_pachaos_dma_mapping_t *entry = calloc(1, sizeof(*entry));
+    if (entry == NULL) {
+        return KB_ERR_NOMEM;
     }
-    return KB_ERR_NOMEM;
+    *entry = *mapping;
+    entry->next = backend->dma_mappings;
+    backend->dma_mappings = entry;
+    return KB_OK;
 }
 
-static kb_pachaos_dma_mapping_t *find_dma_mapping(kb_pachaos_capsule_backend_t *backend, uint64_t iova)
+static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_pachaos_capsule_backend_t *backend, uint64_t iova)
 {
-    for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
-        kb_pachaos_dma_mapping_t *mapping = &backend->dma_mappings[i];
+    kb_pachaos_dma_mapping_t **cursor = backend != NULL ? &backend->dma_mappings : NULL;
+    while (cursor != NULL && *cursor != NULL) {
+        kb_pachaos_dma_mapping_t *mapping = *cursor;
         if (mapping->size != 0 && mapping->iova == iova) {
+            *cursor = mapping->next;
+            mapping->next = NULL;
             return mapping;
         }
+        cursor = &mapping->next;
     }
     return NULL;
+}
+
+static void release_dma_mapping(kb_pachaos_dma_mapping_t *mapping, int copy_back)
+{
+    if (mapping == NULL) {
+        return;
+    }
+    close_capsule(mapping->mapping_capsule);
+    close_capsule(mapping->buffer_capsule);
+    if (mapping->owns_mapped_cpu_addr && copy_back) {
+        memcpy(mapping->cpu_addr, mapping->mapped_cpu_addr, (size_t)mapping->size);
+    }
+    if (mapping->owns_mapped_cpu_addr) {
+        free(mapping->mapped_cpu_addr);
+    }
+    if (mapping->owns_cpu_addr) {
+        free(mapping->cpu_addr);
+    }
+    free(mapping);
 }
 
 static void close_capsule(uint64_t capsule)
@@ -558,8 +584,8 @@ static int pacha_is_backend(kb_backend_t *backend)
 static size_t count_pacha_residual_irqs(const kb_pachaos_capsule_backend_t *backend)
 {
     size_t count = 0;
-    for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
-        if (backend->irqs[i].capsule != 0) {
+    for (const kb_irq_t *irq = backend->irqs; irq != NULL; irq = irq->next) {
+        if (irq->capsule != 0) {
             count++;
         }
     }
@@ -569,8 +595,8 @@ static size_t count_pacha_residual_irqs(const kb_pachaos_capsule_backend_t *back
 static size_t count_pacha_residual_dma_mappings(const kb_pachaos_capsule_backend_t *backend)
 {
     size_t count = 0;
-    for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
-        if (backend->dma_mappings[i].size != 0) {
+    for (const kb_pachaos_dma_mapping_t *mapping = backend->dma_mappings; mapping != NULL; mapping = mapping->next) {
+        if (mapping->size != 0) {
             count++;
         }
     }
@@ -580,8 +606,8 @@ static size_t count_pacha_residual_dma_mappings(const kb_pachaos_capsule_backend
 static size_t count_pacha_residual_mmio_mappings(const kb_pachaos_capsule_backend_t *backend)
 {
     size_t count = 0;
-    for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
-        if (backend->mmio_mappings[i].map_size != 0) {
+    for (const kb_pachaos_mmio_mapping_t *mapping = backend->mmio_mappings; mapping != NULL; mapping = mapping->next) {
+        if (mapping->map_size != 0) {
             count++;
         }
     }
@@ -620,27 +646,27 @@ size_t kb_pachaos_capsule_report_residuals(kb_backend_t *backend, FILE *out, con
     print_pacha_residual_summary(out, label, irqs, dma_mappings, mmio_mappings);
 
     if (out != NULL) {
-        for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
-            const kb_irq_t *irq = &pacha->irqs[i];
+        size_t i = 0;
+        for (const kb_irq_t *irq = pacha->irqs; irq != NULL; irq = irq->next, i++) {
             if (irq->capsule == 0) {
                 continue;
             }
             fprintf(
                 out,
-                "kobox-pachaos-cleanup: residual irq slot=%zu capsule=0x%016" PRIx64 " vector=%u last_count=%" PRIu64 "\n",
+                "kobox-pachaos-cleanup: residual irq index=%zu capsule=0x%016" PRIx64 " vector=%u last_count=%" PRIu64 "\n",
                 i,
                 irq->capsule,
                 irq->vector,
                 irq->last_interrupt_count);
         }
-        for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
-            const kb_pachaos_dma_mapping_t *mapping = &pacha->dma_mappings[i];
+        i = 0;
+        for (const kb_pachaos_dma_mapping_t *mapping = pacha->dma_mappings; mapping != NULL; mapping = mapping->next, i++) {
             if (mapping->size == 0) {
                 continue;
             }
             fprintf(
                 out,
-                "kobox-pachaos-cleanup: residual dma slot=%zu iova=0x%016" PRIx64 " size=%" PRIu64 " mapped_size=%" PRIu64 " buffer=0x%016" PRIx64 " mapping=0x%016" PRIx64 "\n",
+                "kobox-pachaos-cleanup: residual dma index=%zu iova=0x%016" PRIx64 " size=%" PRIu64 " mapped_size=%" PRIu64 " buffer=0x%016" PRIx64 " mapping=0x%016" PRIx64 "\n",
                 i,
                 mapping->iova,
                 mapping->size,
@@ -648,14 +674,14 @@ size_t kb_pachaos_capsule_report_residuals(kb_backend_t *backend, FILE *out, con
                 mapping->buffer_capsule,
                 mapping->mapping_capsule);
         }
-        for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
-            const kb_pachaos_mmio_mapping_t *mapping = &pacha->mmio_mappings[i];
+        i = 0;
+        for (const kb_pachaos_mmio_mapping_t *mapping = pacha->mmio_mappings; mapping != NULL; mapping = mapping->next, i++) {
             if (mapping->map_size == 0) {
                 continue;
             }
             fprintf(
                 out,
-                "kobox-pachaos-cleanup: residual mmio slot=%zu bar=%u capsule=0x%016" PRIx64 " addr=%p map=%p size=%" PRIu64 "\n",
+                "kobox-pachaos-cleanup: residual mmio index=%zu bar=%u capsule=0x%016" PRIx64 " addr=%p map=%p size=%" PRIu64 "\n",
                 i,
                 mapping->bar_index,
                 mapping->capsule,
@@ -747,31 +773,24 @@ static void pacha_destroy(kb_backend_t *backend)
     kb_pachaos_capsule_backend_t *pacha = pacha_from_backend(backend);
     pacha_disable_pci_interrupts(&pacha->device);
     pacha_quiesce_nvme_controller(&pacha->device);
-    for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
-        close_capsule(pacha->irqs[i].capsule);
-        memset(&pacha->irqs[i], 0, sizeof(pacha->irqs[i]));
+    while (pacha->irqs != NULL) {
+        kb_irq_t *irq = pacha->irqs;
+        pacha->irqs = irq->next;
+        close_capsule(irq->capsule);
+        free(irq);
     }
-    for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
-        kb_pachaos_dma_mapping_t *mapping = &pacha->dma_mappings[i];
-        if (mapping->size != 0) {
-            close_capsule(mapping->mapping_capsule);
-            close_capsule(mapping->buffer_capsule);
-            if (mapping->owns_mapped_cpu_addr) {
-                free(mapping->mapped_cpu_addr);
-            }
-            if (mapping->owns_cpu_addr) {
-                free(mapping->cpu_addr);
-            }
-            memset(mapping, 0, sizeof(*mapping));
-        }
+    while (pacha->dma_mappings != NULL) {
+        kb_pachaos_dma_mapping_t *mapping = pacha->dma_mappings;
+        pacha->dma_mappings = mapping->next;
+        mapping->next = NULL;
+        release_dma_mapping(mapping, 0);
     }
-    for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
-        kb_pachaos_mmio_mapping_t *mapping = &pacha->mmio_mappings[i];
-        if (mapping->map_size != 0) {
-            close_capsule(mapping->capsule);
-            munmap(mapping->map_addr, (size_t)mapping->map_size);
-            memset(mapping, 0, sizeof(*mapping));
-        }
+    while (pacha->mmio_mappings != NULL) {
+        kb_pachaos_mmio_mapping_t *mapping = pacha->mmio_mappings;
+        pacha->mmio_mappings = mapping->next;
+        close_capsule(mapping->capsule);
+        munmap(mapping->map_addr, (size_t)mapping->map_size);
+        free(mapping);
     }
     free(pacha);
 }
@@ -1034,25 +1053,34 @@ static kb_status_t remember_mmio_mapping(
     uint64_t capsule,
     unsigned bar_index)
 {
-    for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
-        if (backend->mmio_mappings[i].map_size == 0) {
-            backend->mmio_mappings[i].map_addr = map_addr;
-            backend->mmio_mappings[i].region_addr = region_addr;
-            backend->mmio_mappings[i].map_size = map_size;
-            backend->mmio_mappings[i].capsule = capsule;
-            backend->mmio_mappings[i].bar_index = bar_index;
-            return KB_OK;
-        }
+    if (backend == NULL || map_addr == NULL || region_addr == NULL || map_size == 0 || capsule == 0) {
+        return KB_ERR_INVALID;
     }
-    return KB_ERR_NOMEM;
+    kb_pachaos_mmio_mapping_t *mapping = calloc(1, sizeof(*mapping));
+    if (mapping == NULL) {
+        return KB_ERR_NOMEM;
+    }
+    mapping->map_addr = map_addr;
+    mapping->region_addr = region_addr;
+    mapping->map_size = map_size;
+    mapping->capsule = capsule;
+    mapping->bar_index = bar_index;
+    mapping->next = backend->mmio_mappings;
+    backend->mmio_mappings = mapping;
+    return KB_OK;
 }
 
-static kb_pachaos_mmio_mapping_t *find_mmio_mapping(kb_pachaos_capsule_backend_t *backend, void *addr)
+static kb_pachaos_mmio_mapping_t *take_mmio_mapping(kb_pachaos_capsule_backend_t *backend, void *addr)
 {
-    for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
-        if (backend->mmio_mappings[i].map_size != 0 && backend->mmio_mappings[i].region_addr == addr) {
-            return &backend->mmio_mappings[i];
+    kb_pachaos_mmio_mapping_t **cursor = backend != NULL ? &backend->mmio_mappings : NULL;
+    while (cursor != NULL && *cursor != NULL) {
+        kb_pachaos_mmio_mapping_t *mapping = *cursor;
+        if (mapping->map_size != 0 && mapping->region_addr == addr) {
+            *cursor = mapping->next;
+            mapping->next = NULL;
+            return mapping;
         }
+        cursor = &mapping->next;
     }
     return NULL;
 }
@@ -1142,11 +1170,11 @@ static void pacha_unmap_bar(kb_device_t *device, kb_mmio_region_t *region)
     if (device == NULL || region == NULL) {
         return;
     }
-    kb_pachaos_mmio_mapping_t *mapping = find_mmio_mapping(device->backend, region->addr);
+    kb_pachaos_mmio_mapping_t *mapping = take_mmio_mapping(device->backend, region->addr);
     if (mapping != NULL) {
         close_capsule(mapping->capsule);
         munmap(mapping->map_addr, (size_t)mapping->map_size);
-        memset(mapping, 0, sizeof(*mapping));
+        free(mapping);
     }
     memset(region, 0, sizeof(*region));
 }
@@ -1299,17 +1327,9 @@ static void pacha_dma_free(kb_device_t *device, kb_dma_buffer_t *buffer)
     if (device == NULL || buffer == NULL) {
         return;
     }
-    kb_pachaos_dma_mapping_t *mapping = find_dma_mapping(device->backend, buffer->dma_addr);
+    kb_pachaos_dma_mapping_t *mapping = take_dma_mapping(device->backend, buffer->dma_addr);
     if (mapping != NULL) {
-        close_capsule(mapping->mapping_capsule);
-        close_capsule(mapping->buffer_capsule);
-        if (mapping->owns_mapped_cpu_addr) {
-            free(mapping->mapped_cpu_addr);
-        }
-        if (mapping->owns_cpu_addr) {
-            free(mapping->cpu_addr);
-        }
-        memset(mapping, 0, sizeof(*mapping));
+        release_dma_mapping(mapping, 0);
     }
     memset(buffer, 0, sizeof(*buffer));
 }
@@ -1411,18 +1431,11 @@ static void pacha_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t siz
     if (device == NULL) {
         return;
     }
-    kb_pachaos_dma_mapping_t *mapping = find_dma_mapping(device->backend, dma_addr);
+    kb_pachaos_dma_mapping_t *mapping = take_dma_mapping(device->backend, dma_addr);
     if (mapping != NULL) {
-        close_capsule(mapping->mapping_capsule);
         int copy_back = direction == KB_DMA_FROM_DEVICE || direction == KB_DMA_BIDIRECTIONAL ||
             mapping->direction == KB_DMA_FROM_DEVICE || mapping->direction == KB_DMA_BIDIRECTIONAL;
-        if (mapping->owns_mapped_cpu_addr && copy_back) {
-            memcpy(mapping->cpu_addr, mapping->mapped_cpu_addr, (size_t)mapping->size);
-        }
-        if (mapping->owns_mapped_cpu_addr) {
-            free(mapping->mapped_cpu_addr);
-        }
-        memset(mapping, 0, sizeof(*mapping));
+        release_dma_mapping(mapping, copy_back);
     }
 }
 
@@ -1491,54 +1504,75 @@ static kb_status_t pacha_irq_register(
         return KB_ERR_INVALID;
     }
     kb_pachaos_capsule_backend_t *backend = device->backend;
-    for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
-        if (backend->irqs[i].capsule == 0) {
-            uint64_t irq_kind = PACHA_IRQ_AUTO;
-            uint64_t irq_vector = 0;
-            pacha_decode_irq_vector(vector, &irq_kind, &irq_vector);
-            long child = pacha_syscall5(
-                PACHA_SYSCALL_CAPSULE_DERIVE_IRQ,
-                device->device_capsule,
-                irq_kind,
-                irq_vector,
-                0,
-                0);
-            if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_IRQ)) {
-                return pacha_status_from_return(child);
-            }
-            if (irq_kind == PACHA_IRQ_MSIX) {
-                kb_status_t config_status = pacha_configure_msix_entry(device, (unsigned)irq_vector);
-                if (config_status != KB_OK) {
-                    close_capsule((uint64_t)child);
-                    return config_status;
-                }
-            } else if (irq_kind == PACHA_IRQ_MSI) {
-                close_capsule((uint64_t)child);
-                return KB_ERR_UNSUPPORTED;
-            }
-            backend->irqs[i].capsule = (uint64_t)child;
-            backend->irqs[i].vector = vector;
-            backend->irqs[i].handler = handler;
-            backend->irqs[i].ctx = ctx;
-            uint64_t count = 0;
-            if (pacha_irq_poll_count((uint64_t)child, UINT64_MAX, &count) == KB_OK) {
-                backend->irqs[i].last_interrupt_count = count;
-            }
-            *out_irq = &backend->irqs[i];
-            return KB_OK;
-        }
+    kb_irq_t *irq = calloc(1, sizeof(*irq));
+    if (irq == NULL) {
+        return KB_ERR_NOMEM;
     }
-    return KB_ERR_NOMEM;
+
+    uint64_t irq_kind = PACHA_IRQ_AUTO;
+    uint64_t irq_vector = 0;
+    pacha_decode_irq_vector(vector, &irq_kind, &irq_vector);
+    long child = pacha_syscall5(
+        PACHA_SYSCALL_CAPSULE_DERIVE_IRQ,
+        device->device_capsule,
+        irq_kind,
+        irq_vector,
+        0,
+        0);
+    if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_IRQ)) {
+        free(irq);
+        return pacha_status_from_return(child);
+    }
+    if (irq_kind == PACHA_IRQ_MSIX) {
+        kb_status_t config_status = pacha_configure_msix_entry(device, (unsigned)irq_vector);
+        if (config_status != KB_OK) {
+            close_capsule((uint64_t)child);
+            free(irq);
+            return config_status;
+        }
+    } else if (irq_kind == PACHA_IRQ_MSI) {
+        close_capsule((uint64_t)child);
+        free(irq);
+        return KB_ERR_UNSUPPORTED;
+    }
+    irq->capsule = (uint64_t)child;
+    irq->backend = backend;
+    irq->vector = vector;
+    irq->handler = handler;
+    irq->ctx = ctx;
+    uint64_t count = 0;
+    if (pacha_irq_poll_count((uint64_t)child, UINT64_MAX, &count) == KB_OK) {
+        irq->last_interrupt_count = count;
+    }
+    irq->next = backend->irqs;
+    backend->irqs = irq;
+    *out_irq = irq;
+    return KB_OK;
 }
 
 static void pacha_irq_unregister(kb_device_t *device, kb_irq_t *irq)
 {
-    (void)device;
     if (irq == NULL) {
         return;
     }
+    kb_pachaos_capsule_backend_t *backend =
+        device != NULL && device->backend != NULL ? device->backend : irq->backend;
+    kb_irq_t **cursor = backend != NULL ? &backend->irqs : NULL;
+    int found = 0;
+    while (cursor != NULL && *cursor != NULL) {
+        if (*cursor == irq) {
+            *cursor = irq->next;
+            irq->next = NULL;
+            found = 1;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+    if (!found) {
+        return;
+    }
     close_capsule(irq->capsule);
-    memset(irq, 0, sizeof(*irq));
+    free(irq);
 }
 
 static kb_status_t pacha_irq_wait(kb_device_t *device, kb_irq_t *irq, uint64_t timeout_ns)
