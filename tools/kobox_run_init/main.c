@@ -176,6 +176,7 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
 
     for (unsigned long i = 0; i < drain_ms; i++) {
         kb_run_deferred_work();
+        (void)kb_usb_poll_root_hubs();
         (void)kb_handle_any_irq(1000000ull);
         if (start_ns != 0 && ops != NULL && ops->monotonic_ns != NULL) {
             uint64_t now_ns = ops->monotonic_ns(backend);
@@ -185,6 +186,7 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
         }
     }
     kb_run_deferred_work();
+    (void)kb_usb_poll_root_hubs();
     (void)kb_handle_any_irq(0);
     kb_shim_set_backend(NULL);
 }
