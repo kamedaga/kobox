@@ -222,16 +222,17 @@ static void cleanup_all_irqs_for_backend(kb_backend_t *backend)
     }
     kb_shim_set_backend(backend);
     kb_free_all_irqs();
+    kb_pci_release_all_mmio_mappings();
     kb_shim_set_backend(NULL);
 }
 
 static int destroy_backend_after_cleanup(kb_backend_t *backend)
 {
+    cleanup_all_irqs_for_backend(backend);
     size_t residuals = 0;
     if (backend != NULL) {
         residuals = kb_pachaos_capsule_report_residuals(backend, stderr, "pre-destroy");
     }
-    cleanup_all_irqs_for_backend(backend);
     kb_backend_destroy(backend);
     return residuals == 0 ? 0 : 11;
 }

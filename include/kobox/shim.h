@@ -112,6 +112,7 @@ void *kb_pci_get_class(unsigned int class, void *from);
 void *kb_pci_iomap(void *dev, int bar, unsigned long max);
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max);
 void kb_pci_iounmap(void *dev, void *addr);
+void kb_pci_release_all_mmio_mappings(void);
 void *kb_ioremap(uint64_t phys_addr, size_t size);
 void kb_iounmap(void *addr);
 uint8_t kb_ioread8(const void *addr);

@@ -1470,6 +1470,18 @@ void kb_pci_iounmap(void *dev, void *addr)
     release_mmio_mapping_record(take_mmio_mapping(addr));
 }
 
+void kb_pci_release_all_mmio_mappings(void)
+{
+    while (mmio_mappings != NULL) {
+        shim_mmio_mapping_t *mapping = mmio_mappings;
+        mmio_mappings = mapping->next;
+        mapping->next = NULL;
+        release_mmio_mapping_record(mapping);
+    }
+    mapped_bar0_addr = NULL;
+    mapped_bar0_size = 0;
+}
+
 void *kb_ioremap(uint64_t phys_addr, size_t size)
 {
     kb_backend_t *backend = kb_shim_current_backend();
