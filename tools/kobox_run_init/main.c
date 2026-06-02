@@ -167,6 +167,7 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
         return;
     }
 
+    const int trace_run = getenv("KOBOX_TRACE_RUN") != NULL;
     kb_shim_set_backend(backend);
     const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
     uint64_t start_ns = 0;
@@ -175,8 +176,17 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
     }
 
     for (unsigned long i = 0; i < drain_ms; i++) {
+        if (trace_run) {
+            fprintf(stderr, "kobox-run: drain loop=%lu run_work\n", i);
+        }
         kb_run_deferred_work();
+        if (trace_run) {
+            fprintf(stderr, "kobox-run: drain loop=%lu poll_root_hubs\n", i);
+        }
         (void)kb_usb_poll_root_hubs();
+        if (trace_run) {
+            fprintf(stderr, "kobox-run: drain loop=%lu handle_irq\n", i);
+        }
         (void)kb_handle_any_irq(1000000ull);
         if (start_ns != 0 && ops != NULL && ops->monotonic_ns != NULL) {
             uint64_t now_ns = ops->monotonic_ns(backend);
@@ -185,9 +195,21 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
             }
         }
     }
+    if (trace_run) {
+        fprintf(stderr, "kobox-run: drain final run_work\n");
+    }
     kb_run_deferred_work();
+    if (trace_run) {
+        fprintf(stderr, "kobox-run: drain final poll_root_hubs\n");
+    }
     (void)kb_usb_poll_root_hubs();
+    if (trace_run) {
+        fprintf(stderr, "kobox-run: drain final handle_irq\n");
+    }
     (void)kb_handle_any_irq(0);
+    if (trace_run) {
+        fprintf(stderr, "kobox-run: drain done\n");
+    }
     kb_shim_set_backend(NULL);
 }
 
