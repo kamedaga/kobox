@@ -83,6 +83,12 @@ static int trace_usb_enabled(void)
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
+static int trace_usb_hub_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_USB_HUB");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
 static int usb_event_injection_enabled(void)
 {
     const char *value = getenv("KOBOX_ENABLE_USB_EVENT_INJECT");
@@ -678,7 +684,7 @@ static void kick_root_hub_if_changed(void *hcd)
         }
     }
 
-    if (trace_usb_enabled()) {
+    if (trace_usb_hub_enabled() || trace_usb_enabled()) {
         unsigned long hub_event_bits = 0;
         if (hub != NULL) {
             memcpy(
