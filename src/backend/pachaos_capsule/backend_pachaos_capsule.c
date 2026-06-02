@@ -1549,6 +1549,15 @@ static int backend_matches_preferred_class(kb_backend_t *backend)
     return !has_prog_if || class_bytes[0] == prog_if;
 }
 
+static int preferred_pci_class_is_configured(void)
+{
+    uint8_t class_code = 0;
+    uint8_t subclass = 0;
+    uint8_t prog_if = 0;
+    int has_prog_if = 0;
+    return preferred_pci_class(&class_code, &subclass, &prog_if, &has_prog_if);
+}
+
 static kb_status_t create_from_catalog_token(uint64_t catalog_token, kb_backend_t **out_backend)
 {
     if (out_backend == NULL || !is_vm_object_token(catalog_token)) {
@@ -1644,6 +1653,9 @@ kb_status_t kb_pachaos_capsule_create_from_env(kb_backend_t **out_backend)
         if (catalog_status == KB_OK) {
             return KB_OK;
         }
+        if (preferred_pci_class_is_configured()) {
+            return catalog_status;
+        }
     }
 
     const char *text = getenv("KOBOX_PACHAOS_DEVICE_CAPSULE");
@@ -1652,5 +1664,15 @@ kb_status_t kb_pachaos_capsule_create_from_env(kb_backend_t **out_backend)
     if (status != KB_OK) {
         return status;
     }
-    return kb_pachaos_capsule_create(token, out_backend);
+    kb_backend_t *backend = NULL;
+    status = kb_pachaos_capsule_create(token, &backend);
+    if (status != KB_OK) {
+        return status;
+    }
+    if (!backend_matches_preferred_class(backend)) {
+        kb_backend_destroy(backend);
+        return KB_ERR_NOT_FOUND;
+    }
+    *out_backend = backend;
+    return KB_OK;
 }

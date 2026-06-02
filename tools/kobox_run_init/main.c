@@ -236,11 +236,14 @@ static void configure_pachaos_driver_preference(const char *path)
         return;
     }
     if (strstr(path, "nvme") != NULL || strstr(path, "NVME") != NULL) {
-        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0108", 0);
+        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x010802", 0);
         return;
     }
-    if (strstr(path, "xhci") != NULL || strstr(path, "XHCI") != NULL ||
-        strstr(path, "usb") != NULL || strstr(path, "USB") != NULL) {
+    if (strstr(path, "xhci") != NULL || strstr(path, "XHCI") != NULL) {
+        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c0330", 0);
+        return;
+    }
+    if (strstr(path, "usb") != NULL || strstr(path, "USB") != NULL) {
         (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c03", 0);
     }
 #else
