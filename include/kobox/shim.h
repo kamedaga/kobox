@@ -37,6 +37,7 @@ int kb_request_threaded_irq(
 void kb_free_irq(unsigned int irq, void *dev_id);
 void kb_free_all_irqs(void);
 int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
+int kb_wait_irq_signal_for_dev_id(void *dev_id, uint64_t timeout_ns);
 int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
 int kb_handle_any_irq(uint64_t timeout_ns);
 int kb_handle_any_irq_no_work(uint64_t timeout_ns);

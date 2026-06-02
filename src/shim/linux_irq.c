@@ -245,6 +245,33 @@ int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
     return -19;
 }
 
+int kb_wait_irq_signal_for_dev_id(void *dev_id, uint64_t timeout_ns)
+{
+    for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
+        if (entry->dev_id != dev_id) {
+            continue;
+        }
+
+        const kb_backend_ops_t *ops = kb_backend_get_ops(kb_shim_current_backend());
+        if (ops == NULL || ops->irq_wait == NULL) {
+            return -95;
+        }
+
+        int (*handler)(int, void *) = entry->handler;
+        int (*thread_fn)(int, void *) = entry->thread_fn;
+        entry->handler = NULL;
+        entry->thread_fn = NULL;
+        kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
+        entry->handler = handler;
+        entry->thread_fn = thread_fn;
+        if (trace_irq_enabled()) {
+            fprintf(stderr, "kobox irq: wait-signal dev_id=%p status=%d\n", dev_id, status);
+        }
+        return status == KB_OK ? 0 : -110;
+    }
+    return -19;
+}
+
 int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
 {
     for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {

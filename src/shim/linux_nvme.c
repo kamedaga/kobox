@@ -865,7 +865,7 @@ static int nvme_block_complete_execute(void *request)
                 request,
                 tag_request);
         }
-        int irq_status = kb_handle_irq_for_dev_id(nvmeq, 1000000000ull);
+        int irq_status = kb_wait_irq_signal_for_dev_id(nvmeq, 1000000000ull);
         if (irq_status == 0) {
             tracked_io_irq_waits++;
             uint16_t irq_head = read_u16(nvmeq + KB_NVME_QUEUE_CQ_HEAD_OFFSET);
