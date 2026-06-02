@@ -644,36 +644,37 @@ static void trace_root_hub_state(const char *label, void *hcd)
     trace_root_hub_ports(label, hcd, status, status_len);
 }
 
-static void kick_root_hub_if_changed(void *hcd)
+static int kick_root_hub_if_changed(void *hcd)
 {
     void (*kick_hub_wq)(void *) = (void (*)(void *))kb_module_lookup_exported_symbol("usb_kick_hub_wq");
     int inject_events = usb_event_injection_enabled();
     if (hcd == NULL) {
-        return;
+        return 0;
     }
     if (inject_events && kick_hub_wq == NULL) {
-        return;
+        return 0;
     }
 
     unsigned char status[8] = { 0 };
     int status_len = usb_root_hub_status_data(hcd, status);
     usb_filter_empty_port_changes(hcd, status, status_len);
     if (status_len <= 0) {
-        return;
+        return 0;
     }
 
     void *root_hub = usb_root_hub_for_hcd(hcd);
     if (root_hub == NULL) {
-        return;
+        return 0;
     }
 
     void *hub = usb_hub_for_root_hub(root_hub);
     int hub_ready = usb_hub_ready_for_events(hub);
     kb_usb_hub_event_update_t event;
     if (kb_usb_subsystem_hub_event_prepare(hcd, status, (size_t)status_len, &event) != 0) {
-        return;
+        return 0;
     }
 
+    int kicked = 0;
     if (inject_events && hub != NULL && hub_ready && event.bits != 0) {
         unsigned long existing_bits = 0;
         memcpy(
@@ -719,7 +720,9 @@ static void kick_root_hub_if_changed(void *hcd)
     }
     if (inject_events && hub != NULL && hub_ready && event.new_bits != 0) {
         kick_hub_wq(root_hub);
+        kicked = 1;
     }
+    return kicked;
 }
 
 int kb_usb_hcd_irq(int irq, void *hcd)
@@ -757,8 +760,10 @@ int kb_usb_poll_root_hub(void *hcd)
         kb_usb_subsystem_hcd_note_root_hub_resume(hcd);
         resume_root_hub(hcd);
     }
-    kick_root_hub_if_changed(hcd);
-    poll_rh_status(hcd);
+    int kicked = kick_root_hub_if_changed(hcd);
+    if (!kicked) {
+        poll_rh_status(hcd);
+    }
 
     void *shared_hcd = NULL;
     memcpy(&shared_hcd, (const unsigned char *)hcd + KB_LINUX_6_8_USB_HCD_SHARED_HCD_OFFSET, sizeof(shared_hcd));
@@ -773,8 +778,10 @@ int kb_usb_poll_root_hub(void *hcd)
             kb_usb_subsystem_hcd_note_root_hub_resume(shared_hcd);
             resume_root_hub(shared_hcd);
         }
-        kick_root_hub_if_changed(shared_hcd);
-        poll_rh_status(shared_hcd);
+        kicked = kick_root_hub_if_changed(shared_hcd);
+        if (!kicked) {
+            poll_rh_status(shared_hcd);
+        }
         return 2;
     }
     return 1;
