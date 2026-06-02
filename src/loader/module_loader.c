@@ -58,6 +58,7 @@ enum {
     KB_LOCAL_USB_XHCI_TRACEPOINT_OFFSET = 704,
     KB_LOCAL_USB_MISC_DATA_OFFSET = 1024,
     KB_LOCAL_USB_MISC_DATA_STRIDE = 128,
+    KB_LOCAL_USB_CONTROL_MSG_TRACE_STUB_OFFSET = KB_LOCAL_USB_DATA_OFFSET + KB_LOCAL_USB_MISC_DATA_OFFSET,
 };
 
 static int trace_modules_enabled(void)
@@ -2870,6 +2871,18 @@ static void write_abs_jump_stub(uint8_t *p, void *target, uint64_t *counter)
     p[i++] = 0xc3;
 }
 
+static void write_abs_jump_raw_stub(uint8_t *p, void *target)
+{
+    memset(p, 0x90, KB_LOCAL_SHIM_STUB_SIZE);
+    size_t i = 0;
+    p[i++] = 0x48;
+    p[i++] = 0xb8;
+    write_u64le(p + i, (uint64_t)(uintptr_t)target);
+    i += 8;
+    p[i++] = 0xff;
+    p[i++] = 0xe0;
+}
+
 static void kb_trace_internal_return(const char *name, uint64_t value)
 {
     fprintf(stderr, "kobox-trace: %s returned 0x%llx (%lld)\n", name, (unsigned long long)value, (long long)value);
@@ -3510,6 +3523,9 @@ static kb_status_t load_sections(kb_module_t *module)
             shim_symbols[i].address,
             &module->shim_call_counts[i]);
     }
+    write_abs_jump_raw_stub(
+        module->shim_region + KB_LOCAL_USB_CONTROL_MSG_TRACE_STUB_OFFSET,
+        (void *)(uintptr_t)&kb_usb_control_msg_trace);
     const uint64_t pv_return_zero = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "crc32_le");
     const uint64_t pv_save_flags = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "kobox_x86_save_flags_if_enabled");
     const uint64_t pv_read_pat = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "kobox_x86_read_pat_msr");
@@ -3739,7 +3755,7 @@ static void *lookup_internal_symbol_override(kb_module_t *module, const char *na
         return lookup_module_shim_symbol(module, "crc32_le");
     }
     if (strcmp(name, "usb_control_msg") == 0) {
-        return lookup_module_shim_symbol(module, "kobox_usb_control_msg_trace");
+        return module->shim_region + KB_LOCAL_USB_CONTROL_MSG_TRACE_STUB_OFFSET;
     }
     return 0;
 }
