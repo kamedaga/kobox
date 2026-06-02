@@ -61,6 +61,7 @@ int kb_timer_delete(void *timer);
 unsigned long kb_schedule_timeout(unsigned long timeout);
 void kb_run_deferred_work(void);
 void kb_run_deferred_bottom_halves(void);
+int kb_deferred_work_is_draining(void);
 void kb_register_jiffies_storage(void *storage);
 unsigned long kb_msecs_to_jiffies(unsigned int msecs);
 unsigned long kb_usecs_to_jiffies(unsigned int usecs);

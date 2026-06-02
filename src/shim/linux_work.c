@@ -533,6 +533,11 @@ void kb_run_deferred_bottom_halves(void)
     run_deferred_items(0);
 }
 
+int kb_deferred_work_is_draining(void)
+{
+    return draining_deferred_depth != 0;
+}
+
 int kb_queue_work_on(int cpu, void *wq, void *work)
 {
     (void)cpu;

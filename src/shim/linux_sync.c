@@ -72,6 +72,15 @@ void kb_init_swait_queue_head(void *wq_head)
     (void)wq_head;
 }
 
+static void run_wait_progress(void)
+{
+    if (kb_deferred_work_is_draining()) {
+        kb_run_deferred_bottom_halves();
+    } else {
+        kb_run_deferred_work();
+    }
+}
+
 unsigned long kb_wait_for_completion(void *completion)
 {
     if (completion == NULL) {
@@ -81,7 +90,7 @@ unsigned long kb_wait_for_completion(void *completion)
         fprintf(stderr, "kobox work: wait_for_completion completion=%p\n", completion);
     }
     for (unsigned i = 0; i < 20; i++) {
-        kb_run_deferred_work();
+        run_wait_progress();
         (void)kb_handle_any_irq_no_work(0);
         uint32_t done = 0;
         memcpy(&done, completion, sizeof(done));
@@ -110,7 +119,7 @@ unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long 
     }
     const unsigned long loops = timeout == 0 ? 20 : (timeout > 100 ? 100 : timeout);
     for (unsigned long i = 0; i < loops; i++) {
-        kb_run_deferred_work();
+        run_wait_progress();
         (void)kb_handle_any_irq_no_work(0);
         uint32_t done = 0;
         memcpy(&done, completion, sizeof(done));
