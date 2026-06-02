@@ -392,7 +392,11 @@ int kb_pci_request_irq(
         return irq;
     }
     kb_nvme_shim_track_queue(dev_id);
-    return kb_request_threaded_irq((unsigned int)irq, handler, thread_fn, 0, "kobox-pci", dev_id);
+    int result = kb_request_threaded_irq((unsigned int)irq, handler, thread_fn, 0, "kobox-pci", dev_id);
+    if (trace_pci_enabled()) {
+        fprintf(stderr, "kobox pci: request_irq nr=%u irq=%d dev_id=%p result=%d\n", nr, irq, dev_id, result);
+    }
+    return result;
 }
 
 void kb_pci_free_irq(void *dev, unsigned int nr, void *dev_id)
