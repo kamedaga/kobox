@@ -7,6 +7,31 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+static int stderr_write_all(const char *text, size_t length)
+{
+    if (text == NULL || length == 0) {
+        return 0;
+    }
+    size_t written = 0;
+    while (written < length) {
+#if defined(_WIN32)
+        int n = _write(2, text + written, (unsigned int)(length - written));
+#else
+        ssize_t n = write(STDERR_FILENO, text + written, length - written);
+#endif
+        if (n <= 0) {
+            break;
+        }
+        written += (size_t)n;
+    }
+    return (int)written;
+}
 
 static const char *printk_format(const char *fmt)
 {
@@ -24,10 +49,7 @@ static int safe_puts_counted(const char *text)
     if (text == NULL) {
         return 0;
     }
-    if (fputs(text, stderr) == EOF) {
-        return 0;
-    }
-    return (int)strlen(text);
+    return stderr_write_all(text, strlen(text));
 }
 
 static const char *safe_string_arg(const char *value)
@@ -139,18 +161,14 @@ int kb_vprintk_safe(const char *fmt, va_list args)
 
     while (*p != '\0') {
         if (*p != '%') {
-            if (fputc((unsigned char)*p, stderr) != EOF) {
-                written++;
-            }
+            written += stderr_write_all(p, 1);
             p++;
             continue;
         }
 
         p++;
         if (*p == '%') {
-            if (fputc('%', stderr) != EOF) {
-                written++;
-            }
+            written += stderr_write_all("%", 1);
             p++;
             continue;
         }
@@ -223,7 +241,9 @@ int kb_vprintk_safe(const char *fmt, va_list args)
             while (*p != '\0' && isalnum((unsigned char)*p)) {
                 p++;
             }
-            written += fprintf(stderr, "%p", ptr);
+            char buffer[32];
+            (void)snprintf(buffer, sizeof(buffer), "%p", ptr);
+            written += safe_puts_counted(buffer);
             continue;
         }
         if (conversion == 'c') {
@@ -248,12 +268,8 @@ int kb_vprintk_safe(const char *fmt, va_list args)
             continue;
         }
 
-        if (fputc('%', stderr) != EOF) {
-            written++;
-        }
-        if (fputc((unsigned char)conversion, stderr) != EOF) {
-            written++;
-        }
+        written += stderr_write_all("%", 1);
+        written += stderr_write_all(&conversion, 1);
     }
 
     return written;

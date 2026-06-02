@@ -242,7 +242,6 @@ void kb_nvme_shim_track_queue(void *nvmeq_raw)
         if (dev != NULL) {
             tracked_admin_tag_set = dev + KB_NVME_DEV_TAGSET_OFFSET;
         }
-        nvme_completion_poll_yield();
     } else {
         tracked_io_nvmeq = nvmeq;
     }
