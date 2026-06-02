@@ -19,6 +19,7 @@ typedef enum kb_status {
     KB_ERR_NOMEM = -4,
     KB_ERR_IO = -5,
     KB_ERR_UNSUPPORTED = -6,
+    KB_ERR_PCI_CONFIG = -7,
 } kb_status_t;
 
 typedef enum kb_dma_dir {

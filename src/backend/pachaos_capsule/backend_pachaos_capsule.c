@@ -468,6 +468,30 @@ static void configure_bar_info_from_env(struct kb_device *device)
     }
 }
 
+static const char *kb_status_name(kb_status_t status)
+{
+    switch (status) {
+    case KB_OK:
+        return "KB_OK";
+    case KB_ERR_INVALID:
+        return "KB_ERR_INVALID";
+    case KB_ERR_NOT_FOUND:
+        return "KB_ERR_NOT_FOUND";
+    case KB_ERR_DENIED:
+        return "KB_ERR_DENIED";
+    case KB_ERR_NOMEM:
+        return "KB_ERR_NOMEM";
+    case KB_ERR_IO:
+        return "KB_ERR_IO";
+    case KB_ERR_UNSUPPORTED:
+        return "KB_ERR_UNSUPPORTED";
+    case KB_ERR_PCI_CONFIG:
+        return "KB_ERR_PCI_CONFIG";
+    default:
+        return "KB_ERR_UNKNOWN";
+    }
+}
+
 static void configure_location_from_device_id(struct kb_device *device)
 {
     if ((device->device_id & 0xffffffff00000000ull) == 0x5043490000000000ull) {
@@ -1504,49 +1528,44 @@ static kb_status_t parse_u64_text(const char *text, uint64_t *out_value)
     return KB_OK;
 }
 
-static int preferred_pci_class(uint8_t *out_class, uint8_t *out_subclass, uint8_t *out_prog_if, int *out_has_prog_if)
+static int preferred_pci_class(uint8_t *out_class, uint8_t *out_subclass, uint8_t *out_prog_if)
 {
     const char *text = getenv("KOBOX_PACHAOS_PREFERRED_CLASS");
     uint64_t value = 0;
     if (parse_u64_text(text, &value) != KB_OK) {
         return 0;
     }
-    if (value <= 0xffffu) {
-        *out_class = (uint8_t)((value >> 8) & 0xffu);
-        *out_subclass = (uint8_t)(value & 0xffu);
-        *out_prog_if = 0;
-        *out_has_prog_if = 0;
-        return 1;
-    }
-    if (value <= 0xffffffu) {
+    if (value > 0xffffu && value <= 0xffffffu) {
         *out_class = (uint8_t)((value >> 16) & 0xffu);
         *out_subclass = (uint8_t)((value >> 8) & 0xffu);
         *out_prog_if = (uint8_t)(value & 0xffu);
-        *out_has_prog_if = 1;
         return 1;
     }
     return 0;
 }
 
-static int backend_matches_preferred_class(kb_backend_t *backend)
+static kb_status_t backend_matches_preferred_class(kb_backend_t *backend, int *out_match)
 {
+    if (out_match == NULL) {
+        return KB_ERR_INVALID;
+    }
+    *out_match = 0;
     uint8_t class_code = 0;
     uint8_t subclass = 0;
     uint8_t prog_if = 0;
-    int has_prog_if = 0;
-    if (!preferred_pci_class(&class_code, &subclass, &prog_if, &has_prog_if)) {
-        return 1;
+    if (!preferred_pci_class(&class_code, &subclass, &prog_if)) {
+        *out_match = 1;
+        return KB_OK;
     }
 
     kb_pachaos_capsule_backend_t *pacha = pacha_from_backend(backend);
     uint8_t class_bytes[3] = {0};
-    if (pacha_pci_config_read(&pacha->device, 0x09, class_bytes, sizeof(class_bytes)) != KB_OK) {
-        return 0;
+    kb_status_t status = pacha_pci_config_read(&pacha->device, 0x09, class_bytes, sizeof(class_bytes));
+    if (status != KB_OK) {
+        return status == KB_ERR_DENIED ? KB_ERR_DENIED : KB_ERR_PCI_CONFIG;
     }
-    if (class_bytes[2] != class_code || class_bytes[1] != subclass) {
-        return 0;
-    }
-    return !has_prog_if || class_bytes[0] == prog_if;
+    *out_match = class_bytes[2] == class_code && class_bytes[1] == subclass && class_bytes[0] == prog_if;
+    return KB_OK;
 }
 
 static int preferred_pci_class_is_configured(void)
@@ -1554,13 +1573,27 @@ static int preferred_pci_class_is_configured(void)
     uint8_t class_code = 0;
     uint8_t subclass = 0;
     uint8_t prog_if = 0;
-    int has_prog_if = 0;
-    return preferred_pci_class(&class_code, &subclass, &prog_if, &has_prog_if);
+    return preferred_pci_class(&class_code, &subclass, &prog_if);
 }
 
-static kb_status_t create_from_catalog_token(uint64_t catalog_token, kb_backend_t **out_backend)
+static kb_status_t catalog_token_from_env(uint64_t *out_catalog_token)
 {
-    if (out_backend == NULL || !is_vm_object_token(catalog_token)) {
+    if (out_catalog_token == NULL) {
+        return KB_ERR_INVALID;
+    }
+    const char *catalog_text = getenv("PACHA_EXEC_DEVICE_CATALOG");
+    if (catalog_text == NULL || catalog_text[0] == '\0') {
+        catalog_text = getenv("KOBOX_PACHAOS_DEVICE_CATALOG");
+    }
+    if (catalog_text == NULL || catalog_text[0] == '\0') {
+        return KB_ERR_NOT_FOUND;
+    }
+    return parse_u64_text(catalog_text, out_catalog_token);
+}
+
+static kb_status_t map_catalog_page(uint64_t catalog_token, const kb_pachaos_device_catalog_page_t **out_page)
+{
+    if (out_page == NULL || !is_vm_object_token(catalog_token)) {
         return KB_ERR_INVALID;
     }
 
@@ -1579,6 +1612,21 @@ static kb_status_t create_from_catalog_token(uint64_t catalog_token, kb_backend_
         page->version != KB_PACHAOS_DEVICE_CATALOG_VERSION) {
         return KB_ERR_INVALID;
     }
+    *out_page = page;
+    return KB_OK;
+}
+
+static kb_status_t create_from_catalog_token(uint64_t catalog_token, kb_backend_t **out_backend)
+{
+    if (out_backend == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    const kb_pachaos_device_catalog_page_t *page = NULL;
+    kb_status_t status = map_catalog_page(catalog_token, &page);
+    if (status != KB_OK) {
+        return status;
+    }
 
     kb_status_t last_status = KB_ERR_NOT_FOUND;
     size_t count = page->entry_count;
@@ -1592,14 +1640,23 @@ static kb_status_t create_from_catalog_token(uint64_t catalog_token, kb_backend_
         }
 
         kb_backend_t *candidate = NULL;
-        kb_status_t status = kb_pachaos_capsule_create(entry->device_capsule_token, &candidate);
+        status = kb_pachaos_capsule_create(entry->device_capsule_token, &candidate);
         if (status != KB_OK) {
-            last_status = status;
+            if (last_status == KB_ERR_NOT_FOUND || status == KB_ERR_DENIED) {
+                last_status = status;
+            }
             continue;
         }
-        if (backend_matches_preferred_class(candidate)) {
+        int matched = 0;
+        status = backend_matches_preferred_class(candidate, &matched);
+        if (status == KB_OK && matched) {
             *out_backend = candidate;
             return KB_OK;
+        }
+        if (status != KB_OK &&
+            (last_status == KB_ERR_NOT_FOUND || status == KB_ERR_DENIED || status == KB_ERR_PCI_CONFIG))
+        {
+            last_status = status;
         }
         kb_backend_destroy(candidate);
     }
@@ -1640,16 +1697,10 @@ kb_status_t kb_pachaos_capsule_create(uint64_t device_capsule, kb_backend_t **ou
 
 kb_status_t kb_pachaos_capsule_create_from_env(kb_backend_t **out_backend)
 {
-    const char *catalog_text = getenv("PACHA_EXEC_DEVICE_CATALOG");
-    if (catalog_text == NULL || catalog_text[0] == '\0') {
-        catalog_text = getenv("KOBOX_PACHAOS_DEVICE_CATALOG");
-    }
-    if (catalog_text != NULL && catalog_text[0] != '\0') {
-        uint64_t catalog_token = 0;
-        kb_status_t catalog_status = parse_u64_text(catalog_text, &catalog_token);
-        if (catalog_status == KB_OK) {
-            catalog_status = create_from_catalog_token(catalog_token, out_backend);
-        }
+    uint64_t catalog_token = 0;
+    kb_status_t catalog_status = catalog_token_from_env(&catalog_token);
+    if (catalog_status == KB_OK) {
+        catalog_status = create_from_catalog_token(catalog_token, out_backend);
         if (catalog_status == KB_OK) {
             return KB_OK;
         }
@@ -1669,10 +1720,101 @@ kb_status_t kb_pachaos_capsule_create_from_env(kb_backend_t **out_backend)
     if (status != KB_OK) {
         return status;
     }
-    if (!backend_matches_preferred_class(backend)) {
+    int matched = 0;
+    status = backend_matches_preferred_class(backend, &matched);
+    if (status != KB_OK) {
+        kb_backend_destroy(backend);
+        return status;
+    }
+    if (!matched) {
         kb_backend_destroy(backend);
         return KB_ERR_NOT_FOUND;
     }
     *out_backend = backend;
+    return KB_OK;
+}
+
+kb_status_t kb_pachaos_capsule_dump_catalog(FILE *out)
+{
+    if (out == NULL) {
+        return KB_ERR_INVALID;
+    }
+    uint64_t catalog_token = 0;
+    kb_status_t status = catalog_token_from_env(&catalog_token);
+    if (status != KB_OK) {
+        return status;
+    }
+
+    const kb_pachaos_device_catalog_page_t *page = NULL;
+    status = map_catalog_page(catalog_token, &page);
+    if (status != KB_OK) {
+        return status;
+    }
+
+    uint8_t preferred_class = 0;
+    uint8_t preferred_subclass = 0;
+    uint8_t preferred_prog_if = 0;
+    const int has_preferred = preferred_pci_class(&preferred_class, &preferred_subclass, &preferred_prog_if);
+    fprintf(out, "PachaOS device catalog: entries=%llu", (unsigned long long)page->entry_count);
+    if (has_preferred) {
+        fprintf(out, " preferred=%02x:%02x:%02x", preferred_class, preferred_subclass, preferred_prog_if);
+    }
+    fputc('\n', out);
+
+    size_t count = page->entry_count;
+    if (count > KB_PACHAOS_DEVICE_CATALOG_MAX_ENTRIES) {
+        count = KB_PACHAOS_DEVICE_CATALOG_MAX_ENTRIES;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const kb_pachaos_device_catalog_entry_t *entry = &page->entries[i];
+        if (entry->present == 0) {
+            continue;
+        }
+        fprintf(
+            out,
+            "[%zu] kind=%llu resource=0x%llx vendor=0x%04llx device=0x%04llx token=0x%016llx",
+            i,
+            (unsigned long long)entry->kind,
+            (unsigned long long)entry->resource_id,
+            (unsigned long long)entry->vendor_id,
+            (unsigned long long)entry->device_id,
+            (unsigned long long)entry->device_capsule_token);
+        if (!token_has_kind(entry->device_capsule_token, PACHA_CAPSULE_KIND_DEVICE)) {
+            fprintf(out, " status=invalid-token\n");
+            continue;
+        }
+        kb_backend_t *candidate = NULL;
+        status = kb_pachaos_capsule_create(entry->device_capsule_token, &candidate);
+        if (status != KB_OK) {
+            fprintf(out, " status=%s\n", kb_status_name(status));
+            continue;
+        }
+        kb_pachaos_capsule_backend_t *pacha = pacha_from_backend(candidate);
+        uint8_t class_bytes[3] = {0};
+        kb_status_t config_status = pacha_pci_config_read(&pacha->device, 0x09, class_bytes, sizeof(class_bytes));
+        int matched = 0;
+        kb_status_t match_status = backend_matches_preferred_class(candidate, &matched);
+        if (config_status == KB_OK) {
+            fprintf(
+                out,
+                " bdf=%04x:%02x:%02x.%u pci=%04x:%04x class=%02x:%02x:%02x",
+                pacha->device.location.segment,
+                pacha->device.location.bus,
+                pacha->device.location.device,
+                pacha->device.location.function,
+                pacha->device.pci_id.vendor_id,
+                pacha->device.pci_id.device_id,
+                class_bytes[2],
+                class_bytes[1],
+                class_bytes[0]);
+        } else {
+            fprintf(out, " config=%s", kb_status_name(config_status));
+        }
+        if (has_preferred) {
+            fprintf(out, " match=%s", match_status == KB_OK ? (matched ? "yes" : "no") : kb_status_name(match_status));
+        }
+        fputc('\n', out);
+        kb_backend_destroy(candidate);
+    }
     return KB_OK;
 }

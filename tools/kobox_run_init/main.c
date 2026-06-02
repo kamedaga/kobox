@@ -119,6 +119,8 @@ static const char *status_name(kb_status_t status)
         return "KB_ERR_IO";
     case KB_ERR_UNSUPPORTED:
         return "KB_ERR_UNSUPPORTED";
+    case KB_ERR_PCI_CONFIG:
+        return "KB_ERR_PCI_CONFIG";
     default:
         return "KB_ERR_UNKNOWN";
     }
@@ -243,8 +245,16 @@ static void configure_pachaos_driver_preference(const char *path)
         (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c0330", 0);
         return;
     }
-    if (strstr(path, "usb") != NULL || strstr(path, "USB") != NULL) {
-        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c03", 0);
+    if (strstr(path, "ehci") != NULL || strstr(path, "EHCI") != NULL) {
+        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c0320", 0);
+        return;
+    }
+    if (strstr(path, "ohci") != NULL || strstr(path, "OHCI") != NULL) {
+        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c0310", 0);
+        return;
+    }
+    if (strstr(path, "uhci") != NULL || strstr(path, "UHCI") != NULL) {
+        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c0300", 0);
     }
 #else
     (void)path;

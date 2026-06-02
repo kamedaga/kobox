@@ -23,6 +23,8 @@ static const char *status_name(kb_status_t status)
         return "KB_ERR_IO";
     case KB_ERR_UNSUPPORTED:
         return "KB_ERR_UNSUPPORTED";
+    case KB_ERR_PCI_CONFIG:
+        return "KB_ERR_PCI_CONFIG";
     default:
         return "KB_ERR_UNKNOWN";
     }
@@ -33,17 +35,30 @@ int main(int argc, char **argv)
     const char *backend_name = "sysfs";
     const char *pci_bdf = NULL;
     const char *capsule_text = NULL;
+    int dump_pachaos_catalog = 0;
     if (argc == 3 && strcmp(argv[1], "vfio") == 0) {
         backend_name = "vfio";
         pci_bdf = argv[2];
+    } else if (argc == 3 && strcmp(argv[1], "pachaos") == 0 && strcmp(argv[2], "--catalog") == 0) {
+        backend_name = "pachaos";
+        dump_pachaos_catalog = 1;
     } else if (argc == 3 && strcmp(argv[1], "pachaos") == 0) {
         backend_name = "pachaos";
         capsule_text = argv[2];
     } else if (argc == 2 && strcmp(argv[1], "pachaos") == 0) {
         backend_name = "pachaos";
     } else if (argc != 1) {
-        fprintf(stderr, "usage: kobox-ls-devices [vfio <BDF>|pachaos [DeviceCapsule]]\n");
+        fprintf(stderr, "usage: kobox-ls-devices [vfio <BDF>|pachaos [DeviceCapsule|--catalog]]\n");
         return 1;
+    }
+
+    if (dump_pachaos_catalog) {
+        kb_status_t status = kb_pachaos_capsule_dump_catalog(stdout);
+        if (status != KB_OK) {
+            fprintf(stderr, "pachaos catalog failed: %s (%d)\n", status_name(status), status);
+            return 1;
+        }
+        return 0;
     }
 
     kb_backend_t *backend = NULL;
