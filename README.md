@@ -29,7 +29,7 @@ libc-based Linux shim layer
         | kobox backend API only
         v
 OS backend
-  linux_mock / linux_vfio / pachaos / openbsd
+  linux_vfio / pachaos / FreeBSD / seL4...
 ```
 
 The shim intentionally uses libc and standard userspace primitives such as `malloc`, `pthread`, `mmap`, `clock_gettime`, and C atomics. It does not pretend to be a kernel internally.

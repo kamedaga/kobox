@@ -1,12 +1,16 @@
-# kobox
+# kobox -  ko In The Box
 
 Linux の `.ko` カーネルモジュールを、libc ベースの shim と OS ごとの backend によって userspace で動かす runtime です。
 
 ## kobox とは？
 
-kobox はプリコンパイル済みの Linux カーネルモジュール (`.ko`) を userspace process にロードします。Linux kernel symbol は互換 shim が解決し、実際の device access は Linux VFIO、PachaOS、OpenBSD などの backend に委譲します。
+kobox は任意のOSに`.ko` binaryを動かすプロジェクトおよび技術です。
 
-最初の開発ターゲットは Linux です。Linux なら native kernel driver との挙動比較と性能計測がしやすいため、loader / shim / backend の正しさを Linux 上で固めてから他 OS に移植します。
+## ターゲット
+
+・Linux vfio(QEMU Ubuntuおよび実機のUbuntu24.04.4で動作確認)
+・PachaOS Capsule(QEMU PachaOSでの検証 実機はまだ)
+
 
 ## 設計目標
 
@@ -29,7 +33,7 @@ libc-based Linux shim layer
         | kobox backend API only
         v
 OS backend
-  linux_vfio / pachaos / OpenBSD / FreeBSD...
+  linux_vfio / pachaos / FreeBSD / seL4...
 ```
 
 shim 層はあえて libc と標準的な userspace primitive を使います。`malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics などを使うことで実装量を減らし、libc が使える target OS に広げやすくします。
@@ -45,15 +49,8 @@ backend は OS 固有の device access だけを担当します。
 
 ## 現在のステータス
 
-初期設計段階です。次の milestone は以下です。
+NVMeおよびUSBをLinux vfioバックエンドで動かすことに成功していて、NVMeからPachaOs Capsuleバックエンドで動かすことに挑戦しています。(安定はしないがread/writeが成功)
 
-1. architecture と backend API を固定する
-2. ELF header/section 表示まで入った `kobox-inspect` を symbol / relocation 解析へ広げる
-3. `linux_mock` backend を実装する
-4. 最小 userspace module loader を実装する
-5. 実 hardware 用に `linux_vfio` backend を追加する
-
-この段階では versioning や release は意識しません。loader、shim の境界、backend API が固まるまでは、kobox は versioned runtime ではなく design/prototype project として扱います。
 
 ## Build
 
@@ -65,7 +62,7 @@ cmake --build .artifacts/build
 ctest --test-dir .artifacts/build
 ```
 
-## ロードマップ
+## 代表的な対応ドライバ
 
 1. NVMe — 対応完了
 2. USB (xHCI) — 対応完了 v1: HID + Mass Storage(BOT/SCSI/block I/O)、multi-device 
