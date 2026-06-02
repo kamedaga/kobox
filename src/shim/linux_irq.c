@@ -170,7 +170,6 @@ int kb_request_threaded_irq(
     if (trace_irq_enabled()) {
         fprintf(stderr, "kobox irq: request irq=%u dev_id=%p\n", irq, dev_id);
     }
-    (void)ops->irq_wait(device, entry->backend_irq, 0);
     return 0;
 }
 
