@@ -231,8 +231,9 @@ int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (status == KB_OK && xhci_pending) {
+        if (xhci_pending) {
             poll_root_hub_for_irq(entry);
+            kb_pci_xhci_ack_pending();
         }
         entry->handler = handler;
         entry->thread_fn = thread_fn;
@@ -295,8 +296,9 @@ int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (status == KB_OK && xhci_pending) {
+        if (xhci_pending) {
             poll_root_hub_for_irq(entry);
+            kb_pci_xhci_ack_pending();
         }
         kb_run_deferred_work();
         if (trace_irq_enabled()) {
@@ -325,8 +327,9 @@ static int handle_any_irq(uint64_t timeout_ns, int run_work)
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (status == KB_OK && xhci_pending) {
+        if (xhci_pending) {
             poll_root_hub_for_irq(entry);
+            kb_pci_xhci_ack_pending();
         }
         if (trace_irq_enabled()) {
             fprintf(stderr, "kobox irq: handle-any irq=%u dev_id=%p status=%d\n", entry->irq, entry->dev_id, status);

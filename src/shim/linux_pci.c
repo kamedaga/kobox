@@ -1474,6 +1474,56 @@ int kb_pci_xhci_irq_pending(void)
     return ((*usbsts & KB_XHCI_USBSTS_EINT) != 0 || port_change_pending) ? 1 : 0;
 }
 
+void kb_pci_xhci_ack_pending(void)
+{
+    enum {
+        KB_XHCI_CAPLENGTH_OFFSET = 0x00,
+        KB_XHCI_HCSPARAMS1_OFFSET = 0x04,
+        KB_XHCI_USBSTS_OFFSET = 0x04,
+        KB_XHCI_PORT_REGS_OFFSET = 0x400,
+        KB_XHCI_PORT_REGS_STRIDE = 0x10,
+        KB_XHCI_USBSTS_EINT = 1u << 3,
+        KB_XHCI_USBSTS_PCD = 1u << 4,
+        KB_XHCI_PORTSC_CHANGE_MASK = 0x00fe0000u,
+    };
+
+    if (mapped_bar0_addr == NULL || mapped_bar0_size < 0x40) {
+        return;
+    }
+
+    volatile unsigned char *base = mapped_bar0_addr;
+    uint32_t cap_header = *(volatile uint32_t *)(base + KB_XHCI_CAPLENGTH_OFFSET);
+    uint8_t caplength = (uint8_t)(cap_header & 0xffu);
+    uint16_t raw_version = (uint16_t)((cap_header >> 16) & 0xffffu);
+    if (caplength < 0x20 || raw_version < 0x0090 || raw_version > 0x0120 ||
+        (size_t)caplength + KB_XHCI_USBSTS_OFFSET + sizeof(uint32_t) > mapped_bar0_size)
+    {
+        return;
+    }
+
+    volatile uint32_t *usbsts = (volatile uint32_t *)(base + caplength + KB_XHCI_USBSTS_OFFSET);
+    uint32_t status = *usbsts;
+    uint32_t status_ack = status & (KB_XHCI_USBSTS_EINT | KB_XHCI_USBSTS_PCD);
+    if (status_ack != 0) {
+        *usbsts = status_ack;
+    }
+
+    uint32_t hcsparams1 = *(volatile uint32_t *)(base + KB_XHCI_HCSPARAMS1_OFFSET);
+    unsigned max_ports = (hcsparams1 >> 24) & 0xffu;
+    for (unsigned port = 0; port < max_ports; port++) {
+        size_t portsc_offset = (size_t)caplength + KB_XHCI_PORT_REGS_OFFSET +
+            ((size_t)port * KB_XHCI_PORT_REGS_STRIDE);
+        if (portsc_offset + sizeof(uint32_t) > mapped_bar0_size) {
+            break;
+        }
+        volatile uint32_t *portsc = (volatile uint32_t *)(base + portsc_offset);
+        uint32_t value = *portsc;
+        if ((value & KB_XHCI_PORTSC_CHANGE_MASK) != 0) {
+            *portsc = value;
+        }
+    }
+}
+
 void kb_iounmap(void *addr)
 {
     (void)addr;

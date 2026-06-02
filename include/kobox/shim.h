@@ -102,6 +102,7 @@ int kb_pci_write_config_word(void *dev, int where, uint16_t value);
 int kb_pci_write_config_dword(void *dev, int where, uint32_t value);
 int kb_pci_find_capability(void *dev, int cap);
 int kb_pci_xhci_irq_pending(void);
+void kb_pci_xhci_ack_pending(void);
 int kb_pci_enable_msi(void *dev);
 int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec);
 void kb_pci_disable_msi(void *dev);
