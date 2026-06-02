@@ -286,6 +286,11 @@ static uint64_t align_up_u64(uint64_t value, uint64_t alignment)
     return (value + mask) & ~mask;
 }
 
+static int is_power_of_two_u64(uint64_t value)
+{
+    return value != 0 && (value & (value - 1u)) == 0;
+}
+
 static uint64_t page_size_u64(void)
 {
     long value = sysconf(_SC_PAGESIZE);
@@ -554,7 +559,12 @@ static void pacha_quiesce_nvme_controller(kb_device_t *device)
 static void pacha_destroy(kb_backend_t *backend)
 {
     kb_pachaos_capsule_backend_t *pacha = pacha_from_backend(backend);
+    pacha_disable_pci_interrupts(&pacha->device);
     pacha_quiesce_nvme_controller(&pacha->device);
+    for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
+        close_capsule(pacha->irqs[i].capsule);
+        memset(&pacha->irqs[i], 0, sizeof(pacha->irqs[i]));
+    }
     for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
         kb_pachaos_dma_mapping_t *mapping = &pacha->dma_mappings[i];
         if (mapping->size != 0) {
@@ -566,6 +576,7 @@ static void pacha_destroy(kb_backend_t *backend)
             if (mapping->owns_cpu_addr) {
                 free(mapping->cpu_addr);
             }
+            memset(mapping, 0, sizeof(*mapping));
         }
     }
     for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
@@ -573,10 +584,8 @@ static void pacha_destroy(kb_backend_t *backend)
         if (mapping->map_size != 0) {
             close_capsule(mapping->capsule);
             munmap(mapping->map_addr, (size_t)mapping->map_size);
+            memset(mapping, 0, sizeof(*mapping));
         }
-    }
-    for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
-        close_capsule(pacha->irqs[i].capsule);
     }
     free(pacha);
 }
@@ -1032,6 +1041,9 @@ static kb_status_t pacha_dma_alloc(
     }
     uint64_t page_size = page_size_u64();
     uint64_t effective_alignment = alignment > page_size ? alignment : page_size;
+    if (!is_power_of_two_u64(effective_alignment) || effective_alignment > (uint64_t)SIZE_MAX) {
+        return KB_ERR_INVALID;
+    }
     if (size > UINT64_MAX - (effective_alignment - 1u)) {
         return KB_ERR_INVALID;
     }
@@ -1048,7 +1060,11 @@ static kb_status_t pacha_dma_alloc(
 
     kb_pachaos_capsule_backend_t *backend = device->backend;
     uint64_t iova_hint = align_up_u64(backend->next_iova, effective_alignment);
-    backend->next_iova = iova_hint + alloc_size;
+    if (iova_hint == 0 || iova_hint > UINT64_MAX - alloc_size - page_size) {
+        free(ptr);
+        return KB_ERR_INVALID;
+    }
+    backend->next_iova = iova_hint + alloc_size + page_size;
     long child = pacha_syscall5(
         PACHA_SYSCALL_CAPSULE_DERIVE_DMA_BUFFER,
         device->device_capsule,
@@ -1149,7 +1165,13 @@ static kb_status_t pacha_dma_map(
         owns_mapped_cpu_addr = 1;
     }
     uint64_t iova_hint = align_up_u64(backend->next_iova, page_size);
-    backend->next_iova = iova_hint + bounce_size;
+    if (iova_hint == 0 || iova_hint > UINT64_MAX - bounce_size - page_size) {
+        if (owns_mapped_cpu_addr) {
+            free(mapped_cpu_addr);
+        }
+        return KB_ERR_INVALID;
+    }
+    backend->next_iova = iova_hint + bounce_size + page_size;
     long child = pacha_syscall6(
         PACHA_SYSCALL_CAPSULE_DERIVE_DMA_MAPPING,
         device->device_capsule,
