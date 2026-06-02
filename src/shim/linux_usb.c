@@ -199,6 +199,163 @@ static int usb_status_from_kb_status(kb_status_t status)
     }
 }
 
+static size_t usb_copy_descriptor(void *data, uint16_t size, const unsigned char *descriptor, size_t descriptor_len)
+{
+    if (data == NULL || size == 0 || descriptor == NULL || descriptor_len == 0) {
+        return 0;
+    }
+    size_t copied = descriptor_len;
+    if (copied > size) {
+        copied = size;
+    }
+    memcpy(data, descriptor, copied);
+    return copied;
+}
+
+static int usb_synthetic_control_msg(
+    uint8_t request,
+    uint8_t requesttype,
+    uint16_t value,
+    uint16_t index,
+    void *data,
+    uint16_t size)
+{
+    enum {
+        USB_DIR_IN = 0x80,
+        USB_TYPE_STANDARD = 0x00,
+        USB_RECIP_DEVICE = 0x00,
+        USB_REQ_GET_DESCRIPTOR = 0x06,
+        USB_REQ_SET_ADDRESS = 0x05,
+        USB_REQ_SET_CONFIGURATION = 0x09,
+        USB_DT_DEVICE = 0x01,
+        USB_DT_CONFIG = 0x02,
+        USB_DT_STRING = 0x03,
+        USB_DT_DEVICE_QUALIFIER = 0x06,
+    };
+
+    if (!usb_event_injection_enabled()) {
+        return -95;
+    }
+    if ((requesttype & (USB_DIR_IN | 0x60 | 0x1f)) == (USB_TYPE_STANDARD | USB_RECIP_DEVICE)) {
+        if (request == USB_REQ_SET_ADDRESS || request == USB_REQ_SET_CONFIGURATION) {
+            return 0;
+        }
+    }
+    if ((requesttype & (USB_DIR_IN | 0x60 | 0x1f)) != (USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE) ||
+        request != USB_REQ_GET_DESCRIPTOR)
+    {
+        return -95;
+    }
+
+    static const unsigned char device_descriptor[] = {
+        18, USB_DT_DEVICE,
+        0x00, 0x02,
+        0x00, 0x00, 0x00,
+        64,
+        0x6b, 0x1d,
+        0x01, 0x10,
+        0x00, 0x01,
+        1, 2, 3,
+        1,
+    };
+    static const unsigned char config_descriptor[] = {
+        9, USB_DT_CONFIG,
+        33, 0,
+        1,
+        1,
+        0,
+        0x80,
+        50,
+        9, 0x04,
+        0,
+        0,
+        2,
+        0x08,
+        0x06,
+        0x50,
+        0,
+        7, 0x05,
+        0x81,
+        0x02,
+        0x00, 0x02,
+        0,
+        7, 0x05,
+        0x02,
+        0x02,
+        0x00, 0x02,
+        0,
+    };
+    static const unsigned char qualifier_descriptor[] = {
+        10, USB_DT_DEVICE_QUALIFIER,
+        0x00, 0x02,
+        0x00, 0x00, 0x00,
+        64,
+        1,
+        0,
+    };
+    static const unsigned char langid_descriptor[] = {
+        4, USB_DT_STRING,
+        0x09, 0x04,
+    };
+    static const unsigned char manufacturer_descriptor[] = {
+        12, USB_DT_STRING,
+        'K', 0, 'o', 0, 'b', 0, 'o', 0, 'x', 0,
+    };
+    static const unsigned char product_descriptor[] = {
+        24, USB_DT_STRING,
+        'U', 0, 'S', 0, 'B', 0, ' ', 0, 'S', 0, 't', 0, 'o', 0, 'r', 0, 'a', 0, 'g', 0, 'e', 0,
+    };
+    static const unsigned char serial_descriptor[] = {
+        10, USB_DT_STRING,
+        '0', 0, '0', 0, '0', 0, '1', 0,
+    };
+
+    uint8_t descriptor_type = (uint8_t)(value >> 8);
+    uint8_t descriptor_index = (uint8_t)(value & 0xffu);
+    const unsigned char *descriptor = NULL;
+    size_t descriptor_len = 0;
+    switch (descriptor_type) {
+    case USB_DT_DEVICE:
+        descriptor = device_descriptor;
+        descriptor_len = sizeof(device_descriptor);
+        break;
+    case USB_DT_CONFIG:
+        descriptor = config_descriptor;
+        descriptor_len = sizeof(config_descriptor);
+        break;
+    case USB_DT_DEVICE_QUALIFIER:
+        descriptor = qualifier_descriptor;
+        descriptor_len = sizeof(qualifier_descriptor);
+        break;
+    case USB_DT_STRING:
+        switch (descriptor_index) {
+        case 0:
+            descriptor = langid_descriptor;
+            descriptor_len = sizeof(langid_descriptor);
+            break;
+        case 1:
+            descriptor = manufacturer_descriptor;
+            descriptor_len = sizeof(manufacturer_descriptor);
+            break;
+        case 2:
+            descriptor = product_descriptor;
+            descriptor_len = sizeof(product_descriptor);
+            break;
+        case 3:
+            descriptor = serial_descriptor;
+            descriptor_len = sizeof(serial_descriptor);
+            break;
+        default:
+            return -32;
+        }
+        break;
+    default:
+        return -95;
+    }
+    (void)index;
+    return (int)usb_copy_descriptor(data, size, descriptor, descriptor_len);
+}
+
 static int usb_hub_ready_for_events(void *hub)
 {
     return hub != NULL;
@@ -1343,6 +1500,13 @@ int kb_usb_control_msg_trace(
             data,
             (unsigned)size,
             timeout);
+    }
+    int synthetic_result = usb_synthetic_control_msg(request, requesttype, value, index, data, size);
+    if (synthetic_result != -95) {
+        if (trace) {
+            fprintf(stderr, "kobox usb: control_msg synthetic result=%d\n", synthetic_result);
+        }
+        return synthetic_result;
     }
     int result = real_control_msg != NULL ?
         real_control_msg(dev, pipe, request, requesttype, value, index, data, size, timeout) :
