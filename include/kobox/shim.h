@@ -335,6 +335,7 @@ int kb_usb_hcd_irq(int irq, void *hcd);
 int kb_usb_hcd_is_primary_hcd(void *hcd);
 int kb_usb_poll_root_hub(void *hcd);
 int kb_usb_poll_root_hubs(void);
+void kb_usb_set_event_injection_runtime_allowed(int allowed);
 int kb_usb_add_hcd(void *hcd, unsigned int irqnum, unsigned long irqflags);
 void kb_usb_remove_hcd(void *hcd);
 void *kb_usb_create_shared_hcd(const void *driver, void *dev, const char *bus_name, void *primary_hcd);

@@ -229,6 +229,7 @@ static void configure_pachaos_driver_preference(const char *path)
 int main(int argc, char **argv)
 {
     install_crash_handler();
+    kb_usb_set_event_injection_runtime_allowed(0);
 
     const char *path = NULL;
     const char *backend_name = "mock";
@@ -415,6 +416,7 @@ int main(int argc, char **argv)
         free(data);
         return 0;
     }
+    kb_usb_set_event_injection_runtime_allowed(1);
     if (getenv("KOBOX_NVME_IO_SMOKE") != NULL) {
         kb_shim_set_backend(backend);
         int io_result = kb_nvme_io_smoke();

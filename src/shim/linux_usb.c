@@ -67,6 +67,7 @@ static unsigned char usb_xhci_tracepoint[128];
 static unsigned int usb_num_online_cpus = 1;
 static unsigned char usb_pcpu_hot[256];
 static int usb_pm_suspend_target_state;
+static int usb_event_injection_runtime_allowed;
 
 static int trace_usb_enabled(void)
 {
@@ -77,7 +78,13 @@ static int trace_usb_enabled(void)
 static int usb_event_injection_enabled(void)
 {
     const char *value = getenv("KOBOX_ENABLE_USB_EVENT_INJECT");
-    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    return usb_event_injection_runtime_allowed &&
+           value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+void kb_usb_set_event_injection_runtime_allowed(int allowed)
+{
+    usb_event_injection_runtime_allowed = allowed != 0;
 }
 
 static void *usb_read_ptr_field(const void *base, size_t offset)
