@@ -690,7 +690,9 @@ static void kick_root_hub_if_changed(void *hcd)
         }
     }
 
-    if (trace_usb_hub_enabled() || trace_usb_enabled()) {
+    const int trace_hub = trace_usb_hub_enabled() || trace_usb_enabled();
+    const int trace_changed = event.bits != 0 || event.new_bits != 0 || event.injected_before != event.injected_after;
+    if (trace_hub && trace_changed) {
         unsigned long hub_event_bits = 0;
         if (hub != NULL) {
             memcpy(
