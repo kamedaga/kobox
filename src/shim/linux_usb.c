@@ -60,6 +60,7 @@ enum {
     KB_USB_URB_SETUP_MAP_SINGLE = 0x00100000,
     KB_USB_CONTROL_SETUP_SIZE = 8,
     KB_USB_CONFIG_INTERFACE_MAX = 32,
+    KB_USB_TRACKED_HCD_MAX = 32,
 };
 
 static unsigned char usb_hcd_pci_pm_ops[256];
@@ -68,6 +69,13 @@ static unsigned int usb_num_online_cpus = 1;
 static unsigned char usb_pcpu_hot[256];
 static int usb_pm_suspend_target_state;
 static int usb_event_injection_runtime_allowed;
+
+typedef struct usb_hcd_port_state {
+    void *hcd;
+    unsigned long connected_bits;
+} usb_hcd_port_state_t;
+
+static usb_hcd_port_state_t usb_hcd_port_states[KB_USB_TRACKED_HCD_MAX];
 
 static int trace_usb_enabled(void)
 {
@@ -464,6 +472,80 @@ static int usb_root_hub_status_data(void *hcd, unsigned char status[8])
     return hub_status_data(hcd, (char *)status);
 }
 
+static usb_hcd_port_state_t *usb_port_state_for_hcd(void *hcd)
+{
+    if (hcd == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < KB_USB_TRACKED_HCD_MAX; i++) {
+        if (usb_hcd_port_states[i].hcd == hcd) {
+            return &usb_hcd_port_states[i];
+        }
+    }
+    for (size_t i = 0; i < KB_USB_TRACKED_HCD_MAX; i++) {
+        if (usb_hcd_port_states[i].hcd == NULL) {
+            usb_hcd_port_states[i].hcd = hcd;
+            return &usb_hcd_port_states[i];
+        }
+    }
+    return NULL;
+}
+
+static void usb_filter_empty_port_changes(void *hcd, unsigned char status[8], int status_len)
+{
+    void *driver = NULL;
+    if (hcd == NULL || status == NULL || status_len <= 0) {
+        return;
+    }
+    memcpy(&driver, (const unsigned char *)hcd + KB_LINUX_6_8_USB_HCD_DRIVER_OFFSET, sizeof(driver));
+    if (driver == NULL) {
+        return;
+    }
+
+    int (*hub_control)(void *, uint16_t, uint16_t, uint16_t, char *, uint16_t) = NULL;
+    memcpy(
+        &hub_control,
+        (const unsigned char *)driver + KB_LINUX_6_8_HC_DRIVER_HUB_CONTROL_OFFSET,
+        sizeof(hub_control));
+    if (hub_control == NULL) {
+        return;
+    }
+
+    usb_hcd_port_state_t *state = usb_port_state_for_hcd(hcd);
+    unsigned long connected_now = 0;
+    unsigned long prior_connected = state != NULL ? state->connected_bits : 0;
+
+    for (int byte_index = 0; byte_index < status_len && byte_index < 8; byte_index++) {
+        unsigned char bits = status[byte_index];
+        for (int bit = 0; bit < 8; bit++) {
+            unsigned char mask = (unsigned char)(1u << bit);
+            if ((bits & mask) == 0) {
+                continue;
+            }
+            int port = (byte_index * 8) + bit;
+            if (port == 0) {
+                continue;
+            }
+
+            unsigned char port_data[4] = { 0 };
+            int result =
+                hub_control(hcd, KB_USB_REQ_GET_PORT_STATUS, 0, (uint16_t)port, (char *)port_data, sizeof(port_data));
+            unsigned long port_bit = 1ul << (unsigned)port;
+            int connected = result == 0 && (port_data[0] & 0x01u) != 0;
+            if (connected) {
+                connected_now |= port_bit;
+            }
+            if (!connected && (prior_connected & port_bit) == 0) {
+                status[byte_index] &= (unsigned char)~mask;
+            }
+        }
+    }
+
+    if (state != NULL) {
+        state->connected_bits = connected_now;
+    }
+}
+
 static void trace_root_hub_ports(const char *label, void *hcd, const unsigned char status[8], int status_len)
 {
     void *driver = NULL;
@@ -563,6 +645,7 @@ static void kick_root_hub_if_changed(void *hcd)
 
     unsigned char status[8] = { 0 };
     int status_len = usb_root_hub_status_data(hcd, status);
+    usb_filter_empty_port_changes(hcd, status, status_len);
     if (status_len <= 0) {
         return;
     }
