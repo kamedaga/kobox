@@ -66,9 +66,11 @@ enum {
     KB_PCI_CAPABILITY_LIST_OFFSET = 0x34,
     KB_PCI_STATUS_CAP_LIST = 0x0010,
     KB_PCI_CAP_NEXT_MASK = 0xfc,
+    KB_PCI_CAP_ID_MSI = 0x05,
     KB_PCI_CAP_ID_MSIX = 0x11,
     KB_PCI_COMMAND_MEMORY_SPACE = 1u << 1,
     KB_PCI_COMMAND_BUS_MASTER = 1u << 2,
+    KB_PCI_MSI_CONTROL_ENABLE = 1u << 0,
     KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK = 0x07ff,
     KB_PCI_MSIX_CONTROL_FUNCTION_MASK = 1u << 14,
     KB_PCI_MSIX_CONTROL_ENABLE = 1u << 15,
@@ -77,6 +79,8 @@ enum {
     KB_PCI_MSIX_ENTRY_VECTOR_CTRL = 12,
     KB_PCI_MSIX_ENTRY_CTRL_MASKED = 0x00000001,
     PACHA_DEVICE_INTERRUPT_VECTOR = 0x41,
+    PACHA_NVME_REG_CC = 0x14,
+    PACHA_NVME_REG_CSTS = 0x1c,
 };
 
 static const uint32_t PACHA_X86_MSI_ADDRESS_LOW = UINT32_C(0xFEE00000);
@@ -160,6 +164,13 @@ struct kb_pachaos_capsule_backend {
     kb_pachaos_dma_mapping_t dma_mappings[KB_PACHAOS_DMA_MAPPING_MAX];
     struct kb_irq irqs[KB_PACHAOS_IRQ_MAX];
 };
+
+static uint64_t pacha_now_ns(void);
+static kb_status_t pacha_pci_config_read(kb_device_t *device, uint16_t offset, void *dst, size_t len);
+static kb_status_t pacha_pci_config_write(kb_device_t *device, uint16_t offset, const void *src, size_t len);
+static int pacha_pci_find_capability(kb_device_t *device, uint8_t cap_id, uint8_t *out_offset);
+static kb_status_t pacha_map_bar(kb_device_t *device, unsigned bar_index, kb_mmio_region_t *out_region);
+static void pacha_unmap_bar(kb_device_t *device, kb_mmio_region_t *region);
 
 static const uint64_t pacha_native_syscall_tag = 0x50414348ca000000ull;
 
@@ -426,9 +437,84 @@ static void close_capsule(uint64_t capsule)
     }
 }
 
+static int pacha_device_is_nvme(kb_device_t *device)
+{
+    uint8_t class_bytes[3] = {0};
+    if (device == NULL ||
+        pacha_pci_config_read(device, 0x09, class_bytes, sizeof(class_bytes)) != KB_OK) {
+        return 0;
+    }
+
+    return class_bytes[2] == 0x01 && class_bytes[1] == 0x08;
+}
+
+static void pacha_disable_pci_interrupts(kb_device_t *device)
+{
+    if (device == NULL) {
+        return;
+    }
+
+    uint8_t cap = 0;
+    if (pacha_pci_find_capability(device, KB_PCI_CAP_ID_MSIX, &cap)) {
+        uint16_t control = 0;
+        if (pacha_pci_config_read(device, (uint16_t)(cap + 2u), &control, sizeof(control)) == KB_OK) {
+            control |= KB_PCI_MSIX_CONTROL_FUNCTION_MASK;
+            control &= (uint16_t)~KB_PCI_MSIX_CONTROL_ENABLE;
+            (void)pacha_pci_config_write(device, (uint16_t)(cap + 2u), &control, sizeof(control));
+        }
+    }
+
+    if (pacha_pci_find_capability(device, KB_PCI_CAP_ID_MSI, &cap)) {
+        uint16_t control = 0;
+        if (pacha_pci_config_read(device, (uint16_t)(cap + 2u), &control, sizeof(control)) == KB_OK) {
+            control &= (uint16_t)~KB_PCI_MSI_CONTROL_ENABLE;
+            (void)pacha_pci_config_write(device, (uint16_t)(cap + 2u), &control, sizeof(control));
+        }
+    }
+}
+
+static void pacha_quiesce_nvme_controller(kb_device_t *device)
+{
+    if (!pacha_device_is_nvme(device)) {
+        return;
+    }
+
+    pacha_disable_pci_interrupts(device);
+
+    kb_mmio_region_t region;
+    memset(&region, 0, sizeof(region));
+    if (pacha_map_bar(device, 0, &region) != KB_OK || region.addr == NULL || region.size <= PACHA_NVME_REG_CSTS) {
+        return;
+    }
+
+    volatile uint32_t *cc = (volatile uint32_t *)((unsigned char *)region.addr + PACHA_NVME_REG_CC);
+    volatile uint32_t *csts = (volatile uint32_t *)((unsigned char *)region.addr + PACHA_NVME_REG_CSTS);
+    if ((*cc & 1u) != 0) {
+        *cc &= ~1u;
+        const uint64_t start = pacha_now_ns();
+        for (;;) {
+            if ((*csts & 1u) == 0) {
+                break;
+            }
+            const uint64_t now = pacha_now_ns();
+            if (start != 0 && now >= start && now - start >= 500000000ull) {
+                break;
+            }
+            const struct timespec delay = {
+                .tv_sec = 0,
+                .tv_nsec = 1000000,
+            };
+            nanosleep(&delay, NULL);
+        }
+    }
+
+    pacha_unmap_bar(device, &region);
+}
+
 static void pacha_destroy(kb_backend_t *backend)
 {
     kb_pachaos_capsule_backend_t *pacha = pacha_from_backend(backend);
+    pacha_quiesce_nvme_controller(&pacha->device);
     for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
         kb_pachaos_dma_mapping_t *mapping = &pacha->dma_mappings[i];
         if (mapping->size != 0) {
