@@ -13,7 +13,13 @@ kb_backend_t *kb_shim_current_backend(void);
 static kb_status_t first_device(kb_backend_t *backend, kb_device_t **out_device);
 static int trace_pci_enabled(void);
 typedef struct shim_mmio_mapping shim_mmio_mapping_t;
-static int remember_mmio_mapping(kb_device_t *device, const kb_mmio_region_t *region, void *user_addr, size_t user_size, int bar);
+static int remember_mmio_mapping(
+    kb_backend_t *backend,
+    kb_device_t *device,
+    const kb_mmio_region_t *region,
+    void *user_addr,
+    size_t user_size,
+    int bar);
 static shim_mmio_mapping_t *take_mmio_mapping(void *addr);
 static void release_mmio_mapping_record(shim_mmio_mapping_t *mapping);
 
@@ -61,6 +67,7 @@ static void *mapped_bar0_addr;
 static size_t mapped_bar0_size;
 
 struct shim_mmio_mapping {
+    kb_backend_t *backend;
     kb_device_t *device;
     kb_mmio_region_t region;
     void *user_addr;
@@ -510,9 +517,16 @@ static int trace_pci_enabled(void)
     return getenv("KOBOX_TRACE_PCI") != NULL;
 }
 
-static int remember_mmio_mapping(kb_device_t *device, const kb_mmio_region_t *region, void *user_addr, size_t user_size, int bar)
+static int remember_mmio_mapping(
+    kb_backend_t *backend,
+    kb_device_t *device,
+    const kb_mmio_region_t *region,
+    void *user_addr,
+    size_t user_size,
+    int bar)
 {
-    if (device == NULL || region == NULL || region->addr == NULL || region->size == 0 || user_addr == NULL) {
+    if (backend == NULL || device == NULL || region == NULL || region->addr == NULL || region->size == 0 ||
+        user_addr == NULL) {
         return -22;
     }
 
@@ -520,6 +534,7 @@ static int remember_mmio_mapping(kb_device_t *device, const kb_mmio_region_t *re
     if (mapping == NULL) {
         return -12;
     }
+    mapping->backend = backend;
     mapping->device = device;
     mapping->region = *region;
     mapping->user_addr = user_addr;
@@ -583,8 +598,7 @@ static void release_mmio_mapping_record(shim_mmio_mapping_t *mapping)
     if (mapping == NULL) {
         return;
     }
-    kb_backend_t *backend = kb_shim_current_backend();
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    const kb_backend_ops_t *ops = kb_backend_get_ops(mapping->backend);
     if (ops != NULL && ops->unmap_bar != NULL) {
         kb_mmio_region_t region = mapping->region;
         ops->unmap_bar(mapping->device, &region);
@@ -1424,7 +1438,7 @@ void *kb_pci_iomap(void *dev, int bar, unsigned long max)
     if (ops->map_bar(device, (unsigned)bar, &region) != KB_OK) {
         return NULL;
     }
-    if (remember_mmio_mapping(device, &region, region.addr, (size_t)region.size, bar) != 0) {
+    if (remember_mmio_mapping(backend, device, &region, region.addr, (size_t)region.size, bar) != 0) {
         ops->unmap_bar(device, &region);
         return NULL;
     }
@@ -1482,7 +1496,7 @@ void *kb_ioremap(uint64_t phys_addr, size_t size)
         return NULL;
     }
     void *mapped_addr = (unsigned char *)region.addr + (phys_addr - bar.start);
-    if (remember_mmio_mapping(device, &region, mapped_addr, size, 0) != 0) {
+    if (remember_mmio_mapping(backend, device, &region, mapped_addr, size, 0) != 0) {
         ops->unmap_bar(device, &region);
         return NULL;
     }
