@@ -212,8 +212,18 @@ int kb_device_add(void *dev)
     if (trace_device_enabled()) {
         fprintf(stderr, "kobox device: add dev=%p bus=%p\n", dev, read_ptr(dev, KB_LINUX_6_8_DEVICE_BUS_OFFSET));
     }
+    if (trace_device_enabled()) {
+        fprintf(stderr, "kobox device: observe begin dev=%p\n", dev);
+    }
     kb_usb_observe_linux_device(dev);
+    if (trace_device_enabled()) {
+        fprintf(stderr, "kobox device: observe done dev=%p\n", dev);
+        fprintf(stderr, "kobox device: attach begin dev=%p\n", dev);
+    }
     attach_device(dev);
+    if (trace_device_enabled()) {
+        fprintf(stderr, "kobox device: attach done dev=%p\n", dev);
+    }
     return 0;
 }
 
