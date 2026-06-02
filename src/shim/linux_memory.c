@@ -18,6 +18,18 @@ static int trace_memory(void)
     return getenv("KOBOX_TRACE_SHIMS") != NULL;
 }
 
+static int is_kernel_non_heap_pointer(const void *ptr)
+{
+    const uintptr_t value = (uintptr_t)ptr;
+    if (value == 0) {
+        return 1;
+    }
+    if (value < 4096u) {
+        return 1;
+    }
+    return value >= (uintptr_t)-4095;
+}
+
 void *kb_kmalloc(size_t size, unsigned int flags)
 {
     void *ptr = malloc(size);
@@ -110,6 +122,12 @@ void kb_kmem_cache_free(void *cache, void *ptr)
 
 void kb_kfree(void *ptr)
 {
+    if (is_kernel_non_heap_pointer(ptr)) {
+        if (trace_memory() && ptr != NULL) {
+            fprintf(stderr, "kobox-shim: kfree ignored sentinel ptr=%p\n", ptr);
+        }
+        return;
+    }
     free(ptr);
 }
 
