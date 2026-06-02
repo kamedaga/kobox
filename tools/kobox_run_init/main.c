@@ -189,6 +189,22 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
     kb_shim_set_backend(NULL);
 }
 
+static void cleanup_all_irqs_for_backend(kb_backend_t *backend)
+{
+    if (backend == NULL) {
+        return;
+    }
+    kb_shim_set_backend(backend);
+    kb_free_all_irqs();
+    kb_shim_set_backend(NULL);
+}
+
+static void destroy_backend_after_cleanup(kb_backend_t *backend)
+{
+    cleanup_all_irqs_for_backend(backend);
+    kb_backend_destroy(backend);
+}
+
 int main(int argc, char **argv)
 {
     install_crash_handler();
@@ -290,7 +306,7 @@ int main(int argc, char **argv)
         status = read_file(deps[i].path, &deps[i].data, &deps[i].size);
         if (status != KB_OK) {
             fprintf(stderr, "dependency read failed: %s: %s (%d)\n", deps[i].path, status_name(status), status);
-            kb_backend_destroy(backend);
+            destroy_backend_after_cleanup(backend);
             free(data);
             return 4;
         }
@@ -305,7 +321,7 @@ int main(int argc, char **argv)
             for (size_t j = 0; j <= i; j++) {
                 free(deps[j].data);
             }
-            kb_backend_destroy(backend);
+            destroy_backend_after_cleanup(backend);
             free(data);
             return 4;
         }
@@ -323,7 +339,7 @@ int main(int argc, char **argv)
                 }
                 free(deps[j].data);
             }
-            kb_backend_destroy(backend);
+            destroy_backend_after_cleanup(backend);
             free(data);
             return 4;
         }
@@ -343,7 +359,7 @@ int main(int argc, char **argv)
             kb_module_close(deps[i - 1].module);
             free(deps[i - 1].data);
         }
-        kb_backend_destroy(backend);
+        destroy_backend_after_cleanup(backend);
         free(data);
         fprintf(stderr, "open failed: %s (%d)\n", status_name(status), status);
         return 4;
@@ -358,7 +374,7 @@ int main(int argc, char **argv)
             kb_module_close(deps[i - 1].module);
             free(deps[i - 1].data);
         }
-        kb_backend_destroy(backend);
+        destroy_backend_after_cleanup(backend);
         free(data);
         fprintf(stderr, "init failed: %s (%d)\n", status_name(status), status);
         return 5;
@@ -373,8 +389,7 @@ int main(int argc, char **argv)
             kb_module_close(deps[i - 1].module);
             free(deps[i - 1].data);
         }
-        kb_free_all_irqs();
-        kb_backend_destroy(backend);
+        destroy_backend_after_cleanup(backend);
         free(data);
         return 0;
     }
@@ -390,7 +405,7 @@ int main(int argc, char **argv)
                 kb_module_close(deps[i - 1].module);
                 free(deps[i - 1].data);
             }
-            kb_backend_destroy(backend);
+            destroy_backend_after_cleanup(backend);
             free(data);
             fprintf(stderr, "nvme io smoke failed: %d\n", io_result);
             return 8;
@@ -406,7 +421,7 @@ int main(int argc, char **argv)
                 kb_module_close(deps[i - 1].module);
                 free(deps[i - 1].data);
             }
-            kb_backend_destroy(backend);
+            destroy_backend_after_cleanup(backend);
             free(data);
             fprintf(stderr, "fops smoke failed: %d\n", fops_result);
             return 9;
@@ -424,7 +439,7 @@ int main(int argc, char **argv)
                 kb_module_close(deps[i - 1].module);
                 free(deps[i - 1].data);
             }
-            kb_backend_destroy(backend);
+            destroy_backend_after_cleanup(backend);
             free(data);
             fprintf(stderr, "usb storage io smoke failed: %d\n", storage_io_result);
             return 10;
@@ -444,7 +459,7 @@ int main(int argc, char **argv)
         printf("cleanup_module returned\n");
     } else if (status != KB_ERR_NOT_FOUND) {
         kb_module_close(module);
-        kb_backend_destroy(backend);
+        destroy_backend_after_cleanup(backend);
         free(data);
         fprintf(stderr, "cleanup failed: %s (%d)\n", status_name(status), status);
         return 6;
@@ -459,15 +474,14 @@ int main(int argc, char **argv)
             fprintf(stderr, "dependency cleanup failed: %s: %s (%d)\n", deps[i - 1].path, status_name(status), status);
             kb_module_close(deps[i - 1].module);
             free(deps[i - 1].data);
-            kb_backend_destroy(backend);
+            destroy_backend_after_cleanup(backend);
             free(data);
             return 7;
         }
         kb_module_close(deps[i - 1].module);
         free(deps[i - 1].data);
     }
-    kb_free_all_irqs();
-    kb_backend_destroy(backend);
+    destroy_backend_after_cleanup(backend);
     free(data);
     return 0;
 }
