@@ -1189,6 +1189,9 @@ static kb_status_t pacha_irq_wait(kb_device_t *device, kb_irq_t *irq, uint64_t t
         kb_status_t status = pacha_irq_poll_count(irq->capsule, irq->last_interrupt_count, &count);
         if (status == KB_OK) {
             irq->last_interrupt_count = count;
+            if (irq->handler != NULL) {
+                irq->handler(irq->ctx);
+            }
             return KB_OK;
         }
         if (status != KB_ERR_NOT_FOUND) {
