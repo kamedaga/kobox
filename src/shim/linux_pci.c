@@ -1478,13 +1478,9 @@ void kb_pci_xhci_ack_pending(void)
 {
     enum {
         KB_XHCI_CAPLENGTH_OFFSET = 0x00,
-        KB_XHCI_HCSPARAMS1_OFFSET = 0x04,
         KB_XHCI_USBSTS_OFFSET = 0x04,
-        KB_XHCI_PORT_REGS_OFFSET = 0x400,
-        KB_XHCI_PORT_REGS_STRIDE = 0x10,
         KB_XHCI_USBSTS_EINT = 1u << 3,
         KB_XHCI_USBSTS_PCD = 1u << 4,
-        KB_XHCI_PORTSC_CHANGE_MASK = 0x00fe0000u,
     };
 
     if (mapped_bar0_addr == NULL || mapped_bar0_size < 0x40) {
@@ -1506,21 +1502,6 @@ void kb_pci_xhci_ack_pending(void)
     uint32_t status_ack = status & (KB_XHCI_USBSTS_EINT | KB_XHCI_USBSTS_PCD);
     if (status_ack != 0) {
         *usbsts = status_ack;
-    }
-
-    uint32_t hcsparams1 = *(volatile uint32_t *)(base + KB_XHCI_HCSPARAMS1_OFFSET);
-    unsigned max_ports = (hcsparams1 >> 24) & 0xffu;
-    for (unsigned port = 0; port < max_ports; port++) {
-        size_t portsc_offset = (size_t)caplength + KB_XHCI_PORT_REGS_OFFSET +
-            ((size_t)port * KB_XHCI_PORT_REGS_STRIDE);
-        if (portsc_offset + sizeof(uint32_t) > mapped_bar0_size) {
-            break;
-        }
-        volatile uint32_t *portsc = (volatile uint32_t *)(base + portsc_offset);
-        uint32_t value = *portsc;
-        if ((value & KB_XHCI_PORTSC_CHANGE_MASK) != 0) {
-            *portsc = value;
-        }
     }
 }
 
