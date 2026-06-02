@@ -418,12 +418,16 @@ void kb_usb_observe_linux_device(void *dev)
         return;
     }
 
+    void *device_type = usb_read_ptr_field(dev, KB_LINUX_6_8_DEVICE_TYPE_OFFSET);
+    if (device_type == NULL) {
+        return;
+    }
+
     void *usb_if_device_type = kb_module_lookup_exported_symbol("usb_if_device_type");
     if (usb_if_device_type == NULL) {
         return;
     }
 
-    void *device_type = usb_read_ptr_field(dev, KB_LINUX_6_8_DEVICE_TYPE_OFFSET);
     if (device_type == usb_if_device_type) {
         void *interface = (unsigned char *)dev - KB_LINUX_6_8_USB_INTERFACE_DEV_OFFSET;
         usb_observe_interface(NULL, interface, NULL);
