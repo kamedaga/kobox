@@ -212,6 +212,7 @@ static kb_status_t pacha_pci_config_write(kb_device_t *device, uint16_t offset, 
 static int pacha_pci_find_capability(kb_device_t *device, uint8_t cap_id, uint8_t *out_offset);
 static kb_status_t pacha_map_bar(kb_device_t *device, unsigned bar_index, kb_mmio_region_t *out_region);
 static void pacha_unmap_bar(kb_device_t *device, kb_mmio_region_t *region);
+static const kb_backend_ops_t pacha_ops;
 
 static const uint64_t pacha_native_syscall_tag = 0x50414348ca000000ull;
 
@@ -547,6 +548,124 @@ static void close_capsule(uint64_t capsule)
     if (capsule != 0) {
         (void)pacha_syscall0(PACHA_SYSCALL_CAPSULE_CLOSE, capsule);
     }
+}
+
+static int pacha_is_backend(kb_backend_t *backend)
+{
+    return backend != NULL && backend->ops == &pacha_ops;
+}
+
+static size_t count_pacha_residual_irqs(const kb_pachaos_capsule_backend_t *backend)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
+        if (backend->irqs[i].capsule != 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static size_t count_pacha_residual_dma_mappings(const kb_pachaos_capsule_backend_t *backend)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
+        if (backend->dma_mappings[i].size != 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static size_t count_pacha_residual_mmio_mappings(const kb_pachaos_capsule_backend_t *backend)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
+        if (backend->mmio_mappings[i].map_size != 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void print_pacha_residual_summary(
+    FILE *out,
+    const char *label,
+    size_t irqs,
+    size_t dma_mappings,
+    size_t mmio_mappings)
+{
+    if (out == NULL || (irqs == 0 && dma_mappings == 0 && mmio_mappings == 0)) {
+        return;
+    }
+    fprintf(
+        out,
+        "kobox-pachaos-cleanup: label=%s residual irqs=%zu dma_mappings=%zu mmio_mappings=%zu\n",
+        label != NULL ? label : "cleanup",
+        irqs,
+        dma_mappings,
+        mmio_mappings);
+}
+
+size_t kb_pachaos_capsule_report_residuals(kb_backend_t *backend, FILE *out, const char *label)
+{
+    if (!pacha_is_backend(backend)) {
+        return 0;
+    }
+
+    const kb_pachaos_capsule_backend_t *pacha = pacha_from_backend(backend);
+    const size_t irqs = count_pacha_residual_irqs(pacha);
+    const size_t dma_mappings = count_pacha_residual_dma_mappings(pacha);
+    const size_t mmio_mappings = count_pacha_residual_mmio_mappings(pacha);
+    print_pacha_residual_summary(out, label, irqs, dma_mappings, mmio_mappings);
+
+    if (out != NULL) {
+        for (size_t i = 0; i < KB_PACHAOS_IRQ_MAX; i++) {
+            const kb_irq_t *irq = &pacha->irqs[i];
+            if (irq->capsule == 0) {
+                continue;
+            }
+            fprintf(
+                out,
+                "kobox-pachaos-cleanup: residual irq slot=%zu capsule=0x%016" PRIx64 " vector=%u last_count=%" PRIu64 "\n",
+                i,
+                irq->capsule,
+                irq->vector,
+                irq->last_interrupt_count);
+        }
+        for (size_t i = 0; i < KB_PACHAOS_DMA_MAPPING_MAX; i++) {
+            const kb_pachaos_dma_mapping_t *mapping = &pacha->dma_mappings[i];
+            if (mapping->size == 0) {
+                continue;
+            }
+            fprintf(
+                out,
+                "kobox-pachaos-cleanup: residual dma slot=%zu iova=0x%016" PRIx64 " size=%" PRIu64 " mapped_size=%" PRIu64 " buffer=0x%016" PRIx64 " mapping=0x%016" PRIx64 "\n",
+                i,
+                mapping->iova,
+                mapping->size,
+                mapping->mapped_size,
+                mapping->buffer_capsule,
+                mapping->mapping_capsule);
+        }
+        for (size_t i = 0; i < KB_PACHAOS_MMIO_MAPPING_MAX; i++) {
+            const kb_pachaos_mmio_mapping_t *mapping = &pacha->mmio_mappings[i];
+            if (mapping->map_size == 0) {
+                continue;
+            }
+            fprintf(
+                out,
+                "kobox-pachaos-cleanup: residual mmio slot=%zu bar=%u capsule=0x%016" PRIx64 " addr=%p map=%p size=%" PRIu64 "\n",
+                i,
+                mapping->bar_index,
+                mapping->capsule,
+                mapping->region_addr,
+                mapping->map_addr,
+                mapping->map_size);
+        }
+    }
+
+    return irqs + dma_mappings + mmio_mappings;
 }
 
 static int pacha_device_is_nvme(kb_device_t *device)

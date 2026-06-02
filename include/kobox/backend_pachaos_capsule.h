@@ -13,6 +13,7 @@ kb_status_t kb_pachaos_capsule_parse_token(const char *text, uint64_t *out_token
 kb_status_t kb_pachaos_capsule_create(uint64_t device_capsule, kb_backend_t **out_backend);
 kb_status_t kb_pachaos_capsule_create_from_env(kb_backend_t **out_backend);
 kb_status_t kb_pachaos_capsule_dump_catalog(FILE *out);
+size_t kb_pachaos_capsule_report_residuals(kb_backend_t *backend, FILE *out, const char *label);
 
 #ifdef __cplusplus
 }

@@ -225,10 +225,15 @@ static void cleanup_all_irqs_for_backend(kb_backend_t *backend)
     kb_shim_set_backend(NULL);
 }
 
-static void destroy_backend_after_cleanup(kb_backend_t *backend)
+static int destroy_backend_after_cleanup(kb_backend_t *backend)
 {
+    size_t residuals = 0;
+    if (backend != NULL) {
+        residuals = kb_pachaos_capsule_report_residuals(backend, stderr, "pre-destroy");
+    }
     cleanup_all_irqs_for_backend(backend);
     kb_backend_destroy(backend);
+    return residuals == 0 ? 0 : 11;
 }
 
 static void configure_pachaos_driver_preference(const char *path)
@@ -540,7 +545,11 @@ int main(int argc, char **argv)
         kb_module_close(deps[i - 1].module);
         free(deps[i - 1].data);
     }
-    destroy_backend_after_cleanup(backend);
+    int cleanup_result = destroy_backend_after_cleanup(backend);
     free(data);
+    if (cleanup_result != 0) {
+        fprintf(stderr, "kobox cleanup residuals failed: %d\n", cleanup_result);
+        return cleanup_result;
+    }
     return 0;
 }
