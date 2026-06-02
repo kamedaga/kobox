@@ -3071,13 +3071,18 @@ static void *lookup_shim_symbol(const char *name)
     return 0;
 }
 
+static int symbol_name_pointer_is_valid(const char *name)
+{
+    return (uintptr_t)name >= 4096u;
+}
+
 static void *lookup_exported_symbol(const char *name)
 {
-    if (name == 0 || name[0] == '\0') {
+    if (!symbol_name_pointer_is_valid(name) || name[0] == '\0') {
         return 0;
     }
     for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
-        if (exported_symbols[i].name != 0 && strcmp(exported_symbols[i].name, name) == 0) {
+        if (symbol_name_pointer_is_valid(exported_symbols[i].name) && strcmp(exported_symbols[i].name, name) == 0) {
             return (void *)(uintptr_t)exported_symbols[i].address;
         }
     }
@@ -3370,7 +3375,7 @@ static kb_status_t register_module_exports(kb_module_t *module)
                 return status;
             }
             if (symbol.binding != KB_ELF_STB_GLOBAL || symbol.section_index == KB_ELF_SHN_UNDEF ||
-                symbol.name == 0 || symbol.name[0] == '\0')
+                !symbol_name_pointer_is_valid(symbol.name) || symbol.name[0] == '\0')
             {
                 continue;
             }
@@ -3383,7 +3388,7 @@ static kb_status_t register_module_exports(kb_module_t *module)
 
             int already_registered = 0;
             for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
-                if (exported_symbols[i].name != 0 && strcmp(exported_symbols[i].name, symbol.name) == 0) {
+                if (symbol_name_pointer_is_valid(exported_symbols[i].name) && strcmp(exported_symbols[i].name, symbol.name) == 0) {
                     already_registered = 1;
                     break;
                 }
