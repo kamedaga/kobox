@@ -419,7 +419,7 @@ void kb_usb_observe_linux_device(void *dev)
     }
 
     void *device_type = usb_read_ptr_field(dev, KB_LINUX_6_8_DEVICE_TYPE_OFFSET);
-    if (device_type == NULL) {
+    if ((uintptr_t)device_type < 4096u) {
         return;
     }
 
