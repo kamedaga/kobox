@@ -377,14 +377,13 @@ int kb_pci_irq_vector(void *dev, unsigned int nr)
     return (int)nr;
 }
 
-int kb_pci_request_irq(
+static int kb_pci_request_irq_impl(
     void *dev,
     unsigned int nr,
     int (*handler)(int, void *),
     int (*thread_fn)(int, void *),
     void *dev_id,
-    const char *fmt,
-    ...)
+    const char *fmt)
 {
     (void)fmt;
     int irq = kb_pci_irq_vector(dev, nr);
@@ -397,6 +396,29 @@ int kb_pci_request_irq(
         fprintf(stderr, "kobox pci: request_irq nr=%u irq=%d dev_id=%p result=%d\n", nr, irq, dev_id, result);
     }
     return result;
+}
+
+int kb_pci_request_irq_shim(
+    void *dev,
+    unsigned int nr,
+    int (*handler)(int, void *),
+    int (*thread_fn)(int, void *),
+    void *dev_id,
+    const char *fmt)
+{
+    return kb_pci_request_irq_impl(dev, nr, handler, thread_fn, dev_id, fmt);
+}
+
+int kb_pci_request_irq(
+    void *dev,
+    unsigned int nr,
+    int (*handler)(int, void *),
+    int (*thread_fn)(int, void *),
+    void *dev_id,
+    const char *fmt,
+    ...)
+{
+    return kb_pci_request_irq_impl(dev, nr, handler, thread_fn, dev_id, fmt);
 }
 
 void kb_pci_free_irq(void *dev, unsigned int nr, void *dev_id)

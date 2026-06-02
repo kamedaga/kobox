@@ -1982,7 +1982,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"pci_match_id", (void *)(uintptr_t)&kb_pci_match_id},
     {"pci_read_config_word", (void *)(uintptr_t)&kb_pci_read_config_word},
     {"pci_release_selected_regions", (void *)(uintptr_t)&kb_pci_release_selected_regions},
-    {"pci_request_irq", (void *)(uintptr_t)&kb_pci_request_irq},
+    {"pci_request_irq", (void *)(uintptr_t)&kb_pci_request_irq_shim},
     {"pci_request_selected_regions", (void *)(uintptr_t)&kb_pci_request_selected_regions},
     {"pci_restore_state", (void *)(uintptr_t)&kb_return_zero},
     {"pci_save_state", (void *)(uintptr_t)&kb_return_zero},

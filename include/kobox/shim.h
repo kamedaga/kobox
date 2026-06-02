@@ -219,6 +219,7 @@ int kb_pci_alloc_irq_vectors_affinity(void *dev, unsigned int min_vecs, unsigned
 void kb_pci_free_irq_vectors(void *dev);
 int kb_pci_irq_vector(void *dev, unsigned int nr);
 int kb_pci_request_irq(void *dev, unsigned int nr, int (*handler)(int, void *), int (*thread_fn)(int, void *), void *dev_id, const char *fmt, ...);
+int kb_pci_request_irq_shim(void *dev, unsigned int nr, int (*handler)(int, void *), int (*thread_fn)(int, void *), void *dev_id, const char *fmt);
 void kb_pci_free_irq(void *dev, unsigned int nr, void *dev_id);
 int kb_pci_enable_device_mem(void *dev);
 int kb_pci_request_selected_regions(void *dev, int bars, const char *name);
