@@ -328,6 +328,7 @@ static int handle_any_irq(uint64_t timeout_ns, int run_work)
             irq_trampoline(entry);
         }
         if (xhci_pending) {
+            (void)kb_usb_synthesize_connected_storage();
             kb_pci_xhci_ack_pending();
         }
         if (trace_irq_enabled()) {

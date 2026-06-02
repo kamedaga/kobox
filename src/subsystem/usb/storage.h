@@ -88,6 +88,11 @@ void kb_usb_storage_subsystem_note_driver_deregistered(void *driver);
 void kb_usb_storage_subsystem_note_scsi_host(void *host, void *host_private, void *dev, void *dma_dev);
 void kb_usb_storage_subsystem_note_scsi_scan(void *host);
 void kb_usb_storage_subsystem_remove_scsi_host(void *host);
+int kb_usb_storage_subsystem_synthesize_mass_storage(
+    void *udev,
+    void *interface,
+    void *linux_device,
+    void *parent_linux_device);
 int kb_usb_storage_subsystem_snapshot(const void *interface, kb_usb_storage_snapshot_t *out_snapshot);
 int kb_usb_storage_subsystem_snapshot_by_disk(const void *disk, kb_usb_storage_snapshot_t *out_snapshot);
 size_t kb_usb_storage_subsystem_count(void);

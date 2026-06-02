@@ -627,6 +627,35 @@ void kb_usb_storage_subsystem_remove_scsi_host(void *host)
     record->snapshot.scsi_host_private = NULL;
 }
 
+int kb_usb_storage_subsystem_synthesize_mass_storage(
+    void *udev,
+    void *interface,
+    void *linux_device,
+    void *parent_linux_device)
+{
+    if (interface == NULL) {
+        return -22;
+    }
+    kb_usb_storage_record_t *record = record_for_interface(interface);
+    if (record == NULL) {
+        return -12;
+    }
+    record->snapshot.udev = udev;
+    record->snapshot.interface = interface;
+    record->snapshot.linux_device = linux_device;
+    record->snapshot.parent_linux_device = parent_linux_device;
+    record->snapshot.interface_number = 0;
+    record->snapshot.subclass = 0x06;
+    record->snapshot.protocol = 0x50;
+    record->snapshot.bulk_in_endpoint = 0x81;
+    record->snapshot.bulk_out_endpoint = 0x02;
+    record->snapshot.medium_present = 1;
+    if (storage_driver_registered || record->snapshot.driver != NULL || record->snapshot.driver_data != NULL) {
+        return storage_ensure_block(record);
+    }
+    return 0;
+}
+
 int kb_usb_storage_subsystem_snapshot(const void *interface, kb_usb_storage_snapshot_t *out_snapshot)
 {
     kb_usb_storage_record_t *record = record_find_by_interface(interface);

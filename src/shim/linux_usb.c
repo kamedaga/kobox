@@ -1,5 +1,6 @@
 #include "kobox/shim.h"
 #include "subsystem/dma/dma.h"
+#include "subsystem/usb/storage.h"
 #include "subsystem/usb/usb.h"
 
 #include <stdarg.h>
@@ -69,6 +70,10 @@ static unsigned int usb_num_online_cpus = 1;
 static unsigned char usb_pcpu_hot[256];
 static int usb_pm_suspend_target_state;
 static int usb_event_injection_runtime_allowed;
+static unsigned char usb_synthetic_storage_udev[64];
+static unsigned char usb_synthetic_storage_interface[64];
+static unsigned char usb_synthetic_storage_device[64];
+static unsigned char usb_synthetic_storage_parent_device[64];
 
 typedef struct usb_hcd_port_state {
     void *hcd;
@@ -956,6 +961,18 @@ int kb_usb_poll_root_hubs(void)
     int polled = 0;
     (void)kb_usb_subsystem_for_each_hcd(usb_poll_root_hub_record, &polled);
     return polled;
+}
+
+int kb_usb_synthesize_connected_storage(void)
+{
+    if (!usb_event_injection_enabled()) {
+        return 0;
+    }
+    return kb_usb_storage_subsystem_synthesize_mass_storage(
+        usb_synthetic_storage_udev,
+        usb_synthetic_storage_interface,
+        usb_synthetic_storage_device,
+        usb_synthetic_storage_parent_device);
 }
 
 int kb_usb_add_hcd(void *hcd, unsigned int irqnum, unsigned long irqflags)
