@@ -20,7 +20,10 @@ enum {
     KB_PACHAOS_MMIO_MAPPING_MAX = 32,
     KB_PACHAOS_IRQ_MAX = 32,
     KB_PACHAOS_PCI_CONFIG_SIZE = 256,
+    KB_PACHAOS_MMIO_MAP_ATTEMPTS = 8,
 };
+
+static const uintptr_t KB_PACHAOS_MIN_MMIO_USER_VA = UINT64_C(0x100000000);
 
 enum {
     PACHA_SYSCALL_CAPSULE_QUERY = 0x70,
@@ -287,6 +290,43 @@ static uint64_t page_size_u64(void)
 {
     long value = sysconf(_SC_PAGESIZE);
     return value > 0 ? (uint64_t)value : 4096u;
+}
+
+static int pacha_trace_enabled(void)
+{
+    return getenv("KOBOX_PACHAOS_LOG") != NULL;
+}
+
+static int pacha_user_mmio_va_valid(const void *addr, uint64_t size)
+{
+    if (addr == NULL || addr == MAP_FAILED || size == 0 || size > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    const uintptr_t value = (uintptr_t)addr;
+    const uint64_t page_size = page_size_u64();
+    if ((value & (uintptr_t)(page_size - 1u)) != 0) {
+        return 0;
+    }
+    if (value < KB_PACHAOS_MIN_MMIO_USER_VA) {
+        return 0;
+    }
+    if ((uint64_t)value > UINT64_MAX - size) {
+        return 0;
+    }
+    return 1;
+}
+
+static void pacha_trace_bad_mmio_va(const char *label, const void *addr, uint64_t size)
+{
+    if (!pacha_trace_enabled()) {
+        return;
+    }
+    fprintf(
+        stderr,
+        "kobox-pachaos: %s rejected mmio va=%p size=0x%" PRIx64 "\n",
+        label,
+        addr,
+        size);
 }
 
 static int dma_range_crosses_page(const void *ptr, uint64_t size)
@@ -845,9 +885,25 @@ static kb_status_t pacha_map_bar(kb_device_t *device, unsigned bar_index, kb_mmi
         return KB_ERR_INVALID;
     }
 
-    void *map_addr = mmap(NULL, (size_t)map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (map_addr == MAP_FAILED) {
-        return KB_ERR_NOMEM;
+    void *map_addr = MAP_FAILED;
+    kb_status_t map_status = KB_ERR_NOMEM;
+    for (unsigned attempt = 0; attempt < KB_PACHAOS_MMIO_MAP_ATTEMPTS; attempt++) {
+        map_addr = mmap(NULL, (size_t)map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (map_addr == MAP_FAILED) {
+            map_status = KB_ERR_NOMEM;
+            break;
+        }
+        if (pacha_user_mmio_va_valid(map_addr, map_size)) {
+            map_status = KB_OK;
+            break;
+        }
+        pacha_trace_bad_mmio_va("mmap", map_addr, map_size);
+        munmap(map_addr, (size_t)map_size);
+        map_addr = MAP_FAILED;
+        map_status = KB_ERR_IO;
+    }
+    if (map_status != KB_OK) {
+        return map_status;
     }
     long child = pacha_syscall5(
         PACHA_SYSCALL_CAPSULE_DERIVE_MMIO,
@@ -859,6 +915,17 @@ static kb_status_t pacha_map_bar(kb_device_t *device, unsigned bar_index, kb_mmi
     if (!token_has_kind((uint64_t)child, PACHA_CAPSULE_KIND_MMIO)) {
         munmap(map_addr, (size_t)map_size);
         return pacha_status_from_return(child);
+    }
+
+    uint64_t snapshot[PACHA_SNAPSHOT_WORDS];
+    kb_status_t snapshot_status = capsule_query((uint64_t)child, snapshot);
+    if (snapshot_status != KB_OK ||
+        snapshot[PACHA_SNAPSHOT_KIND] != PACHA_CAPSULE_KIND_MMIO ||
+        snapshot[PACHA_SNAPSHOT_USER_VA] != (uint64_t)(uintptr_t)map_addr ||
+        snapshot[PACHA_SNAPSHOT_SIZE] < map_size) {
+        close_capsule((uint64_t)child);
+        munmap(map_addr, (size_t)map_size);
+        return snapshot_status == KB_OK ? KB_ERR_IO : snapshot_status;
     }
 
     void *region_addr = (void *)((unsigned char *)map_addr + page_offset);
@@ -925,7 +992,11 @@ static kb_status_t pacha_configure_msix_entry(kb_device_t *device, unsigned entr
         return status;
     }
 
-    if (entry_offset + KB_PCI_MSIX_ENTRY_SIZE > region.size) {
+    if (entry_offset > UINT64_MAX - KB_PCI_MSIX_ENTRY_SIZE ||
+        entry_offset + KB_PCI_MSIX_ENTRY_SIZE > region.size ||
+        (uintptr_t)region.addr < KB_PACHAOS_MIN_MMIO_USER_VA ||
+        (uint64_t)(uintptr_t)region.addr > UINT64_MAX - entry_offset - KB_PCI_MSIX_ENTRY_SIZE) {
+        pacha_trace_bad_mmio_va("msix", region.addr, region.size);
         pacha_unmap_bar(device, &region);
         return KB_ERR_INVALID;
     }
