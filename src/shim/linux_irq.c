@@ -257,8 +257,14 @@ int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
             return -95;
         }
 
+        int (*handler)(int, void *) = entry->handler;
+        int (*thread_fn)(int, void *) = entry->thread_fn;
+        entry->handler = NULL;
+        entry->thread_fn = NULL;
         kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
         int xhci_pending = kb_pci_xhci_irq_pending();
+        entry->handler = handler;
+        entry->thread_fn = thread_fn;
         if (status == KB_OK || xhci_pending) {
             irq_trampoline(entry);
         }
@@ -281,8 +287,14 @@ static int handle_any_irq(uint64_t timeout_ns, int run_work)
         return -95;
     }
     for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
+        int (*handler)(int, void *) = entry->handler;
+        int (*thread_fn)(int, void *) = entry->thread_fn;
+        entry->handler = NULL;
+        entry->thread_fn = NULL;
         kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
         int xhci_pending = kb_pci_xhci_irq_pending();
+        entry->handler = handler;
+        entry->thread_fn = thread_fn;
         if (status == KB_OK || xhci_pending) {
             irq_trampoline(entry);
         }
