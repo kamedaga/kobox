@@ -1,24 +1,24 @@
-# kobox -  ko In The Box
+# kobox
 
-Linux の `.ko` カーネルモジュールを、libc ベースの shim と OS ごとの backend によって userspace で動かす runtime です。
+> Linux の `.ko` カーネルモジュールをユーザーランドで動かす — ポータブル・libc ベース・カーネル改変不要。
 
-## kobox とは？
+![Language: C11](https://img.shields.io/badge/language-C11-blue?style=flat-square&logo=c)
+![Build: CMake](https://img.shields.io/badge/build-CMake-064F8C?style=flat-square&logo=cmake)
+![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)
+![Status](https://img.shields.io/badge/status-active-brightgreen?style=flat-square)
 
-kobox は任意のOSに`.ko` binaryを動かすプロジェクトおよび技術です。
+kobox はコンパイル済みの Linux カーネルモジュール (`.ko`) をユーザーランドプロセスとして動かすランタイムです。  
+Linux カーネルシンボルは互換 shim 層で解決して、デバイスアクセスは OS ごとの backend (Linux VFIO / PachaOS Capsule など) に任せる構成になっています。
 
-## ターゲット
-
-・Linux vfio(QEMU Ubuntuおよび実機のUbuntu24.04.4で動作確認)
-・PachaOS Capsule(QEMU PachaOSでの検証 実機はまだ)
-
+---
 
 ## 設計目標
 
-- 既存の `.ko` binary を再コンパイルなしで動かす。
-- shimはlibc依存のみ。
-- OS 固有の device access は backend API の内側に。
-- Linux、PachaOS、OpenBSD の対応を shim の書き換えではなく backend 実装にする。
-- portable backend を増やす前に、Linux native driver との差分と overhead を測る。
+- 既存の `.ko` バイナリを再コンパイルなしで動かす
+- shim 層は libc だけに依存して移植性を保つ
+- OS 固有のデバイスアクセスは backend API の内側に閉じ込める
+- Linux・PachaOS・OpenBSD 対応は shim を書き換えるのではなく backend を追加する形で
+- ポータビリティを語る前に、Linux ネイティブドライバとのオーバーヘッドをちゃんと測る
 
 ## アーキテクチャ
 
@@ -33,28 +33,39 @@ libc-based Linux shim layer
         | kobox backend API only
         v
 OS backend
-  linux_vfio / pachaos / FreeBSD / seL4...
+  linux_vfio / pachaos_capsule / linux_mock / ...
 ```
 
-shim 層はあえて libc と標準的な userspace primitive を使います。`malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics などを使うことで実装量を減らし、libc が使える target OS に広げやすくします。
+shim 層はわざと libc と普通のユーザーランド primitive (`malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics) を使っています。内部でカーネルを再実装するつもりはなくて、libc が使える OS ならどこでも動かせるようにします。
 
-backend は OS 固有の device access だけを担当します。
+backend が担当するのは OS 固有のデバイスアクセスだけ:
 
-- device enumeration
-- PCI config access
-- BAR/MMIO mapping
-- DMA allocation / mapping
-- IRQ delivery
-- time, logging, event integration
+- デバイス列挙
+- PCI config アクセス
+- BAR / MMIO マッピング
+- DMA バッファのアロケーションとマッピング
+- IRQ デリバリー
+- 時刻・ログ・イベント統合
+
+---
 
 ## 現在のステータス
 
-NVMeおよびUSBをLinux vfioバックエンドで動かすことに成功していて、NVMeからPachaOs Capsuleバックエンドで動かすことに挑戦しています。(安定はしないがread/writeが成功)
+NVMe と USB は Linux VFIO・PachaOS Capsule の両 backend でエンドツーエンド動作済みです。
 
+| Driver | Linux VFIO | PachaOS Capsule |
+|---|---|---|
+| NVMe | 動作中 | 動作中 |
+| USB Storage (xHCI / BOT / SCSI) | 動作中 | 動作中 |
+| Network (e1000e / r8169) | 進行中 | — |
+| SATA (AHCI) | 予定 | — |
+| NVIDIA GPU | `init_module` 通過まで確認済み | — |
+
+---
 
 ## Build
 
-kobox は C11 で書き、CMake と clang で build します。
+C11 で書いていて、CMake と clang が必要です。
 
 ```sh
 cmake -S . -B .artifacts/build -DCMAKE_C_COMPILER=clang
@@ -62,15 +73,35 @@ cmake --build .artifacts/build
 ctest --test-dir .artifacts/build
 ```
 
-## 代表的な対応ドライバ
+---
 
-1. NVMe — 対応完了
-2. USB (xHCI) — 対応完了 v1: HID + Mass Storage(BOT/SCSI/block I/O)、multi-device 
-3. Network (e1000e / r8169) — PCI + DMA shim を流用
-4. SATA (AHCI) — NVMe とストレージ shim を共通化
-5. NVIDIA GPU — 一部重要な関数が未実装だが初期化に成功
+## PachaOS Capsule バックエンド
 
+`pachaos_capsule` は PachaOS の `DeviceCapsule` トークンから kobox backend を作って、Capsule 操作は PachaOS ネイティブ syscall で行います。
 
+```sh
+KOBOX_PACHAOS_DEVICE_CAPSULE=0xca12000000000001 kobox-ls-devices pachaos
+kobox-run --backend=pachaos --capsule=0xca12000000000001 run driver.ko
+```
+
+PachaOS Capsule ABI に config/BAR 情報取得が入るまでは、環境変数で PCI ID と BAR サイズを渡せます:
+
+```sh
+KOBOX_PACHAOS_PCI_ID=8086:10d3:02:00:00
+KOBOX_PACHAOS_BAR0_SIZE=0x1000
+```
+
+---
+
+## ロードマップ
+
+1. NVMe — 完了
+2. USB (xHCI) — 完了: HID + Mass Storage (BOT / SCSI / block I/O)、マルチデバイス対応
+3. Network (e1000e / r8169) — PCI + DMA shim を流用して進行中
+4. SATA (AHCI) — NVMe とストレージ shim を共通化して対応予定
+5. NVIDIA GPU — 最終ボス (`init_module` まで通った)
+
+---
 
 ## ライセンス
 
