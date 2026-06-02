@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include "kobox/shim.h"
 #include "shim/linux_block.h"
 #include "shim/linux_nvme.h"
@@ -11,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <time.h>
+#endif
 
 kb_backend_t *kb_shim_current_backend(void);
 
@@ -159,6 +166,17 @@ static void nvme_completion_poll_pause(void)
 {
     for (volatile unsigned int i = 0; i < KB_NVME_EXECUTE_POLL_PAUSE_ITERS; i++) {
     }
+}
+
+static void nvme_completion_poll_yield(void)
+{
+#if !defined(_WIN32)
+    const struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 50000,
+    };
+    (void)nanosleep(&delay, NULL);
+#endif
 }
 
 static int nvme_completion_matches_request(
@@ -891,6 +909,7 @@ static int nvme_block_complete_execute(void *request)
         }
         if (poll_bar != NULL) {
             (void)mmio_read32(poll_bar, KB_NVME_REG_CSTS);
+            nvme_completion_poll_yield();
         }
         nvme_completion_poll_pause();
     }

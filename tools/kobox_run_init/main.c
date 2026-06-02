@@ -36,11 +36,13 @@ typedef struct loaded_input_module {
     kb_module_t *module;
 } loaded_input_module_t;
 
-#if !defined(_WIN32) && defined(__GLIBC__)
+#if !defined(_WIN32)
 static void crash_handler(int signo, siginfo_t *info, void *ucontext)
 {
+#if defined(__GLIBC__)
     void *frames[64];
     int count = backtrace(frames, 64);
+#endif
     const char message[] = "kobox-run: crash while executing module\n";
     (void)write(STDERR_FILENO, message, sizeof(message) - 1);
 #if defined(__x86_64__)
@@ -75,7 +77,9 @@ static void crash_handler(int signo, siginfo_t *info, void *ucontext)
         dprintf(STDERR_FILENO, "kobox-run: signal=%d addr=%p\n", signo, info->si_addr);
     }
 #endif
+#if defined(__GLIBC__)
     backtrace_symbols_fd(frames, count, STDERR_FILENO);
+#endif
     signal(signo, SIG_DFL);
     raise(signo);
 }
