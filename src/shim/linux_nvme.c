@@ -812,6 +812,9 @@ static int nvme_block_complete_execute(void *request)
         return -22;
     }
 
+    atomic_thread_fence(memory_order_seq_cst);
+    nvme_completion_poll_yield();
+
     unsigned char *nvmeq = kb_linux_block_request_driver_data(request);
     if (nvmeq == NULL) {
         return -22;
