@@ -205,6 +205,25 @@ static void destroy_backend_after_cleanup(kb_backend_t *backend)
     kb_backend_destroy(backend);
 }
 
+static void configure_pachaos_driver_preference(const char *path)
+{
+#if !defined(_WIN32)
+    if (path == NULL || getenv("KOBOX_PACHAOS_PREFERRED_CLASS") != NULL) {
+        return;
+    }
+    if (strstr(path, "nvme") != NULL || strstr(path, "NVME") != NULL) {
+        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0108", 0);
+        return;
+    }
+    if (strstr(path, "xhci") != NULL || strstr(path, "XHCI") != NULL ||
+        strstr(path, "usb") != NULL || strstr(path, "USB") != NULL) {
+        (void)setenv("KOBOX_PACHAOS_PREFERRED_CLASS", "0x0c03", 0);
+    }
+#else
+    (void)path;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     install_crash_handler();
@@ -279,6 +298,7 @@ int main(int argc, char **argv)
         }
         status = kb_linux_vfio_create(pci_bdf, &backend);
     } else if (strcmp(backend_name, "pachaos") == 0 || strcmp(backend_name, "pachaos_capsule") == 0) {
+        configure_pachaos_driver_preference(path);
         if (capsule_text != NULL) {
             uint64_t capsule = 0;
             status = kb_pachaos_capsule_parse_token(capsule_text, &capsule);

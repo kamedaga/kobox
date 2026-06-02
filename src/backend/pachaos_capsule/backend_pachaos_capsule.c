@@ -37,6 +37,7 @@ enum {
     PACHA_SYSCALL_CAPSULE_PCI_CONFIG_WRITE = 0x7a,
     PACHA_SYSCALL_CAPSULE_PCI_BAR_INFO = 0x7b,
     PACHA_SYSCALL_CAPSULE_IRQ_POLL = 0x7c,
+    PACHA_SYSCALL_MAP_VM_OBJECT = 0x28,
 };
 
 enum {
@@ -84,9 +85,13 @@ enum {
     PACHA_DEVICE_INTERRUPT_VECTOR = 0x41,
     PACHA_NVME_REG_CC = 0x14,
     PACHA_NVME_REG_CSTS = 0x1c,
+    KB_PACHAOS_DEVICE_CATALOG_MAGIC = 0x44455643,
+    KB_PACHAOS_DEVICE_CATALOG_VERSION = 1,
+    KB_PACHAOS_DEVICE_CATALOG_MAX_ENTRIES = 23,
 };
 
 static const uint32_t PACHA_X86_MSI_ADDRESS_LOW = UINT32_C(0xFEE00000);
+static const uintptr_t KB_PACHAOS_DEVICE_CATALOG_VA = UINT64_C(0x26700000);
 
 enum {
     KB_IRQ_BACKEND_KIND_SHIFT = 30,
@@ -117,6 +122,39 @@ enum {
 };
 
 typedef struct kb_pachaos_capsule_backend kb_pachaos_capsule_backend_t;
+
+typedef struct kb_pachaos_device_catalog_entry {
+    uint64_t present;
+    uint64_t kind;
+    uint64_t vendor_id;
+    uint64_t device_id;
+    uint64_t subsystem_id;
+    uint64_t resource_id;
+    uint64_t common_page_paddr;
+    uint64_t notify_page_paddr;
+    uint64_t isr_page_paddr;
+    uint64_t device_page_paddr;
+    uint64_t common_page_offset;
+    uint64_t notify_page_offset;
+    uint64_t isr_page_offset;
+    uint64_t device_page_offset;
+    uint64_t notify_off_multiplier;
+    uint64_t iommu_token;
+    uint64_t queue0_submit_token;
+    uint64_t queue0_notify_token;
+    uint64_t queue1_submit_token;
+    uint64_t queue1_notify_token;
+    uint64_t command_token;
+    uint64_t device_capsule_token;
+} kb_pachaos_device_catalog_entry_t;
+
+typedef struct kb_pachaos_device_catalog_page {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t entry_count;
+    uint64_t reserved0;
+    kb_pachaos_device_catalog_entry_t entries[KB_PACHAOS_DEVICE_CATALOG_MAX_ENTRIES];
+} kb_pachaos_device_catalog_page_t;
 
 typedef struct kb_pachaos_mmio_mapping {
     void *map_addr;
@@ -247,6 +285,11 @@ static int token_has_kind(uint64_t token, uint64_t kind)
     return ((token >> 56) == 0xcau) &&
         (((token >> 52) & 0x0fu) == 1u) &&
         (((token >> 48) & 0x0fu) == kind);
+}
+
+static int is_vm_object_token(uint64_t token)
+{
+    return (token & (1ull << 62)) != 0 && (token & ~(1ull << 62)) != 0;
 }
 
 static kb_status_t capsule_query(uint64_t token, uint64_t words[PACHA_SNAPSHOT_WORDS])
@@ -1446,6 +1489,114 @@ kb_status_t kb_pachaos_capsule_parse_token(const char *text, uint64_t *out_token
     return KB_OK;
 }
 
+static kb_status_t parse_u64_text(const char *text, uint64_t *out_value)
+{
+    if (text == NULL || text[0] == '\0' || out_value == NULL) {
+        return KB_ERR_INVALID;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 0);
+    if (errno != 0 || end == text || *end != '\0') {
+        return KB_ERR_INVALID;
+    }
+    *out_value = (uint64_t)value;
+    return KB_OK;
+}
+
+static int preferred_pci_class(uint8_t *out_class, uint8_t *out_subclass, uint8_t *out_prog_if, int *out_has_prog_if)
+{
+    const char *text = getenv("KOBOX_PACHAOS_PREFERRED_CLASS");
+    uint64_t value = 0;
+    if (parse_u64_text(text, &value) != KB_OK) {
+        return 0;
+    }
+    if (value <= 0xffffu) {
+        *out_class = (uint8_t)((value >> 8) & 0xffu);
+        *out_subclass = (uint8_t)(value & 0xffu);
+        *out_prog_if = 0;
+        *out_has_prog_if = 0;
+        return 1;
+    }
+    if (value <= 0xffffffu) {
+        *out_class = (uint8_t)((value >> 16) & 0xffu);
+        *out_subclass = (uint8_t)((value >> 8) & 0xffu);
+        *out_prog_if = (uint8_t)(value & 0xffu);
+        *out_has_prog_if = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int backend_matches_preferred_class(kb_backend_t *backend)
+{
+    uint8_t class_code = 0;
+    uint8_t subclass = 0;
+    uint8_t prog_if = 0;
+    int has_prog_if = 0;
+    if (!preferred_pci_class(&class_code, &subclass, &prog_if, &has_prog_if)) {
+        return 1;
+    }
+
+    kb_pachaos_capsule_backend_t *pacha = pacha_from_backend(backend);
+    uint8_t class_bytes[3] = {0};
+    if (pacha_pci_config_read(&pacha->device, 0x09, class_bytes, sizeof(class_bytes)) != KB_OK) {
+        return 0;
+    }
+    if (class_bytes[2] != class_code || class_bytes[1] != subclass) {
+        return 0;
+    }
+    return !has_prog_if || class_bytes[0] == prog_if;
+}
+
+static kb_status_t create_from_catalog_token(uint64_t catalog_token, kb_backend_t **out_backend)
+{
+    if (out_backend == NULL || !is_vm_object_token(catalog_token)) {
+        return KB_ERR_INVALID;
+    }
+
+    long map_status = pacha_syscall3(
+        PACHA_SYSCALL_MAP_VM_OBJECT,
+        catalog_token,
+        (uint64_t)KB_PACHAOS_DEVICE_CATALOG_VA,
+        0);
+    if (map_status != 0) {
+        return pacha_status_from_return(map_status);
+    }
+
+    const kb_pachaos_device_catalog_page_t *page =
+        (const kb_pachaos_device_catalog_page_t *)KB_PACHAOS_DEVICE_CATALOG_VA;
+    if (page->magic != KB_PACHAOS_DEVICE_CATALOG_MAGIC ||
+        page->version != KB_PACHAOS_DEVICE_CATALOG_VERSION) {
+        return KB_ERR_INVALID;
+    }
+
+    kb_status_t last_status = KB_ERR_NOT_FOUND;
+    size_t count = page->entry_count;
+    if (count > KB_PACHAOS_DEVICE_CATALOG_MAX_ENTRIES) {
+        count = KB_PACHAOS_DEVICE_CATALOG_MAX_ENTRIES;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const kb_pachaos_device_catalog_entry_t *entry = &page->entries[i];
+        if (entry->present == 0 || !token_has_kind(entry->device_capsule_token, PACHA_CAPSULE_KIND_DEVICE)) {
+            continue;
+        }
+
+        kb_backend_t *candidate = NULL;
+        kb_status_t status = kb_pachaos_capsule_create(entry->device_capsule_token, &candidate);
+        if (status != KB_OK) {
+            last_status = status;
+            continue;
+        }
+        if (backend_matches_preferred_class(candidate)) {
+            *out_backend = candidate;
+            return KB_OK;
+        }
+        kb_backend_destroy(candidate);
+    }
+    return last_status;
+}
+
 kb_status_t kb_pachaos_capsule_create(uint64_t device_capsule, kb_backend_t **out_backend)
 {
     if (out_backend == NULL || !token_has_kind(device_capsule, PACHA_CAPSULE_KIND_DEVICE)) {
@@ -1480,6 +1631,21 @@ kb_status_t kb_pachaos_capsule_create(uint64_t device_capsule, kb_backend_t **ou
 
 kb_status_t kb_pachaos_capsule_create_from_env(kb_backend_t **out_backend)
 {
+    const char *catalog_text = getenv("PACHA_EXEC_DEVICE_CATALOG");
+    if (catalog_text == NULL || catalog_text[0] == '\0') {
+        catalog_text = getenv("KOBOX_PACHAOS_DEVICE_CATALOG");
+    }
+    if (catalog_text != NULL && catalog_text[0] != '\0') {
+        uint64_t catalog_token = 0;
+        kb_status_t catalog_status = parse_u64_text(catalog_text, &catalog_token);
+        if (catalog_status == KB_OK) {
+            catalog_status = create_from_catalog_token(catalog_token, out_backend);
+        }
+        if (catalog_status == KB_OK) {
+            return KB_OK;
+        }
+    }
+
     const char *text = getenv("KOBOX_PACHAOS_DEVICE_CAPSULE");
     uint64_t token = 0;
     kb_status_t status = kb_pachaos_capsule_parse_token(text, &token);
