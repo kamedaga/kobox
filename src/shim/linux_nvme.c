@@ -72,6 +72,10 @@ static void *tracked_admin_tag_set;
 static unsigned char *tracked_admin_nvmeq;
 static unsigned char *tracked_io_nvmeq;
 static unsigned int tracked_io_irq_waits;
+static uint64_t recreated_admin_sq_dma;
+static uint64_t recreated_admin_cq_dma;
+static uint64_t recreated_io_sq_dma;
+static uint64_t recreated_io_cq_dma;
 
 static uint16_t read_u16(const void *ptr)
 {
@@ -608,6 +612,26 @@ static void nvme_dma_unmap_existing(uint64_t dma_addr, uint64_t size)
         KB_DMA_BIDIRECTIONAL);
 }
 
+static void nvme_release_recreated_queue_mappings(void)
+{
+    if (recreated_io_cq_dma != 0) {
+        nvme_dma_unmap_existing(recreated_io_cq_dma, KB_NVME_IO_QUEUE_DEPTH * 16u);
+        recreated_io_cq_dma = 0;
+    }
+    if (recreated_io_sq_dma != 0) {
+        nvme_dma_unmap_existing(recreated_io_sq_dma, KB_NVME_IO_QUEUE_DEPTH * 64u);
+        recreated_io_sq_dma = 0;
+    }
+    if (recreated_admin_cq_dma != 0) {
+        nvme_dma_unmap_existing(recreated_admin_cq_dma, KB_NVME_ADMIN_QUEUE_DEPTH * 16u);
+        recreated_admin_cq_dma = 0;
+    }
+    if (recreated_admin_sq_dma != 0) {
+        nvme_dma_unmap_existing(recreated_admin_sq_dma, KB_NVME_ADMIN_QUEUE_DEPTH * 64u);
+        recreated_admin_sq_dma = 0;
+    }
+}
+
 static int nvme_reset_controller_and_recreate_io_queue(void)
 {
     if (tracked_admin_nvmeq == NULL || tracked_io_nvmeq == NULL) {
@@ -631,6 +655,7 @@ static int nvme_reset_controller_and_recreate_io_queue(void)
     nvme_reset_queue_state(tracked_admin_nvmeq);
     nvme_reset_queue_state(tracked_io_nvmeq);
     nvme_reset_dbbuf_shadow();
+    nvme_release_recreated_queue_mappings();
 
     unsigned char *admin_sq = read_ptr(tracked_admin_nvmeq + KB_NVME_QUEUE_SQ_OFFSET);
     unsigned char *admin_cq = read_ptr(tracked_admin_nvmeq + KB_NVME_QUEUE_CQ_OFFSET);
@@ -694,6 +719,18 @@ static int nvme_reset_controller_and_recreate_io_queue(void)
     }
     if (result == 0) {
         result = nvme_submit_admin_dbbuf_config(tracked_admin_nvmeq);
+    }
+
+    if (result == 0) {
+        recreated_admin_sq_dma = admin_sq_dma;
+        recreated_admin_cq_dma = admin_cq_dma;
+        recreated_io_sq_dma = io_sq_dma;
+        recreated_io_cq_dma = io_cq_dma;
+    } else {
+        nvme_dma_unmap_existing(io_cq_dma, KB_NVME_IO_QUEUE_DEPTH * 16u);
+        nvme_dma_unmap_existing(io_sq_dma, KB_NVME_IO_QUEUE_DEPTH * 64u);
+        nvme_dma_unmap_existing(admin_cq_dma, KB_NVME_ADMIN_QUEUE_DEPTH * 16u);
+        nvme_dma_unmap_existing(admin_sq_dma, KB_NVME_ADMIN_QUEUE_DEPTH * 64u);
     }
 
     if (trace_nvme_enabled()) {
@@ -773,6 +810,7 @@ int kb_nvme_io_smoke(void)
         if (result != 0) {
             fprintf(stderr, "kobox nvme io smoke: read failed lba=%llu blocks=%u status=%d\n",
                 (unsigned long long)cases[i].lba, cases[i].blocks, result);
+            nvme_release_recreated_queue_mappings();
             free(write_buffer);
             free(read_buffer);
             return result;
@@ -780,6 +818,7 @@ int kb_nvme_io_smoke(void)
         if (memcmp(write_buffer, read_buffer, length) != 0) {
             fprintf(stderr, "kobox nvme io smoke: compare failed lba=%llu blocks=%u\n",
                 (unsigned long long)cases[i].lba, cases[i].blocks);
+            nvme_release_recreated_queue_mappings();
             free(write_buffer);
             free(read_buffer);
             return -5;
@@ -792,6 +831,7 @@ int kb_nvme_io_smoke(void)
     }
 
     unsigned int irq_waits = tracked_io_irq_waits - irq_waits_before;
+    nvme_release_recreated_queue_mappings();
     free(write_buffer);
     free(read_buffer);
     if (irq_waits < case_count * 2u) {
