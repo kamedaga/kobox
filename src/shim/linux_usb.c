@@ -201,12 +201,7 @@ static int usb_status_from_kb_status(kb_status_t status)
 
 static int usb_hub_ready_for_events(void *hub)
 {
-    void *hdev = NULL;
-    if (hub == NULL) {
-        return 0;
-    }
-    memcpy(&hdev, (const unsigned char *)hub + KB_LINUX_6_8_USB_HUB_HDEV_OFFSET, sizeof(hdev));
-    return hdev != NULL;
+    return hub != NULL;
 }
 
 static void usb_hcd_release_record(kb_usb_hcd_record_t *record)
