@@ -1,27 +1,11 @@
 #include "subsystem/usb/usb.h"
 #include "subsystem/usb/storage.h"
+#include "kobox/shim.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
-enum {
-    KB_USB_HCD_MAX = 16,
-    KB_USB_URB_MAX = 256,
-    KB_USB_DEVICE_MAX = 64,
-    KB_USB_INTERFACE_MAX = 128,
-    KB_USB_ENDPOINT_MAX = 512,
-    KB_USB_DRIVER_MAX = 64,
-};
-
-static kb_usb_hcd_record_t usb_hcd_records[KB_USB_HCD_MAX];
-
-typedef struct kb_usb_hub_event_injection {
-    void *hcd;
-    unsigned long bits;
-} kb_usb_hub_event_injection_t;
-
-static kb_usb_hub_event_injection_t usb_hub_event_injections[KB_USB_HCD_MAX];
+static kb_usb_hcd_record_t *usb_hcd_records;
 
 typedef struct kb_usb_urb_record {
     int active;
@@ -50,71 +34,68 @@ typedef struct kb_usb_urb_record {
     int last_giveback_status;
     unsigned int last_mem_flags;
     unsigned int last_submit_mem_flags;
+    struct kb_usb_urb_record *next;
 } kb_usb_urb_record_t;
 
-static kb_usb_urb_record_t usb_urb_records[KB_USB_URB_MAX];
+static kb_usb_urb_record_t *usb_urb_records;
 
 typedef struct kb_usb_device_record {
     int active;
     kb_usb_device_snapshot_t snapshot;
+    struct kb_usb_device_record *next;
 } kb_usb_device_record_t;
 
 typedef struct kb_usb_interface_record {
     int active;
     kb_usb_interface_snapshot_t snapshot;
+    struct kb_usb_interface_record *next;
 } kb_usb_interface_record_t;
 
 typedef struct kb_usb_endpoint_record {
     int active;
     kb_usb_endpoint_snapshot_t snapshot;
+    struct kb_usb_endpoint_record *next;
 } kb_usb_endpoint_record_t;
 
 typedef struct kb_usb_driver_record {
     int active;
     kb_usb_driver_snapshot_t snapshot;
+    struct kb_usb_driver_record *next;
 } kb_usb_driver_record_t;
 
-static kb_usb_device_record_t usb_device_records[KB_USB_DEVICE_MAX];
-static kb_usb_interface_record_t usb_interface_records[KB_USB_INTERFACE_MAX];
-static kb_usb_endpoint_record_t usb_endpoint_records[KB_USB_ENDPOINT_MAX];
-static kb_usb_driver_record_t usb_driver_records[KB_USB_DRIVER_MAX];
+static kb_usb_device_record_t *usb_device_records;
+static kb_usb_interface_record_t *usb_interface_records;
+static kb_usb_endpoint_record_t *usb_endpoint_records;
+static kb_usb_driver_record_t *usb_driver_records;
 
-static long hub_event_injection_index(const kb_usb_hub_event_injection_t *injection)
+static int pointer_is_error_or_low(const void *ptr)
 {
-    if (injection == NULL) {
+    uintptr_t value = (uintptr_t)ptr;
+    return value < 4096u || value >= UINTPTR_MAX - 4095u;
+}
+
+static long hcd_record_index(const kb_usb_hcd_record_t *target)
+{
+    if (target == NULL) {
         return -1;
     }
-    return (long)(injection - usb_hub_event_injections);
+    long index = 0;
+    for (kb_usb_hcd_record_t *record = usb_hcd_records; record != NULL; record = record->next) {
+        if (record == target) {
+            return index;
+        }
+        index++;
+    }
+    return -1;
 }
 
-static kb_usb_hub_event_injection_t *hub_event_injection_find(void *hcd)
+static kb_usb_hcd_record_t *hub_event_record_for_hcd(void *hcd)
 {
-    if (hcd == NULL) {
-        return NULL;
+    kb_usb_hcd_record_t *record = kb_usb_subsystem_hcd_for_hcd(hcd);
+    if (record != NULL || pointer_is_error_or_low(hcd)) {
+        return record;
     }
-    for (size_t i = 0; i < KB_USB_HCD_MAX; i++) {
-        if (usb_hub_event_injections[i].hcd == hcd) {
-            return &usb_hub_event_injections[i];
-        }
-    }
-    return NULL;
-}
-
-static kb_usb_hub_event_injection_t *hub_event_injection_for_hcd(void *hcd)
-{
-    kb_usb_hub_event_injection_t *injection = hub_event_injection_find(hcd);
-    if (injection != NULL || hcd == NULL) {
-        return injection;
-    }
-
-    for (size_t i = 0; i < KB_USB_HCD_MAX; i++) {
-        if (usb_hub_event_injections[i].hcd == NULL) {
-            usb_hub_event_injections[i].hcd = hcd;
-            usb_hub_event_injections[i].bits = 0;
-            return &usb_hub_event_injections[i];
-        }
-    }
-    return NULL;
+    return kb_usb_subsystem_hcd_track(hcd);
 }
 
 static unsigned long hub_status_bits(const unsigned char *status, size_t status_len)
@@ -132,12 +113,12 @@ static unsigned long hub_status_bits(const unsigned char *status, size_t status_
 
 static kb_usb_urb_record_t *urb_record_find(const void *urb)
 {
-    if (urb == NULL) {
+    if (pointer_is_error_or_low(urb)) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_URB_MAX; i++) {
-        if (usb_urb_records[i].active && usb_urb_records[i].urb == urb) {
-            return &usb_urb_records[i];
+    for (kb_usb_urb_record_t *record = usb_urb_records; record != NULL; record = record->next) {
+        if (record->active && record->urb == urb) {
+            return record;
         }
     }
     return NULL;
@@ -145,6 +126,9 @@ static kb_usb_urb_record_t *urb_record_find(const void *urb)
 
 static kb_usb_urb_record_t *urb_record_for(void *hcd, void *urb)
 {
+    if (pointer_is_error_or_low(urb)) {
+        return NULL;
+    }
     kb_usb_urb_record_t *record = urb_record_find(urb);
     if (record != NULL) {
         if (record->hcd == NULL) {
@@ -152,30 +136,33 @@ static kb_usb_urb_record_t *urb_record_for(void *hcd, void *urb)
         }
         return record;
     }
-    if (urb == NULL) {
+    record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_URB_MAX; i++) {
-        if (!usb_urb_records[i].active) {
-            memset(&usb_urb_records[i], 0, sizeof(usb_urb_records[i]));
-            usb_urb_records[i].active = 1;
-            usb_urb_records[i].hcd = hcd;
-            usb_urb_records[i].urb = urb;
-            return &usb_urb_records[i];
-        }
-    }
-    return NULL;
+    record->active = 1;
+    record->hcd = hcd;
+    record->urb = urb;
+    record->next = usb_urb_records;
+    usb_urb_records = record;
+    return record;
 }
 
 static void urb_records_release_for_hcd(void *hcd)
 {
-    if (hcd == NULL) {
+    if (pointer_is_error_or_low(hcd)) {
         return;
     }
-    for (size_t i = 0; i < KB_USB_URB_MAX; i++) {
-        if (usb_urb_records[i].active && usb_urb_records[i].hcd == hcd) {
-            memset(&usb_urb_records[i], 0, sizeof(usb_urb_records[i]));
+    kb_usb_urb_record_t **cursor = &usb_urb_records;
+    while (*cursor != NULL) {
+        kb_usb_urb_record_t *record = *cursor;
+        if (record->active && record->hcd == hcd) {
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            continue;
         }
+        cursor = &record->next;
     }
 }
 
@@ -184,9 +171,9 @@ static kb_usb_device_record_t *device_record_find(const void *udev)
     if (udev == NULL) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_DEVICE_MAX; i++) {
-        if (usb_device_records[i].active && usb_device_records[i].snapshot.udev == udev) {
-            return &usb_device_records[i];
+    for (kb_usb_device_record_t *record = usb_device_records; record != NULL; record = record->next) {
+        if (record->active && record->snapshot.udev == udev) {
+            return record;
         }
     }
     return NULL;
@@ -198,15 +185,15 @@ static kb_usb_device_record_t *device_record_for(const void *udev)
     if (record != NULL || udev == NULL) {
         return record;
     }
-    for (size_t i = 0; i < KB_USB_DEVICE_MAX; i++) {
-        if (!usb_device_records[i].active) {
-            memset(&usb_device_records[i], 0, sizeof(usb_device_records[i]));
-            usb_device_records[i].active = 1;
-            usb_device_records[i].snapshot.udev = (void *)udev;
-            return &usb_device_records[i];
-        }
+    record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
+        return NULL;
     }
-    return NULL;
+    record->active = 1;
+    record->snapshot.udev = (void *)udev;
+    record->next = usb_device_records;
+    usb_device_records = record;
+    return record;
 }
 
 static kb_usb_interface_record_t *interface_record_find(const void *interface)
@@ -214,9 +201,9 @@ static kb_usb_interface_record_t *interface_record_find(const void *interface)
     if (interface == NULL) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_INTERFACE_MAX; i++) {
-        if (usb_interface_records[i].active && usb_interface_records[i].snapshot.interface == interface) {
-            return &usb_interface_records[i];
+    for (kb_usb_interface_record_t *record = usb_interface_records; record != NULL; record = record->next) {
+        if (record->active && record->snapshot.interface == interface) {
+            return record;
         }
     }
     return NULL;
@@ -228,15 +215,15 @@ static kb_usb_interface_record_t *interface_record_for(const void *interface)
     if (record != NULL || interface == NULL) {
         return record;
     }
-    for (size_t i = 0; i < KB_USB_INTERFACE_MAX; i++) {
-        if (!usb_interface_records[i].active) {
-            memset(&usb_interface_records[i], 0, sizeof(usb_interface_records[i]));
-            usb_interface_records[i].active = 1;
-            usb_interface_records[i].snapshot.interface = (void *)interface;
-            return &usb_interface_records[i];
-        }
+    record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
+        return NULL;
     }
-    return NULL;
+    record->active = 1;
+    record->snapshot.interface = (void *)interface;
+    record->next = usb_interface_records;
+    usb_interface_records = record;
+    return record;
 }
 
 static kb_usb_endpoint_record_t *endpoint_record_find(const void *endpoint)
@@ -244,9 +231,9 @@ static kb_usb_endpoint_record_t *endpoint_record_find(const void *endpoint)
     if (endpoint == NULL) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_ENDPOINT_MAX; i++) {
-        if (usb_endpoint_records[i].active && usb_endpoint_records[i].snapshot.endpoint == endpoint) {
-            return &usb_endpoint_records[i];
+    for (kb_usb_endpoint_record_t *record = usb_endpoint_records; record != NULL; record = record->next) {
+        if (record->active && record->snapshot.endpoint == endpoint) {
+            return record;
         }
     }
     return NULL;
@@ -258,15 +245,15 @@ static kb_usb_endpoint_record_t *endpoint_record_for(const void *endpoint)
     if (record != NULL || endpoint == NULL) {
         return record;
     }
-    for (size_t i = 0; i < KB_USB_ENDPOINT_MAX; i++) {
-        if (!usb_endpoint_records[i].active) {
-            memset(&usb_endpoint_records[i], 0, sizeof(usb_endpoint_records[i]));
-            usb_endpoint_records[i].active = 1;
-            usb_endpoint_records[i].snapshot.endpoint = (void *)endpoint;
-            return &usb_endpoint_records[i];
-        }
+    record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
+        return NULL;
     }
-    return NULL;
+    record->active = 1;
+    record->snapshot.endpoint = (void *)endpoint;
+    record->next = usb_endpoint_records;
+    usb_endpoint_records = record;
+    return record;
 }
 
 static kb_usb_driver_record_t *driver_record_find(const void *driver)
@@ -274,9 +261,9 @@ static kb_usb_driver_record_t *driver_record_find(const void *driver)
     if (driver == NULL) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_DRIVER_MAX; i++) {
-        if (usb_driver_records[i].active && usb_driver_records[i].snapshot.driver == driver) {
-            return &usb_driver_records[i];
+    for (kb_usb_driver_record_t *record = usb_driver_records; record != NULL; record = record->next) {
+        if (record->active && record->snapshot.driver == driver) {
+            return record;
         }
     }
     return NULL;
@@ -288,15 +275,15 @@ static kb_usb_driver_record_t *driver_record_for(const void *driver)
     if (record != NULL || driver == NULL) {
         return record;
     }
-    for (size_t i = 0; i < KB_USB_DRIVER_MAX; i++) {
-        if (!usb_driver_records[i].active) {
-            memset(&usb_driver_records[i], 0, sizeof(usb_driver_records[i]));
-            usb_driver_records[i].active = 1;
-            usb_driver_records[i].snapshot.driver = (void *)driver;
-            return &usb_driver_records[i];
-        }
+    record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
+        return NULL;
     }
-    return NULL;
+    record->active = 1;
+    record->snapshot.driver = (void *)driver;
+    record->next = usb_driver_records;
+    usb_driver_records = record;
+    return record;
 }
 
 static void endpoint_records_release_for_interface(void *interface)
@@ -304,10 +291,16 @@ static void endpoint_records_release_for_interface(void *interface)
     if (interface == NULL) {
         return;
     }
-    for (size_t i = 0; i < KB_USB_ENDPOINT_MAX; i++) {
-        if (usb_endpoint_records[i].active && usb_endpoint_records[i].snapshot.interface == interface) {
-            memset(&usb_endpoint_records[i], 0, sizeof(usb_endpoint_records[i]));
+    kb_usb_endpoint_record_t **cursor = &usb_endpoint_records;
+    while (*cursor != NULL) {
+        kb_usb_endpoint_record_t *record = *cursor;
+        if (record->active && record->snapshot.interface == interface) {
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            continue;
         }
+        cursor = &record->next;
     }
 }
 
@@ -316,10 +309,16 @@ static void endpoint_records_release_for_udev(void *udev)
     if (udev == NULL) {
         return;
     }
-    for (size_t i = 0; i < KB_USB_ENDPOINT_MAX; i++) {
-        if (usb_endpoint_records[i].active && usb_endpoint_records[i].snapshot.udev == udev) {
-            memset(&usb_endpoint_records[i], 0, sizeof(usb_endpoint_records[i]));
+    kb_usb_endpoint_record_t **cursor = &usb_endpoint_records;
+    while (*cursor != NULL) {
+        kb_usb_endpoint_record_t *record = *cursor;
+        if (record->active && record->snapshot.udev == udev) {
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            continue;
         }
+        cursor = &record->next;
     }
 }
 
@@ -328,55 +327,89 @@ static void interface_records_release_for_udev(void *udev)
     if (udev == NULL) {
         return;
     }
-    for (size_t i = 0; i < KB_USB_INTERFACE_MAX; i++) {
-        if (usb_interface_records[i].active && usb_interface_records[i].snapshot.udev == udev) {
-            kb_usb_storage_subsystem_remove_interface(usb_interface_records[i].snapshot.interface);
-            endpoint_records_release_for_interface(usb_interface_records[i].snapshot.interface);
-            memset(&usb_interface_records[i], 0, sizeof(usb_interface_records[i]));
+    kb_usb_interface_record_t **cursor = &usb_interface_records;
+    while (*cursor != NULL) {
+        kb_usb_interface_record_t *record = *cursor;
+        if (record->active && record->snapshot.udev == udev) {
+            void *interface = record->snapshot.interface;
+            kb_usb_storage_subsystem_remove_interface(interface);
+            endpoint_records_release_for_interface(interface);
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            continue;
         }
+        cursor = &record->next;
     }
 }
 
 static void device_records_release_for_hcd(void *hcd)
 {
-    if (hcd == NULL) {
+    if (pointer_is_error_or_low(hcd)) {
         return;
     }
-    for (size_t i = 0; i < KB_USB_DEVICE_MAX; i++) {
-        if (usb_device_records[i].active && usb_device_records[i].snapshot.hcd == hcd) {
-            void *udev = usb_device_records[i].snapshot.udev;
+    kb_usb_device_record_t **cursor = &usb_device_records;
+    while (*cursor != NULL) {
+        kb_usb_device_record_t *record = *cursor;
+        if (record->active && record->snapshot.hcd == hcd) {
+            void *udev = record->snapshot.udev;
             interface_records_release_for_udev(udev);
             endpoint_records_release_for_udev(udev);
-            memset(&usb_device_records[i], 0, sizeof(usb_device_records[i]));
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            continue;
         }
+        cursor = &record->next;
     }
 }
 
 kb_usb_hcd_record_t *kb_usb_subsystem_hcd_alloc(size_t storage_size)
 {
-    for (size_t i = 0; i < KB_USB_HCD_MAX; i++) {
-        if (usb_hcd_records[i].active) {
-            continue;
-        }
-        memset(&usb_hcd_records[i], 0, sizeof(usb_hcd_records[i]));
-        usb_hcd_records[i].hcd = calloc(1, storage_size);
-        if (usb_hcd_records[i].hcd == NULL) {
-            return NULL;
-        }
-        usb_hcd_records[i].active = 1;
-        return &usb_hcd_records[i];
+    kb_usb_hcd_record_t *record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
+        return NULL;
     }
-    return NULL;
+    record->hcd = kb_kzalloc(storage_size, 0);
+    if (record->hcd == NULL) {
+        kb_kfree(record);
+        return NULL;
+    }
+    record->owns_storage = 1;
+    record->active = 1;
+    record->next = usb_hcd_records;
+    usb_hcd_records = record;
+    return record;
+}
+
+kb_usb_hcd_record_t *kb_usb_subsystem_hcd_track(void *hcd)
+{
+    if (pointer_is_error_or_low(hcd)) {
+        return NULL;
+    }
+    kb_usb_hcd_record_t *existing = kb_usb_subsystem_hcd_for_hcd(hcd);
+    if (existing != NULL) {
+        return existing;
+    }
+    kb_usb_hcd_record_t *record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
+        return NULL;
+    }
+    record->hcd = hcd;
+    record->active = 1;
+    record->next = usb_hcd_records;
+    usb_hcd_records = record;
+    return record;
 }
 
 kb_usb_hcd_record_t *kb_usb_subsystem_hcd_for_hcd(void *hcd)
 {
-    if (hcd == NULL) {
+    if (pointer_is_error_or_low(hcd)) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_HCD_MAX; i++) {
-        if (usb_hcd_records[i].active && usb_hcd_records[i].hcd == hcd) {
-            return &usb_hcd_records[i];
+    for (kb_usb_hcd_record_t *record = usb_hcd_records; record != NULL; record = record->next) {
+        if (record->active && record->hcd == hcd) {
+            return record;
         }
     }
     return NULL;
@@ -387,9 +420,9 @@ kb_usb_hcd_record_t *kb_usb_subsystem_primary_hcd_for_owner(void *owner)
     if (owner == NULL) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_USB_HCD_MAX; i++) {
-        if (usb_hcd_records[i].active && usb_hcd_records[i].owner == owner && usb_hcd_records[i].primary) {
-            return &usb_hcd_records[i];
+    for (kb_usb_hcd_record_t *record = usb_hcd_records; record != NULL; record = record->next) {
+        if (record->active && record->owner == owner && record->primary) {
+            return record;
         }
     }
     return NULL;
@@ -400,14 +433,22 @@ void kb_usb_subsystem_hcd_release(kb_usb_hcd_record_t *record)
     if (record == NULL || !record->active) {
         return;
     }
-    kb_usb_hub_event_injection_t *injection = hub_event_injection_find(record->hcd);
-    if (injection != NULL) {
-        memset(injection, 0, sizeof(*injection));
-    }
     device_records_release_for_hcd(record->hcd);
     urb_records_release_for_hcd(record->hcd);
-    free(record->hcd);
+    if (record->owns_storage) {
+        kb_kfree(record->hcd);
+    }
+
+    kb_usb_hcd_record_t **cursor = &usb_hcd_records;
+    while (*cursor != NULL) {
+        if (*cursor == record) {
+            *cursor = record->next;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
     memset(record, 0, sizeof(*record));
+    kb_kfree(record);
 }
 
 int kb_usb_subsystem_for_each_hcd(int (*callback)(kb_usb_hcd_record_t *record, void *ctx), void *ctx)
@@ -417,14 +458,17 @@ int kb_usb_subsystem_for_each_hcd(int (*callback)(kb_usb_hcd_record_t *record, v
     }
 
     int visited = 0;
-    for (size_t i = 0; i < KB_USB_HCD_MAX; i++) {
-        if (!usb_hcd_records[i].active || usb_hcd_records[i].hcd == NULL) {
+    for (kb_usb_hcd_record_t *record = usb_hcd_records; record != NULL;) {
+        kb_usb_hcd_record_t *next = record->next;
+        if (!record->active || record->hcd == NULL) {
+            record = next;
             continue;
         }
         visited++;
-        if (callback(&usb_hcd_records[i], ctx) != 0) {
+        if (callback(record, ctx) != 0) {
             break;
         }
+        record = next;
     }
     return visited;
 }
@@ -543,8 +587,8 @@ int kb_usb_subsystem_hub_event_prepare(
         return -22;
     }
 
-    kb_usb_hub_event_injection_t *injection = hub_event_injection_for_hcd(hcd);
-    if (injection == NULL) {
+    kb_usb_hcd_record_t *record = hub_event_record_for_hcd(hcd);
+    if (record == NULL) {
         return -12;
     }
 
@@ -554,11 +598,11 @@ int kb_usb_subsystem_hub_event_prepare(
     }
 
     unsigned long bits = hub_status_bits(status, status_len);
-    unsigned long injected_before = injection->bits;
+    unsigned long injected_before = record->hub_event_bits;
     if (bits == 0) {
-        injection->bits = 0;
+        record->hub_event_bits = 0;
     }
-    unsigned long new_bits = bits & ~injection->bits;
+    unsigned long new_bits = bits & ~record->hub_event_bits;
 
     if (update != NULL) {
         memcpy(update->status, status, copied);
@@ -566,8 +610,8 @@ int kb_usb_subsystem_hub_event_prepare(
         update->bits = bits;
         update->new_bits = new_bits;
         update->injected_before = injected_before;
-        update->injected_after = injection->bits;
-        update->slot = hub_event_injection_index(injection);
+        update->injected_after = record->hub_event_bits;
+        update->slot = hcd_record_index(record);
     }
     return 0;
 }
@@ -581,20 +625,20 @@ int kb_usb_subsystem_hub_event_commit(
         return -22;
     }
 
-    kb_usb_hub_event_injection_t *injection = hub_event_injection_for_hcd(hcd);
-    if (injection == NULL) {
+    kb_usb_hcd_record_t *record = hub_event_record_for_hcd(hcd);
+    if (record == NULL) {
         return -12;
     }
 
-    unsigned long injected_before = injection->bits;
-    injection->bits |= bits;
+    unsigned long injected_before = record->hub_event_bits;
+    record->hub_event_bits |= bits;
 
     if (update != NULL) {
         if (update->slot < 0) {
-            update->slot = hub_event_injection_index(injection);
+            update->slot = hcd_record_index(record);
         }
         update->injected_before = injected_before;
-        update->injected_after = injection->bits;
+        update->injected_after = record->hub_event_bits;
     }
     return 0;
 }
@@ -750,6 +794,67 @@ int kb_usb_subsystem_urb_snapshot(const void *urb, kb_usb_urb_snapshot_t *out_sn
     return 0;
 }
 
+size_t kb_usb_subsystem_urb_count(void)
+{
+    size_t count = 0;
+    for (kb_usb_urb_record_t *record = usb_urb_records; record != NULL; record = record->next) {
+        if (record->active) {
+            count++;
+        }
+    }
+    return count;
+}
+
+int kb_usb_subsystem_for_each_urb(
+    int (*callback)(const kb_usb_urb_snapshot_t *snapshot, void *ctx),
+    void *ctx)
+{
+    if (callback == NULL) {
+        return 0;
+    }
+    int visited = 0;
+    for (kb_usb_urb_record_t *record = usb_urb_records; record != NULL;) {
+        kb_usb_urb_record_t *next = record->next;
+        if (!record->active) {
+            record = next;
+            continue;
+        }
+        kb_usb_urb_snapshot_t snapshot = {
+            .hcd = record->hcd,
+            .urb = record->urb,
+            .transfer_buffer = record->transfer_buffer,
+            .setup_packet = record->setup_packet,
+            .transfer_dma = record->transfer_dma,
+            .setup_dma = record->setup_dma,
+            .transfer_buffer_length = record->transfer_buffer_length,
+            .actual_length = record->actual_length,
+            .transfer_flags = record->transfer_flags,
+            .dma_map_flags = record->dma_map_flags,
+            .status = record->status,
+            .linked = record->linked,
+            .mapped = record->mapped,
+            .link_count = record->link_count,
+            .unlink_count = record->unlink_count,
+            .map_count = record->map_count,
+            .unmap_count = record->unmap_count,
+            .submit_count = record->submit_count,
+            .kill_count = record->kill_count,
+            .giveback_count = record->giveback_count,
+            .last_unlink_status = record->last_unlink_status,
+            .last_submit_status = record->last_submit_status,
+            .last_giveback_status = record->last_giveback_status,
+            .last_mem_flags = record->last_mem_flags,
+            .last_submit_mem_flags = record->last_submit_mem_flags,
+        };
+        visited++;
+        if (callback(&snapshot, ctx) != 0) {
+            break;
+        }
+        record = next;
+    }
+    return visited;
+}
+
 int kb_usb_subsystem_device_observe(const kb_usb_device_update_t *update)
 {
     if (update == NULL || update->udev == NULL) {
@@ -788,13 +893,19 @@ int kb_usb_subsystem_device_observe(const kb_usb_device_update_t *update)
 
 void kb_usb_subsystem_device_remove(void *udev)
 {
-    kb_usb_device_record_t *record = device_record_find(udev);
-    if (record == NULL) {
-        return;
+    kb_usb_device_record_t **cursor = &usb_device_records;
+    while (*cursor != NULL) {
+        kb_usb_device_record_t *record = *cursor;
+        if (record->active && record->snapshot.udev == udev) {
+            interface_records_release_for_udev(udev);
+            endpoint_records_release_for_udev(udev);
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            return;
+        }
+        cursor = &record->next;
     }
-    interface_records_release_for_udev(udev);
-    endpoint_records_release_for_udev(udev);
-    memset(record, 0, sizeof(*record));
 }
 
 int kb_usb_subsystem_device_snapshot(const void *udev, kb_usb_device_snapshot_t *out_snapshot)
@@ -810,8 +921,8 @@ int kb_usb_subsystem_device_snapshot(const void *udev, kb_usb_device_snapshot_t 
 size_t kb_usb_subsystem_device_count(void)
 {
     size_t count = 0;
-    for (size_t i = 0; i < KB_USB_DEVICE_MAX; i++) {
-        if (usb_device_records[i].active) {
+    for (kb_usb_device_record_t *record = usb_device_records; record != NULL; record = record->next) {
+        if (record->active) {
             count++;
         }
     }
@@ -826,15 +937,18 @@ int kb_usb_subsystem_for_each_device(
         return 0;
     }
     int visited = 0;
-    for (size_t i = 0; i < KB_USB_DEVICE_MAX; i++) {
-        if (!usb_device_records[i].active) {
+    for (kb_usb_device_record_t *record = usb_device_records; record != NULL;) {
+        kb_usb_device_record_t *next = record->next;
+        if (!record->active) {
+            record = next;
             continue;
         }
         visited++;
-        kb_usb_device_snapshot_t snapshot = usb_device_records[i].snapshot;
+        kb_usb_device_snapshot_t snapshot = record->snapshot;
         if (callback(&snapshot, ctx) != 0) {
             break;
         }
+        record = next;
     }
     return visited;
 }
@@ -868,13 +982,19 @@ int kb_usb_subsystem_interface_observe(const kb_usb_interface_update_t *update)
 
 void kb_usb_subsystem_interface_remove(void *interface)
 {
-    kb_usb_interface_record_t *record = interface_record_find(interface);
-    if (record == NULL) {
-        return;
+    kb_usb_interface_record_t **cursor = &usb_interface_records;
+    while (*cursor != NULL) {
+        kb_usb_interface_record_t *record = *cursor;
+        if (record->active && record->snapshot.interface == interface) {
+            kb_usb_storage_subsystem_remove_interface(interface);
+            endpoint_records_release_for_interface(interface);
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            return;
+        }
+        cursor = &record->next;
     }
-    kb_usb_storage_subsystem_remove_interface(interface);
-    endpoint_records_release_for_interface(interface);
-    memset(record, 0, sizeof(*record));
 }
 
 int kb_usb_subsystem_interface_snapshot(const void *interface, kb_usb_interface_snapshot_t *out_snapshot)
@@ -890,8 +1010,8 @@ int kb_usb_subsystem_interface_snapshot(const void *interface, kb_usb_interface_
 size_t kb_usb_subsystem_interface_count(void)
 {
     size_t count = 0;
-    for (size_t i = 0; i < KB_USB_INTERFACE_MAX; i++) {
-        if (usb_interface_records[i].active) {
+    for (kb_usb_interface_record_t *record = usb_interface_records; record != NULL; record = record->next) {
+        if (record->active) {
             count++;
         }
     }
@@ -906,15 +1026,18 @@ int kb_usb_subsystem_for_each_interface(
         return 0;
     }
     int visited = 0;
-    for (size_t i = 0; i < KB_USB_INTERFACE_MAX; i++) {
-        if (!usb_interface_records[i].active) {
+    for (kb_usb_interface_record_t *record = usb_interface_records; record != NULL;) {
+        kb_usb_interface_record_t *next = record->next;
+        if (!record->active) {
+            record = next;
             continue;
         }
         visited++;
-        kb_usb_interface_snapshot_t snapshot = usb_interface_records[i].snapshot;
+        kb_usb_interface_snapshot_t snapshot = record->snapshot;
         if (callback(&snapshot, ctx) != 0) {
             break;
         }
+        record = next;
     }
     return visited;
 }
@@ -944,9 +1067,16 @@ int kb_usb_subsystem_endpoint_observe(const kb_usb_endpoint_update_t *update)
 
 void kb_usb_subsystem_endpoint_remove(void *endpoint)
 {
-    kb_usb_endpoint_record_t *record = endpoint_record_find(endpoint);
-    if (record != NULL) {
-        memset(record, 0, sizeof(*record));
+    kb_usb_endpoint_record_t **cursor = &usb_endpoint_records;
+    while (*cursor != NULL) {
+        kb_usb_endpoint_record_t *record = *cursor;
+        if (record->active && record->snapshot.endpoint == endpoint) {
+            *cursor = record->next;
+            memset(record, 0, sizeof(*record));
+            kb_kfree(record);
+            return;
+        }
+        cursor = &record->next;
     }
 }
 
@@ -963,8 +1093,8 @@ int kb_usb_subsystem_endpoint_snapshot(const void *endpoint, kb_usb_endpoint_sna
 size_t kb_usb_subsystem_endpoint_count(void)
 {
     size_t count = 0;
-    for (size_t i = 0; i < KB_USB_ENDPOINT_MAX; i++) {
-        if (usb_endpoint_records[i].active) {
+    for (kb_usb_endpoint_record_t *record = usb_endpoint_records; record != NULL; record = record->next) {
+        if (record->active) {
             count++;
         }
     }
@@ -979,15 +1109,18 @@ int kb_usb_subsystem_for_each_endpoint(
         return 0;
     }
     int visited = 0;
-    for (size_t i = 0; i < KB_USB_ENDPOINT_MAX; i++) {
-        if (!usb_endpoint_records[i].active) {
+    for (kb_usb_endpoint_record_t *record = usb_endpoint_records; record != NULL;) {
+        kb_usb_endpoint_record_t *next = record->next;
+        if (!record->active) {
+            record = next;
             continue;
         }
         visited++;
-        kb_usb_endpoint_snapshot_t snapshot = usb_endpoint_records[i].snapshot;
+        kb_usb_endpoint_snapshot_t snapshot = record->snapshot;
         if (callback(&snapshot, ctx) != 0) {
             break;
         }
+        record = next;
     }
     return visited;
 }
@@ -1033,8 +1166,8 @@ int kb_usb_subsystem_driver_snapshot(const void *driver, kb_usb_driver_snapshot_
 size_t kb_usb_subsystem_driver_count(void)
 {
     size_t count = 0;
-    for (size_t i = 0; i < KB_USB_DRIVER_MAX; i++) {
-        if (usb_driver_records[i].active) {
+    for (kb_usb_driver_record_t *record = usb_driver_records; record != NULL; record = record->next) {
+        if (record->active) {
             count++;
         }
     }
@@ -1049,15 +1182,18 @@ int kb_usb_subsystem_for_each_driver(
         return 0;
     }
     int visited = 0;
-    for (size_t i = 0; i < KB_USB_DRIVER_MAX; i++) {
-        if (!usb_driver_records[i].active) {
+    for (kb_usb_driver_record_t *record = usb_driver_records; record != NULL;) {
+        kb_usb_driver_record_t *next = record->next;
+        if (!record->active) {
+            record = next;
             continue;
         }
         visited++;
-        kb_usb_driver_snapshot_t snapshot = usb_driver_records[i].snapshot;
+        kb_usb_driver_snapshot_t snapshot = record->snapshot;
         if (callback(&snapshot, ctx) != 0) {
             break;
         }
+        record = next;
     }
     return visited;
 }

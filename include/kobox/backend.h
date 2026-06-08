@@ -101,6 +101,7 @@ typedef struct kb_backend_ops {
         kb_dma_dir_t direction,
         uint64_t *out_dma_addr);
     void (*dma_unmap)(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction);
+    kb_status_t (*dma_set_mask)(kb_device_t *device, uint64_t mask, int coherent);
 
     kb_status_t (*irq_register)(
         kb_device_t *device,

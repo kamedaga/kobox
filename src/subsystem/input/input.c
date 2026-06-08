@@ -1,4 +1,5 @@
 #include "subsystem/input/input.h"
+#include "kobox/shim.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,8 @@ enum {
     KB_LINUX_INPUT_DEV_PHYS_OFFSET = 8,
     KB_LINUX_INPUT_DEV_UNIQ_OFFSET = 16,
     KB_LINUX_INPUT_DEV_ID_OFFSET = 24,
+    KB_LINUX_6_8_INPUT_DEV_OPEN_OFFSET = 456,
+    KB_LINUX_6_8_INPUT_DEV_CLOSE_OFFSET = 464,
 };
 
 typedef struct kb_input_device_record {
@@ -17,6 +20,9 @@ typedef struct kb_input_device_record {
     int absinfo_allocated;
 } kb_input_device_record_t;
 
+typedef int (*kb_linux_input_open_fn)(void *dev);
+typedef void (*kb_linux_input_close_fn)(void *dev);
+
 static kb_input_device_record_t input_devices[KB_INPUT_DEVICE_MAX];
 static kb_input_event_t input_events[KB_INPUT_EVENT_QUEUE_MAX];
 static size_t input_event_head;
@@ -24,10 +30,44 @@ static size_t input_event_count;
 static uint64_t next_event_sequence = 1;
 static unsigned int next_device_id = 1;
 
+static int trace_input_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *value = getenv("KOBOX_TRACE_INPUT");
+    cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    return cached;
+}
+
 static int pointer_is_error_or_low(const void *ptr)
 {
     const uintptr_t value = (uintptr_t)ptr;
     return value < 4096u || value >= UINTPTR_MAX - 4095u;
+}
+
+static int trust_device_strings_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *value = getenv("KOBOX_INPUT_TRUST_DEVICE_STRINGS");
+    cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    return cached;
+}
+
+static size_t bounded_strlen(const char *value, size_t max_len)
+{
+    size_t length = 0;
+    if (value == NULL) {
+        return 0;
+    }
+    while (length < max_len && value[length] != '\0') {
+        length++;
+    }
+    return length;
 }
 
 static void copy_known_string(char *dst, size_t dst_size, const char *src, const char *fallback)
@@ -42,7 +82,26 @@ static void copy_known_string(char *dst, size_t dst_size, const char *src, const
     if (value == NULL) {
         value = "";
     }
-    snprintf(dst, dst_size, "%s", value);
+    size_t length = bounded_strlen(value, dst_size - 1u);
+    memcpy(dst, value, length);
+    dst[length] = '\0';
+}
+
+static const char *summary_string(char *scratch, size_t scratch_size, const char *value, const char *fallback)
+{
+    if (scratch_size == 0) {
+        return "";
+    }
+    if (value == NULL || value[0] == '\0') {
+        value = fallback != NULL ? fallback : "";
+    }
+    size_t length = bounded_strlen(value, scratch_size - 1u);
+    for (size_t i = 0; i < length; i++) {
+        unsigned char ch = (unsigned char)value[i];
+        scratch[i] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '?';
+    }
+    scratch[length] = '\0';
+    return scratch;
 }
 
 static const char *linux_input_string(void *dev, size_t offset)
@@ -52,6 +111,27 @@ static const char *linux_input_string(void *dev, size_t offset)
     }
     const char *const *slot = (const char *const *)((unsigned char *)dev + offset);
     return *slot;
+}
+
+static void *linux_input_ptr(void *dev, size_t offset)
+{
+    void *value = NULL;
+    if (dev != NULL) {
+        memcpy(&value, (unsigned char *)dev + offset, sizeof(value));
+    }
+    return value;
+}
+
+static int enter_function_gs(const void *function, unsigned long *old_gs)
+{
+    unsigned long kernel_gs = kb_module_kernel_gs_for_address(function);
+    if (kernel_gs == 0) {
+        kernel_gs = kb_shim_current_kernel_gs();
+    }
+    if (kernel_gs == 0) {
+        return 0;
+    }
+    return kb_shim_enter_kernel_gs(kernel_gs, old_gs) == 0;
 }
 
 static kb_input_id_t linux_input_id(void *dev)
@@ -102,6 +182,46 @@ static kb_input_device_record_t *alloc_record(void *dev)
     return NULL;
 }
 
+static kb_input_device_record_t *fallback_event_record(void)
+{
+    for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
+        if (input_devices[i].snapshot.active && input_devices[i].snapshot.opened) {
+            return &input_devices[i];
+        }
+    }
+    for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
+        if (input_devices[i].snapshot.active) {
+            return &input_devices[i];
+        }
+    }
+    for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
+        if (input_devices[i].snapshot.id == 0 && input_devices[i].snapshot.linux_dev == NULL) {
+            memset(&input_devices[i], 0, sizeof(input_devices[i]));
+            input_devices[i].snapshot.id = next_device_id++;
+            input_devices[i].snapshot.active = 1;
+            snprintf(input_devices[i].snapshot.name, sizeof(input_devices[i].snapshot.name), "%s", "input");
+            return &input_devices[i];
+        }
+    }
+    return NULL;
+}
+
+static int input_record_can_open(const kb_input_device_record_t *record)
+{
+    return record != NULL &&
+        record->snapshot.active &&
+        !record->snapshot.opened &&
+        record->snapshot.linux_dev != NULL;
+}
+
+static int input_record_can_close(const kb_input_device_record_t *record)
+{
+    return record != NULL &&
+        record->snapshot.active &&
+        record->snapshot.opened &&
+        record->snapshot.linux_dev != NULL;
+}
+
 static void refresh_device_snapshot(kb_input_device_record_t *record)
 {
     if (record == NULL || record->snapshot.linux_dev == NULL) {
@@ -111,30 +231,98 @@ static void refresh_device_snapshot(kb_input_device_record_t *record)
     copy_known_string(
         record->snapshot.name,
         sizeof(record->snapshot.name),
-        linux_input_string(dev, KB_LINUX_INPUT_DEV_NAME_OFFSET),
+        trust_device_strings_enabled() ? linux_input_string(dev, KB_LINUX_INPUT_DEV_NAME_OFFSET) : NULL,
         "input");
     copy_known_string(
         record->snapshot.phys,
         sizeof(record->snapshot.phys),
-        linux_input_string(dev, KB_LINUX_INPUT_DEV_PHYS_OFFSET),
+        trust_device_strings_enabled() ? linux_input_string(dev, KB_LINUX_INPUT_DEV_PHYS_OFFSET) : NULL,
         "");
     copy_known_string(
         record->snapshot.uniq,
         sizeof(record->snapshot.uniq),
-        linux_input_string(dev, KB_LINUX_INPUT_DEV_UNIQ_OFFSET),
+        trust_device_strings_enabled() ? linux_input_string(dev, KB_LINUX_INPUT_DEV_UNIQ_OFFSET) : NULL,
         "");
     record->snapshot.input_id = linux_input_id(dev);
 }
 
+static int open_input_record(kb_input_device_record_t *record)
+{
+    if (!input_record_can_open(record)) {
+        return 0;
+    }
+
+    void *dev = record->snapshot.linux_dev;
+    kb_linux_input_open_fn open_fn =
+        (kb_linux_input_open_fn)linux_input_ptr(dev, KB_LINUX_6_8_INPUT_DEV_OPEN_OFFSET);
+    if (open_fn == NULL || pointer_is_error_or_low((const void *)open_fn)) {
+        return 0;
+    }
+
+    unsigned long old_gs = 0;
+    if (trace_input_enabled()) {
+        fprintf(stderr, "kobox input: open begin dev=%p open=%p\n", dev, (void *)open_fn);
+    }
+    int has_gs = enter_function_gs((const void *)open_fn, &old_gs);
+    if (trace_input_enabled()) {
+        fprintf(stderr, "kobox input: open call dev=%p open=%p has_gs=%d old_gs=0x%lx\n", dev, (void *)open_fn, has_gs, old_gs);
+    }
+    int result = kb_linux_call_int_ptr(open_fn, dev);
+    if (trace_input_enabled()) {
+        fprintf(stderr, "kobox input: open returned dev=%p open=%p result=%d\n", dev, (void *)open_fn, result);
+    }
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+
+    record->snapshot.open_result = result;
+    if (result == 0) {
+        record->snapshot.opened = 1;
+    }
+    if (trace_input_enabled()) {
+        fprintf(
+            stderr,
+            "kobox input: open dev=%p open=%p result=%d opened=%d\n",
+            dev,
+            (void *)open_fn,
+            result,
+            record->snapshot.opened);
+    }
+    return result == 0;
+}
+
+static void close_input_record(kb_input_device_record_t *record)
+{
+    if (!input_record_can_close(record)) {
+        return;
+    }
+
+    void *dev = record->snapshot.linux_dev;
+    kb_linux_input_close_fn close_fn =
+        (kb_linux_input_close_fn)linux_input_ptr(dev, KB_LINUX_6_8_INPUT_DEV_CLOSE_OFFSET);
+    if (close_fn != NULL && !pointer_is_error_or_low((const void *)close_fn)) {
+        unsigned long old_gs = 0;
+        int has_gs = enter_function_gs((const void *)close_fn, &old_gs);
+        kb_linux_call_void_ptr(close_fn, dev);
+        if (has_gs) {
+            kb_shim_leave_kernel_gs(old_gs);
+        }
+    }
+    if (trace_input_enabled()) {
+        fprintf(stderr, "kobox input: close dev=%p close=%p\n", dev, (void *)close_fn);
+    }
+    record->snapshot.opened = 0;
+}
+
 void *kb_input_subsystem_allocate_device(void)
 {
-    void *dev = calloc(1, KB_INPUT_LINUX_DEVICE_STORAGE_SIZE);
+    void *dev = kb_kzalloc(KB_INPUT_LINUX_DEVICE_STORAGE_SIZE, 0);
     if (dev == NULL) {
         return NULL;
     }
     kb_input_device_record_t *record = alloc_record(dev);
     if (record == NULL) {
-        free(dev);
+        kb_kfree(dev);
         return NULL;
     }
     record->allocated = 1;
@@ -148,7 +336,7 @@ void kb_input_subsystem_free_device(void *dev)
         return;
     }
     if (record->allocated) {
-        free(dev);
+        kb_kfree(dev);
     }
     memset(record, 0, sizeof(*record));
 }
@@ -170,16 +358,17 @@ void kb_input_subsystem_unregister_device(void *dev)
     if (record == NULL) {
         return;
     }
+    close_input_record(record);
     record->snapshot.active = 0;
     if (record->allocated) {
-        free(dev);
+        kb_kfree(dev);
         memset(record, 0, sizeof(*record));
     }
 }
 
 void kb_input_subsystem_record_event(void *dev, unsigned int type, unsigned int code, int value)
 {
-    kb_input_device_record_t *record = alloc_record(dev);
+    kb_input_device_record_t *record = dev != NULL ? alloc_record(dev) : fallback_event_record();
     if (record == NULL) {
         return;
     }
@@ -198,7 +387,7 @@ void kb_input_subsystem_record_event(void *dev, unsigned int type, unsigned int 
     input_events[index] = (kb_input_event_t){
         .sequence = next_event_sequence++,
         .device_id = record->snapshot.id,
-        .linux_dev = dev,
+        .linux_dev = record->snapshot.linux_dev,
         .type = type,
         .code = code,
         .value = value,
@@ -274,6 +463,24 @@ int kb_input_subsystem_for_each_device(
     return visited;
 }
 
+int kb_input_subsystem_open_registered_devices(void)
+{
+    int opened = 0;
+    for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
+        if (open_input_record(&input_devices[i])) {
+            opened++;
+        }
+    }
+    return opened;
+}
+
+void kb_input_subsystem_close_registered_devices(void)
+{
+    for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
+        close_input_record(&input_devices[i]);
+    }
+}
+
 size_t kb_input_subsystem_pop_events(kb_input_event_t *events, size_t max_events)
 {
     if (events == NULL || max_events == 0) {
@@ -303,28 +510,102 @@ void kb_input_subsystem_print_summary(FILE *out)
         if (!device->active) {
             continue;
         }
+        char name[KB_INPUT_NAME_MAX];
+        char phys[KB_INPUT_PHYS_MAX];
         fprintf(
             out,
-            "kobox-input: device id=%u linux=%p name=%s phys=%s bus=%04x vendor=%04x product=%04x version=%04x events=%lu dropped=%lu slot=%ld\n",
+            "kobox-input: device id=%u linux=%p name=%s phys=%s bus=%04x vendor=%04x product=%04x version=%04x events=%lu dropped=%lu opened=%d open_result=%d slot=%ld\n",
             device->id,
             device->linux_dev,
-            device->name[0] == '\0' ? "input" : device->name,
-            device->phys,
+            summary_string(name, sizeof(name), device->name, "input"),
+            summary_string(phys, sizeof(phys), device->phys, ""),
             device->input_id.bustype,
             device->input_id.vendor,
             device->input_id.product,
             device->input_id.version,
             device->event_count,
             device->dropped_events,
+            device->opened,
+            device->open_result,
             input_device_index(&input_devices[i]));
     }
 }
 
+int kb_input_subsystem_run_mouse_smoke(FILE *out)
+{
+    enum {
+        EV_SYN = 0x00,
+        EV_KEY = 0x01,
+        EV_REL = 0x02,
+        EV_ABS = 0x03,
+        REL_X = 0x00,
+        REL_Y = 0x01,
+        ABS_X = 0x00,
+        ABS_Y = 0x01,
+        BTN_LEFT = 0x110,
+    };
+
+    if (out == NULL) {
+        out = stdout;
+    }
+
+    kb_input_event_t events[KB_INPUT_EVENT_QUEUE_MAX];
+    size_t count = kb_input_subsystem_pop_events(events, KB_INPUT_EVENT_QUEUE_MAX);
+    int x = 0;
+    int y = 0;
+    int left = 0;
+    unsigned int rel_events = 0;
+    unsigned int abs_events = 0;
+    unsigned int key_events = 0;
+    unsigned int syn_events = 0;
+    unsigned int device_id = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (device_id == 0) {
+            device_id = events[i].device_id;
+        }
+        if (events[i].type == EV_REL && events[i].code == REL_X) {
+            x += events[i].value;
+            rel_events++;
+        } else if (events[i].type == EV_REL && events[i].code == REL_Y) {
+            y += events[i].value;
+            rel_events++;
+        } else if (events[i].type == EV_ABS && events[i].code == ABS_X) {
+            x = events[i].value;
+            abs_events++;
+        } else if (events[i].type == EV_ABS && events[i].code == ABS_Y) {
+            y = events[i].value;
+            abs_events++;
+        } else if (events[i].type == EV_KEY && events[i].code == BTN_LEFT) {
+            left = events[i].value != 0;
+            key_events++;
+        } else if (events[i].type == EV_SYN) {
+            syn_events++;
+        }
+    }
+
+    fprintf(
+        out,
+        "kobox-usb-hid-mouse: device_id=%u events=%zu rel=%u abs=%u key=%u syn=%u x=%d y=%d left=%d result=%s\n",
+        device_id,
+        count,
+        rel_events,
+        abs_events,
+        key_events,
+        syn_events,
+        x,
+        y,
+        left,
+        count != 0 && (rel_events >= 2 || abs_events >= 2) ? "ok" : "no-events");
+    return count != 0 && (rel_events >= 2 || abs_events >= 2) ? 0 : -5;
+}
+
 void kb_input_subsystem_reset(void)
 {
+    kb_input_subsystem_close_registered_devices();
     for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
         if (input_devices[i].allocated && input_devices[i].snapshot.linux_dev != NULL) {
-            free(input_devices[i].snapshot.linux_dev);
+            kb_kfree(input_devices[i].snapshot.linux_dev);
         }
         memset(&input_devices[i], 0, sizeof(input_devices[i]));
     }

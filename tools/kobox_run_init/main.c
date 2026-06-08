@@ -10,18 +10,16 @@
 #include "kobox/shim.h"
 #include "subsystem/input/input.h"
 #include "subsystem/usb/storage.h"
+#include "subsystem/usb/usb.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if !defined(_WIN32) && defined(__GLIBC__)
-#include <execinfo.h>
-#endif
-#if !defined(_WIN32)
-#include <signal.h>
-#include <ucontext.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -36,71 +34,48 @@ typedef struct loaded_input_module {
     kb_module_t *module;
 } loaded_input_module_t;
 
-#if !defined(_WIN32)
-static void crash_handler(int signo, siginfo_t *info, void *ucontext)
+static void stdout_write_all(const char *text, size_t length)
 {
-#if defined(__GLIBC__)
-    void *frames[64];
-    int count = backtrace(frames, 64);
-#endif
-    const char message[] = "kobox-run: crash while executing module\n";
-    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
-#if defined(__x86_64__)
-    ucontext_t *context = (ucontext_t *)ucontext;
-    if (context != NULL) {
-        uintptr_t *sp = (uintptr_t *)context->uc_mcontext.gregs[REG_RSP];
-        dprintf(
-            STDERR_FILENO,
-            "kobox-run: signal=%d addr=%p rip=%p rsp=%p\n",
-            signo,
-            info != NULL ? info->si_addr : NULL,
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RIP],
-            (void *)sp);
-        dprintf(
-            STDERR_FILENO,
-            "kobox-run: rax=%p rbx=%p rcx=%p rdx=%p rdi=%p rsi=%p r12=%p\n",
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RAX],
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RBX],
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RCX],
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RDX],
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RDI],
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_RSI],
-            (void *)(uintptr_t)context->uc_mcontext.gregs[REG_R12]);
-        if (sp != NULL && getenv("KOBOX_CRASH_STACK") != NULL) {
-            for (int i = 0; i < 8; i++) {
-                dprintf(STDERR_FILENO, "kobox-run: stack[%d]=%p\n", i, (void *)sp[i]);
-            }
-        }
+    if (text == NULL || length == 0) {
+        return;
     }
+    size_t written = 0;
+    while (written < length) {
+#if defined(_WIN32)
+        int n = _write(1, text + written, (unsigned int)(length - written));
 #else
-    if (info != NULL) {
-        dprintf(STDERR_FILENO, "kobox-run: signal=%d addr=%p\n", signo, info->si_addr);
+        ssize_t n = write(STDOUT_FILENO, text + written, length - written);
+#endif
+        if (n <= 0) {
+            break;
+        }
+        written += (size_t)n;
     }
-#endif
-#if defined(__GLIBC__)
-    backtrace_symbols_fd(frames, count, STDERR_FILENO);
-#endif
-    signal(signo, SIG_DFL);
-    raise(signo);
 }
 
-static void install_crash_handler(void)
+static void stdout_linef(const char *fmt, ...)
 {
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_sigaction = crash_handler;
-    action.sa_flags = SA_SIGINFO;
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGSEGV, &action, NULL);
-    sigaction(SIGBUS, &action, NULL);
-    sigaction(SIGILL, &action, NULL);
-    sigaction(SIGABRT, &action, NULL);
+    char line[256];
+    va_list args;
+    va_start(args, fmt);
+    int length = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (length <= 0) {
+        return;
+    }
+    size_t write_len = (size_t)length;
+    if (write_len >= sizeof(line)) {
+        write_len = sizeof(line) - 1u;
+        line[write_len] = '\0';
+    }
+    if (write_len != 0 && line[write_len - 1u] == '\n' && write_len + 1u < sizeof(line)) {
+        line[write_len - 1u] = '\r';
+        line[write_len] = '\n';
+        write_len++;
+        line[write_len] = '\0';
+    }
+    stdout_write_all(line, write_len);
 }
-#else
-static void install_crash_handler(void)
-{
-}
-#endif
 
 static const char *status_name(kb_status_t status)
 {
@@ -124,6 +99,11 @@ static const char *status_name(kb_status_t status)
     default:
         return "KB_ERR_UNKNOWN";
     }
+}
+
+static int cleanup_failure_code(kb_status_t status)
+{
+    return status == KB_ERR_NOT_FOUND ? 0 : 1;
 }
 
 static kb_status_t read_file(const char *path, void **out_data, size_t *out_size)
@@ -169,7 +149,6 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
         return;
     }
 
-    const int trace_run = getenv("KOBOX_TRACE_RUN") != NULL;
     kb_shim_set_backend(backend);
     const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
     uint64_t start_ns = 0;
@@ -178,16 +157,9 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
     }
 
     for (unsigned long i = 0; i < drain_ms; i++) {
-        if (trace_run) {
-            fprintf(stderr, "kobox-run: drain loop=%lu run_work\n", i);
-        }
         kb_run_deferred_work();
-        if (trace_run) {
-            fprintf(stderr, "kobox-run: drain loop=%lu poll_root_hubs\n", i);
-        }
-        (void)kb_usb_poll_root_hubs();
-        if (trace_run) {
-            fprintf(stderr, "kobox-run: drain loop=%lu handle_irq\n", i);
+        if (kb_usb_root_hub_poll_needed()) {
+            (void)kb_usb_poll_root_hubs();
         }
         (void)kb_handle_any_irq(1000000ull);
         if (start_ns != 0 && ops != NULL && ops->monotonic_ns != NULL) {
@@ -197,21 +169,321 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
             }
         }
     }
-    if (trace_run) {
-        fprintf(stderr, "kobox-run: drain final run_work\n");
-    }
     kb_run_deferred_work();
-    if (trace_run) {
-        fprintf(stderr, "kobox-run: drain final poll_root_hubs\n");
-    }
-    (void)kb_usb_poll_root_hubs();
-    if (trace_run) {
-        fprintf(stderr, "kobox-run: drain final handle_irq\n");
+    if (kb_usb_root_hub_poll_needed()) {
+        (void)kb_usb_poll_root_hubs();
     }
     (void)kb_handle_any_irq(0);
-    if (trace_run) {
-        fprintf(stderr, "kobox-run: drain done\n");
+    kb_shim_set_backend(NULL);
+}
+
+static int mouse_live_enabled(void)
+{
+    const char *value = getenv("KOBOX_USB_HID_MOUSE_LIVE");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int mouse_live_synthetic_enabled(void)
+{
+    const char *device = getenv("KOBOX_USB_SYNTHETIC_DEVICE");
+    return device != NULL && strstr(device, "hid") != NULL && strstr(device, "mouse") != NULL;
+}
+
+static int mouse_live_xhci_only_enabled(void)
+{
+    const char *value = getenv("KOBOX_USB_HID_MOUSE_XHCI_ONLY");
+    if (value != NULL && value[0] != '\0') {
+        return strcmp(value, "0") != 0;
     }
+    const char *real = getenv("KOBOX_USB_REAL_DEVICE");
+    const char *backend = getenv("KOBOX_BACKEND");
+    return real != NULL && real[0] != '\0' && strcmp(real, "0") != 0 &&
+        backend != NULL && (strcmp(backend, "pachaos") == 0 || strcmp(backend, "pachaos_capsule") == 0);
+}
+
+static unsigned long mouse_live_duration_ms(unsigned long drain_ms)
+{
+    const char *value = getenv("KOBOX_USB_HID_MOUSE_LIVE_MS");
+    if (value != NULL && value[0] != '\0') {
+        unsigned long parsed = strtoul(value, NULL, 10);
+        if (parsed != 0) {
+            return parsed;
+        }
+    }
+    return drain_ms != 0 ? drain_ms : 10000;
+}
+
+static int mouse_live_trace_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_MOUSE_LIVE");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static void mouse_live_trace(unsigned long loop, const char *phase)
+{
+    fprintf(stderr, "kobox-usb-hid-mouse-live-trace: loop=%lu phase=%s\n", loop, phase);
+    fflush(stderr);
+}
+
+static void mouse_live_pause(int xhci_only)
+{
+    (void)xhci_only;
+    kb_msleep(1);
+}
+
+static unsigned int mouse_live_print_limit(void)
+{
+    const char *value = getenv("KOBOX_USB_HID_MOUSE_LIVE_PRINT_LIMIT");
+    if (value != NULL && value[0] != '\0') {
+        unsigned long parsed = strtoul(value, NULL, 10);
+        if (parsed <= 1024ul) {
+            return (unsigned int)parsed;
+        }
+    }
+    return 32;
+}
+
+static unsigned int drain_mouse_live_events(int *x, int *y, int *left, unsigned int *printed_details)
+{
+    enum {
+        EV_SYN = 0x00,
+        EV_KEY = 0x01,
+        EV_REL = 0x02,
+        EV_ABS = 0x03,
+        REL_X = 0x00,
+        REL_Y = 0x01,
+        ABS_X = 0x00,
+        ABS_Y = 0x01,
+        BTN_LEFT = 0x110,
+    };
+
+    kb_input_event_t events[64];
+    size_t count = kb_input_subsystem_pop_events(events, sizeof(events) / sizeof(events[0]));
+    unsigned int changed_count = 0;
+    const unsigned int print_limit = mouse_live_print_limit();
+    const unsigned int non_coordinate_print_limit = print_limit < 8u ? print_limit : 8u;
+    for (size_t i = 0; i < count; i++) {
+        int changed = 0;
+        int coordinate_event = 0;
+        if (events[i].type == EV_REL && events[i].code == REL_X) {
+            *x += events[i].value;
+            changed = 1;
+            coordinate_event = 1;
+        } else if (events[i].type == EV_REL && events[i].code == REL_Y) {
+            *y += events[i].value;
+            changed = 1;
+            coordinate_event = 1;
+        } else if (events[i].type == EV_ABS && events[i].code == ABS_X) {
+            *x = events[i].value;
+            changed = 1;
+            coordinate_event = 1;
+        } else if (events[i].type == EV_ABS && events[i].code == ABS_Y) {
+            *y = events[i].value;
+            changed = 1;
+            coordinate_event = 1;
+        } else if (events[i].type == EV_KEY && events[i].code == BTN_LEFT) {
+            *left = events[i].value != 0;
+            changed = 1;
+        } else if (events[i].type == EV_SYN) {
+            changed = 1;
+        }
+        if (changed) {
+            changed_count++;
+            const int should_print_detail =
+                coordinate_event ||
+                (printed_details != NULL && *printed_details < non_coordinate_print_limit);
+            if (printed_details != NULL && *printed_details < print_limit && should_print_detail) {
+                stdout_linef(
+                    "kobox-usb-hid-mouse-live: seq=%llu device_id=%u type=%u code=%u value=%d x=%d y=%d left=%d\n",
+                    (unsigned long long)events[i].sequence,
+                    events[i].device_id,
+                    events[i].type,
+                    events[i].code,
+                    events[i].value,
+                    *x,
+                    *y,
+                    *left);
+                (*printed_details)++;
+                if (*printed_details == print_limit) {
+                    stdout_linef("kobox-usb-hid-mouse-live: detail output capped at %u events\n", print_limit);
+                }
+            }
+        }
+    }
+    return changed_count;
+}
+
+static void mouse_live_run_deferred_step(int input_active)
+{
+    if (input_active) {
+        kb_run_deferred_bottom_halves();
+    } else {
+        kb_run_deferred_work();
+    }
+}
+
+static void mouse_live_drive_source(unsigned long loop, int synthetic, int xhci_only, int trace_live)
+{
+    if (synthetic) {
+        if (trace_live) {
+            mouse_live_trace(loop, "synthetic-before");
+        }
+        (void)kb_usb_synthesize_connected_hid_mouse();
+        if (trace_live) {
+            mouse_live_trace(loop, "synthetic-after");
+        }
+        return;
+    }
+
+    if (xhci_only) {
+        return;
+    }
+
+    if (trace_live) {
+        mouse_live_trace(loop, "hub-before");
+    }
+    if (kb_usb_root_hub_poll_needed()) {
+        (void)kb_usb_poll_root_hubs();
+    }
+    if (trace_live) {
+        mouse_live_trace(loop, "hub-after");
+    }
+}
+
+static void mouse_live_open_inputs(int *input_active)
+{
+    int opened_this_loop = kb_input_subsystem_open_registered_devices();
+    if (opened_this_loop != 0 || kb_input_subsystem_device_count() != 0) {
+        *input_active = 1;
+        kb_usb_pause_root_hub_poll_for_live();
+    }
+}
+
+static int mouse_live_deadline_reached(
+    const kb_backend_ops_t *ops,
+    kb_backend_t *backend,
+    uint64_t live_start_ns,
+    unsigned long live_ms,
+    unsigned long loops,
+    unsigned long max_loops)
+{
+    if (ops != NULL && ops->monotonic_ns != NULL) {
+        uint64_t now_ns = ops->monotonic_ns(backend);
+        if (live_start_ns != 0 &&
+            now_ns >= live_start_ns &&
+            now_ns - live_start_ns >= ((uint64_t)live_ms * 1000000ull))
+        {
+            return 1;
+        }
+        return live_start_ns == 0 && loops >= max_loops;
+    }
+    return loops >= max_loops;
+}
+
+static void run_mouse_live(kb_backend_t *backend, unsigned long live_ms)
+{
+    if (live_ms == 0) {
+        return;
+    }
+
+    kb_shim_set_backend(backend);
+    kb_usb_reset_root_hub_poll_live_state();
+    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    int x = 0;
+    int y = 0;
+    int left = 0;
+    unsigned long loops = 0;
+    unsigned int printed = 0;
+    unsigned int printed_details = 0;
+    int input_active = 0;
+    const int synthetic = mouse_live_synthetic_enabled();
+    const int xhci_only = mouse_live_xhci_only_enabled();
+    const int trace_live = mouse_live_trace_enabled();
+    uint64_t live_start_ns = ops != NULL && ops->monotonic_ns != NULL ? ops->monotonic_ns(backend) : 0;
+    const unsigned long max_loops = live_ms + 10000;
+    stdout_linef(
+        "kobox-usb-hid-mouse-live: begin ms=%lu mode=%s loop=deadline-start/bh-after-input\n",
+        live_ms,
+        synthetic ? "synthetic" : (xhci_only ? "real-xhci" : "hybrid"));
+    if (!synthetic && xhci_only) {
+        if (kb_usb_root_hub_poll_needed()) {
+            (void)kb_usb_poll_root_hubs();
+            /*
+             * In xHCI-only live mode this first poll is only the connect kick.
+             * After that, real xHCI events must drive enumeration; repeated
+             * root-hub polls from completion waits can race the device setup
+             * path and corrupt the ep0 descriptor handshake.
+             */
+            kb_usb_pause_root_hub_poll_for_live();
+        }
+    }
+    for (;;) {
+        if (trace_live) {
+            mouse_live_trace(loops, "work-before");
+        }
+        mouse_live_run_deferred_step(input_active);
+        if (trace_live) {
+            mouse_live_trace(loops, "work-after");
+        }
+        mouse_live_drive_source(loops, synthetic, xhci_only, trace_live);
+        if (trace_live) {
+            mouse_live_trace(loops, "irq-wait-before");
+        }
+        (void)kb_handle_any_irq_no_work(1000000ull);
+        if (trace_live) {
+            mouse_live_trace(loops, "irq-wait-after");
+        }
+        if (trace_live) {
+            mouse_live_trace(loops, "input-open-before");
+        }
+        mouse_live_open_inputs(&input_active);
+        if (trace_live) {
+            mouse_live_trace(loops, "input-open-after");
+        }
+        if (trace_live) {
+            mouse_live_trace(loops, "irq-drain-before");
+        }
+        (void)kb_handle_any_irq_no_work(0);
+        if (trace_live) {
+            mouse_live_trace(loops, "irq-drain-after");
+        }
+        if (trace_live) {
+            mouse_live_trace(loops, "event-drain-before");
+        }
+        unsigned int drained = drain_mouse_live_events(&x, &y, &left, &printed_details);
+        printed += drained;
+        if (drained != 0) {
+            input_active = 1;
+            kb_usb_pause_root_hub_poll_for_live();
+        }
+        if (trace_live) {
+            mouse_live_trace(loops, "event-drain-after");
+        }
+        mouse_live_pause(xhci_only);
+        loops++;
+
+        if (mouse_live_deadline_reached(ops, backend, live_start_ns, live_ms, loops, max_loops)) {
+            break;
+        }
+    }
+    if (synthetic) {
+        (void)kb_usb_synthesize_connected_hid_mouse();
+    } else if (!xhci_only) {
+        if (kb_usb_root_hub_poll_needed()) {
+            (void)kb_usb_poll_root_hubs();
+        }
+    }
+    (void)kb_handle_any_irq_no_work(0);
+    (void)kb_input_subsystem_open_registered_devices();
+    (void)kb_handle_any_irq_no_work(0);
+    printed += drain_mouse_live_events(&x, &y, &left, &printed_details);
+    stdout_linef(
+        "kobox-usb-hid-mouse-live-summary: events=%u x=%d y=%d left=%d result=%s\n",
+        printed,
+        x,
+        y,
+        left,
+        printed != 0 ? "ok" : "no-events");
     kb_shim_set_backend(NULL);
 }
 
@@ -221,6 +493,7 @@ static void cleanup_all_irqs_for_backend(kb_backend_t *backend)
         return;
     }
     kb_shim_set_backend(backend);
+    kb_usb_cleanup_tracked_urb_dma();
     kb_free_all_irqs();
     kb_pci_release_all_mmio_mappings();
     kb_shim_set_backend(NULL);
@@ -269,7 +542,6 @@ static void configure_pachaos_driver_preference(const char *path)
 
 int main(int argc, char **argv)
 {
-    install_crash_handler();
     kb_usb_set_event_injection_runtime_allowed(0);
 
     const char *path = NULL;
@@ -342,6 +614,7 @@ int main(int argc, char **argv)
         }
         status = kb_linux_vfio_create(pci_bdf, &backend);
     } else if (strcmp(backend_name, "pachaos") == 0 || strcmp(backend_name, "pachaos_capsule") == 0) {
+        (void)setenv("KOBOX_BACKEND", "pachaos", 1);
         configure_pachaos_driver_preference(path);
         if (capsule_text != NULL) {
             uint64_t capsule = 0;
@@ -492,7 +765,28 @@ int main(int argc, char **argv)
             return 9;
         }
     }
-    drain_after_init(backend, drain_ms);
+    if (mouse_live_enabled()) {
+        run_mouse_live(backend, mouse_live_duration_ms(drain_ms));
+    } else {
+        drain_after_init(backend, drain_ms);
+    }
+    const char *usb_hid_mouse_smoke = getenv("KOBOX_USB_HID_MOUSE_SMOKE");
+    if (usb_hid_mouse_smoke != NULL && usb_hid_mouse_smoke[0] != '\0' && strcmp(usb_hid_mouse_smoke, "0") != 0) {
+        int hid_result = kb_input_subsystem_run_mouse_smoke(stdout);
+        if (hid_result != 0) {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            destroy_backend_after_cleanup(backend);
+            free(data);
+            fprintf(stderr, "usb hid mouse smoke failed: %d\n", hid_result);
+            return 12;
+        }
+    }
     const char *usb_storage_io_smoke = getenv("KOBOX_USB_STORAGE_IO_SMOKE");
     if (usb_storage_io_smoke != NULL && usb_storage_io_smoke[0] != '\0' && strcmp(usb_storage_io_smoke, "0") != 0) {
         int storage_io_result = kb_usb_storage_subsystem_run_io_smoke(stdout);
@@ -519,15 +813,16 @@ int main(int argc, char **argv)
         kb_usb_storage_subsystem_print_summary(stdout);
     }
 
+    kb_status_t first_cleanup_error = KB_OK;
+    int first_cleanup_return = 0;
+
     status = kb_module_call_cleanup(module);
     if (status == KB_OK) {
         printf("cleanup_module returned\n");
     } else if (status != KB_ERR_NOT_FOUND) {
-        kb_module_close(module);
-        destroy_backend_after_cleanup(backend);
-        free(data);
         fprintf(stderr, "cleanup failed: %s (%d)\n", status_name(status), status);
-        return 6;
+        first_cleanup_error = status;
+        first_cleanup_return = 6;
     }
 
     kb_module_close(module);
@@ -537,11 +832,10 @@ int main(int argc, char **argv)
             printf("dependency %s cleanup_module returned\n", deps[i - 1].path);
         } else if (status != KB_ERR_NOT_FOUND) {
             fprintf(stderr, "dependency cleanup failed: %s: %s (%d)\n", deps[i - 1].path, status_name(status), status);
-            kb_module_close(deps[i - 1].module);
-            free(deps[i - 1].data);
-            destroy_backend_after_cleanup(backend);
-            free(data);
-            return 7;
+            if (first_cleanup_error == KB_OK) {
+                first_cleanup_error = status;
+                first_cleanup_return = 7;
+            }
         }
         kb_module_close(deps[i - 1].module);
         free(deps[i - 1].data);
@@ -551,6 +845,9 @@ int main(int argc, char **argv)
     if (cleanup_result != 0) {
         fprintf(stderr, "kobox cleanup residuals failed: %d\n", cleanup_result);
         return cleanup_result;
+    }
+    if (cleanup_failure_code(first_cleanup_error) != 0) {
+        return first_cleanup_return;
     }
     return 0;
 }

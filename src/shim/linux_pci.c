@@ -73,6 +73,7 @@ struct shim_mmio_mapping {
     void *user_addr;
     size_t user_size;
     int bar;
+    unsigned int refs;
     shim_mmio_mapping_t *next;
 };
 
@@ -82,6 +83,81 @@ static int trace_xhci_enabled(void)
 {
     const char *value = getenv("KOBOX_TRACE_XHCI");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static void trace_xhci_dma_window(const char *label, uint64_t dma_addr, size_t bytes)
+{
+    size_t available = 0;
+    const unsigned char *cpu = kb_dma_cpu_addr(dma_addr, &available);
+    fprintf(
+        stderr,
+        "kobox xhci: ring_cmd_db dma %s dma=0x%016llx cpu=%p available=%zu\n",
+        label,
+        (unsigned long long)dma_addr,
+        (const void *)cpu,
+        available);
+    if (cpu == NULL) {
+        return;
+    }
+
+    size_t limit = available < bytes ? available : bytes;
+    for (size_t offset = 0; offset + 16 <= limit; offset += 16) {
+        uint32_t words[4];
+        memcpy(words, cpu + offset, sizeof(words));
+        fprintf(
+            stderr,
+            "kobox xhci: ring_cmd_db dma %s +0x%zx %08x %08x %08x %08x\n",
+            label,
+            offset,
+            words[0],
+            words[1],
+            words[2],
+            words[3]);
+    }
+}
+
+static int pachaos_backend_active(void)
+{
+    const char *backend = getenv("KOBOX_BACKEND");
+    return backend != NULL && (strcmp(backend, "pachaos") == 0 || strcmp(backend, "pachaos_capsule") == 0);
+}
+
+static int env_enabled(const char *name)
+{
+    const char *value = getenv(name);
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int pci_device_is_xhci(void *dev)
+{
+    enum {
+        KB_PCI_REVISION_CLASS_OFFSET = 0x08,
+        KB_PCI_CLASS_XHCI = 0x0c0330,
+    };
+
+    uint32_t revision_class = 0;
+    if (kb_pci_read_config_dword(dev, KB_PCI_REVISION_CLASS_OFFSET, &revision_class) != 0) {
+        return 0;
+    }
+    return ((revision_class >> 8) & UINT32_C(0x00ffffff)) == KB_PCI_CLASS_XHCI;
+}
+
+static int pachaos_xhci_uses_legacy_irq(void *dev)
+{
+    /*
+     * PachaOS does not yet deliver PCI MSI/MSI-X to kobox correctly. qemu-xhci
+     * stalls in the command doorbell path once the Linux xHCI driver enables
+     * MSI-X, while the same controller enumerates and reports HID input through
+     * the legacy vector path. Keep this scoped to xHCI so other PCI devices can
+     * use the normal vector selection path. KOBOX_PACHAOS_ENABLE_MSI=1 keeps a
+     * direct comparison path for fixing the kernel MSI/MSI-X route later.
+     */
+    return pachaos_backend_active() && !env_enabled("KOBOX_PACHAOS_ENABLE_MSI") && pci_device_is_xhci(dev);
+}
+
+static int pachaos_backend_programs_msix_table(void)
+{
+    return pachaos_backend_active();
 }
 
 enum {
@@ -220,6 +296,27 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
     kb_pci_subsystem_irq_vectors_clear();
     kb_irq_clear_mappings();
 
+    if (pachaos_xhci_uses_legacy_irq(dev)) {
+        if (min_vecs > 1) {
+            if (trace_pci_enabled()) {
+                fprintf(stderr, "kobox pci: alloc_irq_vectors pachaos-xhci-legacy insufficient min=%u\n", min_vecs);
+            }
+            return -28;
+        }
+        unsigned int legacy_vector = 0;
+        if (kb_pci_subsystem_irq_vectors_set(1, &legacy_vector) != 0) {
+            return -22;
+        }
+        if (trace_pci_enabled()) {
+            fprintf(
+                stderr,
+                "kobox pci: alloc_irq_vectors pachaos-xhci-legacy flags=0x%x max=%u\n",
+                flags,
+                max_vecs);
+        }
+        return 1;
+    }
+
     if (trace_pci_enabled()) {
         fprintf(
             stderr,
@@ -237,11 +334,7 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
                 unsigned int table_size = (unsigned int)((control & KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1u);
                 unsigned int vectors = max_vecs < table_size ? max_vecs : table_size;
                 if (vectors >= min_vecs) {
-                    control |= KB_PCI_MSIX_CONTROL_ENABLE;
-                    control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
-                    if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
-                        return -5;
-                    }
+                    int backend_programs_table = pachaos_backend_programs_msix_table();
                     unsigned int linux_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
                     uint16_t entries[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
                     for (unsigned int i = 0; i < vectors; i++) {
@@ -252,17 +345,30 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
                             return -12;
                         }
                     }
-                    if (kb_pci_msix_unmask_entries(dev, entries, vectors) != 0) {
-                        kb_irq_clear_mappings();
-                        kb_pci_subsystem_irq_vectors_clear();
-                        return -5;
+                    if (!backend_programs_table) {
+                        control |= KB_PCI_MSIX_CONTROL_ENABLE;
+                        control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
+                        if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
+                            kb_irq_clear_mappings();
+                            kb_pci_subsystem_irq_vectors_clear();
+                            return -5;
+                        }
+                        if (kb_pci_msix_unmask_entries(dev, entries, vectors) != 0) {
+                            kb_irq_clear_mappings();
+                            kb_pci_subsystem_irq_vectors_clear();
+                            return -5;
+                        }
                     }
                     if (kb_pci_subsystem_irq_vectors_set(vectors, linux_vectors) != 0) {
                         kb_irq_clear_mappings();
                         return -22;
                     }
                     if (trace_pci_enabled()) {
-                        fprintf(stderr, "kobox pci: alloc_irq_vectors msix=%u\n", vectors);
+                        fprintf(
+                            stderr,
+                            "kobox pci: alloc_irq_vectors msix=%u%s\n",
+                            vectors,
+                            backend_programs_table ? " backend-programmed" : "");
                     }
                     return (int)vectors;
                 } else if (trace_pci_enabled()) {
@@ -530,7 +636,7 @@ static int remember_mmio_mapping(
         return -22;
     }
 
-    shim_mmio_mapping_t *mapping = calloc(1, sizeof(*mapping));
+    shim_mmio_mapping_t *mapping = kb_kzalloc(sizeof(*mapping), 0);
     if (mapping == NULL) {
         return -12;
     }
@@ -540,9 +646,125 @@ static int remember_mmio_mapping(
     mapping->user_addr = user_addr;
     mapping->user_size = user_size == 0 ? (size_t)region->size : user_size;
     mapping->bar = bar;
+    mapping->refs = 1;
     mapping->next = mmio_mappings;
     mmio_mappings = mapping;
     return 0;
+}
+
+static shim_mmio_mapping_t *retain_mmio_mapping_for_bar(kb_backend_t *backend, kb_device_t *device, int bar)
+{
+    if (backend == NULL || device == NULL) {
+        return NULL;
+    }
+    for (shim_mmio_mapping_t *mapping = mmio_mappings; mapping != NULL; mapping = mapping->next) {
+        if (mapping->backend == backend &&
+            mapping->device == device &&
+            mapping->bar == bar &&
+            mapping->region.addr != NULL &&
+            mapping->region.size != 0) {
+            if (mapping->refs != UINT32_MAX) {
+                mapping->refs++;
+            }
+            return mapping;
+        }
+    }
+    return NULL;
+}
+
+static shim_mmio_mapping_t *find_mmio_mapping_for_bar(kb_backend_t *backend, kb_device_t *device, int bar)
+{
+    if (backend == NULL || device == NULL) {
+        return NULL;
+    }
+    for (shim_mmio_mapping_t *mapping = mmio_mappings; mapping != NULL; mapping = mapping->next) {
+        if (mapping->backend == backend &&
+            mapping->device == device &&
+            mapping->bar == bar &&
+            mapping->region.addr != NULL &&
+            mapping->region.size != 0) {
+            return mapping;
+        }
+    }
+    return NULL;
+}
+
+static void trace_msix_state(void *dev, const char *label)
+{
+    if (dev == NULL || label == NULL || !(trace_xhci_enabled() || trace_pci_enabled())) {
+        return;
+    }
+
+    int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSIX);
+    if (cap == 0) {
+        return;
+    }
+
+    uint16_t control = 0;
+    uint32_t table = 0;
+    uint32_t pba = 0;
+    if (kb_pci_read_config_word(dev, cap + 2, &control) != 0 ||
+        kb_pci_read_config_dword(dev, cap + 4, &table) != 0 ||
+        kb_pci_read_config_dword(dev, cap + 8, &pba) != 0) {
+        return;
+    }
+
+    unsigned int table_bar = table & KB_PCI_MSIX_TABLE_BIR_MASK;
+    unsigned int pba_bar = pba & KB_PCI_MSIX_TABLE_BIR_MASK;
+    uint64_t table_offset = (uint64_t)(table & ~((uint32_t)KB_PCI_MSIX_TABLE_BIR_MASK));
+    uint64_t pba_offset = (uint64_t)(pba & ~((uint32_t)KB_PCI_MSIX_TABLE_BIR_MASK));
+    unsigned int table_size = (unsigned int)((control & KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1u);
+
+    kb_backend_t *backend = kb_shim_current_backend();
+    kb_device_t *device = binding.device;
+    if (device == NULL && first_device(backend, &device) != KB_OK) {
+        device = NULL;
+    }
+
+    fprintf(
+        stderr,
+        "kobox xhci: msix state %s cap=0x%02x control=0x%04x table=0x%08x pba=0x%08x size=%u table_bar=%u table_off=0x%llx pba_bar=%u pba_off=0x%llx\n",
+        label,
+        cap,
+        control,
+        table,
+        pba,
+        table_size,
+        table_bar,
+        (unsigned long long)table_offset,
+        pba_bar,
+        (unsigned long long)pba_offset);
+
+    shim_mmio_mapping_t *table_mapping =
+        find_mmio_mapping_for_bar(backend, device, (int)table_bar);
+    if (table_mapping != NULL) {
+        for (unsigned int entry = 0; entry < table_size && entry < 2u; entry++) {
+            uint64_t entry_offset = table_offset + ((uint64_t)entry * KB_PCI_MSIX_ENTRY_SIZE);
+            if (entry_offset + KB_PCI_MSIX_ENTRY_SIZE > (uint64_t)table_mapping->region.size) {
+                break;
+            }
+            volatile uint32_t *slot = (volatile uint32_t *)((unsigned char *)table_mapping->region.addr + entry_offset);
+            fprintf(
+                stderr,
+                "kobox xhci: msix table[%u] %08x %08x %08x %08x\n",
+                entry,
+                slot[0],
+                slot[1],
+                slot[2],
+                slot[KB_PCI_MSIX_ENTRY_VECTOR_CTRL / sizeof(uint32_t)]);
+        }
+    } else {
+        fprintf(stderr, "kobox xhci: msix table mapping missing bar=%u\n", table_bar);
+    }
+
+    shim_mmio_mapping_t *pba_mapping =
+        find_mmio_mapping_for_bar(backend, device, (int)pba_bar);
+    if (pba_mapping != NULL && pba_offset + sizeof(uint32_t) <= (uint64_t)pba_mapping->region.size) {
+        volatile uint32_t *word0 = (volatile uint32_t *)((unsigned char *)pba_mapping->region.addr + pba_offset);
+        fprintf(stderr, "kobox xhci: msix pba word0=0x%08x\n", *word0);
+    } else {
+        fprintf(stderr, "kobox xhci: msix pba mapping missing bar=%u\n", pba_bar);
+    }
 }
 
 static int mmio_mapping_matches(const shim_mmio_mapping_t *mapping, const void *addr)
@@ -571,6 +793,10 @@ static shim_mmio_mapping_t *take_mmio_mapping(void *addr)
     while (*cursor != NULL) {
         shim_mmio_mapping_t *mapping = *cursor;
         if (mmio_mapping_matches(mapping, addr)) {
+            if (mapping->refs > 1) {
+                mapping->refs--;
+                return NULL;
+            }
             *cursor = mapping->next;
             mapping->next = NULL;
             return mapping;
@@ -606,7 +832,39 @@ static void release_mmio_mapping_record(shim_mmio_mapping_t *mapping)
     if (mapping->bar == 0) {
         refresh_mapped_bar0_after_unmap();
     }
-    free(mapping);
+    kb_kfree(mapping);
+}
+
+static int cached_bar0_snapshot(volatile unsigned char **base_out, size_t *size_out)
+{
+    volatile unsigned char *base = (volatile unsigned char *)mapped_bar0_addr;
+    size_t size = mapped_bar0_size;
+    for (shim_mmio_mapping_t *mapping = mmio_mappings; mapping != NULL; mapping = mapping->next) {
+        if (mapping->bar != 0 || mapping->region.addr == NULL || mapping->region.size == 0) {
+            continue;
+        }
+        base = (volatile unsigned char *)mapping->region.addr;
+        size = (size_t)mapping->region.size;
+        mapped_bar0_addr = mapping->region.addr;
+        mapped_bar0_size = size;
+        break;
+    }
+    if ((uintptr_t)base < 4096u || size < 0x40) {
+        if (base_out != NULL) {
+            *base_out = NULL;
+        }
+        if (size_out != NULL) {
+            *size_out = 0;
+        }
+        return 0;
+    }
+    if (base_out != NULL) {
+        *base_out = base;
+    }
+    if (size_out != NULL) {
+        *size_out = size;
+    }
+    return 1;
 }
 
 static void write_u32(void *ptr, uint32_t value)
@@ -631,6 +889,85 @@ static uintptr_t read_ulong_field(const void *ptr)
     uintptr_t value = 0;
     memcpy(&value, ptr, sizeof(value));
     return value;
+}
+
+static uintptr_t read_ptr_field(const void *ptr)
+{
+    uintptr_t value = 0;
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+typedef struct xhci_interrupter_snapshot {
+    uint32_t iman;
+    uint32_t erstsz;
+    uint64_t erstba;
+    uint64_t erdp;
+    uint32_t event_words[4];
+    int event_visible;
+    int event_pending;
+} xhci_interrupter_snapshot_t;
+
+static unsigned int xhci_max_interrupters(uint32_t hcsparams1)
+{
+    unsigned int max_intrs = (hcsparams1 >> 8) & 0x7ffu;
+    if (max_intrs == 0) {
+        max_intrs = 1;
+    }
+    if (max_intrs > 32u) {
+        max_intrs = 32u;
+    }
+    return max_intrs;
+}
+
+static int xhci_interrupter_snapshot(
+    volatile unsigned char *base,
+    size_t bar0_size,
+    uint32_t rtsoff,
+    unsigned int index,
+    xhci_interrupter_snapshot_t *out_snapshot)
+{
+    enum {
+        KB_XHCI_INTERRUPTER0_OFFSET = 0x20,
+        KB_XHCI_INTERRUPTER_STRIDE = 0x20,
+        KB_XHCI_IMAN_OFFSET = 0x00,
+        KB_XHCI_ERSTSZ_OFFSET = 0x08,
+        KB_XHCI_ERSTBA_OFFSET = 0x10,
+        KB_XHCI_ERDP_OFFSET = 0x18,
+    };
+
+    if (base == NULL || out_snapshot == NULL) {
+        return 0;
+    }
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+    size_t offset = (size_t)rtsoff + KB_XHCI_INTERRUPTER0_OFFSET +
+        ((size_t)index * KB_XHCI_INTERRUPTER_STRIDE);
+    if (offset + KB_XHCI_ERDP_OFFSET + sizeof(uint64_t) > bar0_size) {
+        return 0;
+    }
+
+    volatile unsigned char *ir = base + offset;
+    out_snapshot->iman = *(volatile uint32_t *)(ir + KB_XHCI_IMAN_OFFSET);
+    out_snapshot->erstsz = *(volatile uint32_t *)(ir + KB_XHCI_ERSTSZ_OFFSET);
+    uint32_t erstba_low = *(volatile uint32_t *)(ir + KB_XHCI_ERSTBA_OFFSET);
+    uint32_t erstba_high = *(volatile uint32_t *)(ir + KB_XHCI_ERSTBA_OFFSET + sizeof(uint32_t));
+    uint32_t erdp_low = *(volatile uint32_t *)(ir + KB_XHCI_ERDP_OFFSET);
+    uint32_t erdp_high = *(volatile uint32_t *)(ir + KB_XHCI_ERDP_OFFSET + sizeof(uint32_t));
+    out_snapshot->erstba = ((uint64_t)erstba_high << 32) | erstba_low;
+    out_snapshot->erdp = ((uint64_t)erdp_high << 32) | erdp_low;
+
+    size_t available = 0;
+    const unsigned char *event = kb_dma_cpu_addr(out_snapshot->erdp & ~UINT64_C(0xf), &available);
+    if (event != NULL && available >= sizeof(out_snapshot->event_words)) {
+        memcpy(out_snapshot->event_words, event, sizeof(out_snapshot->event_words));
+        out_snapshot->event_visible = 1;
+        out_snapshot->event_pending =
+            (out_snapshot->event_words[0] |
+             out_snapshot->event_words[1] |
+             out_snapshot->event_words[2] |
+             out_snapshot->event_words[3]) != 0;
+    }
+    return 1;
 }
 
 static void write_pci_resource(
@@ -1326,7 +1663,7 @@ int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec)
             return -22;
         }
     }
-    uint16_t *table_entries = calloc((size_t)vectors, sizeof(*table_entries));
+    uint16_t *table_entries = kb_kzalloc((size_t)vectors * sizeof(*table_entries), 0);
     if (table_entries == NULL) {
         return -12;
     }
@@ -1338,7 +1675,7 @@ int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec)
         if (status != 0) {
             kb_irq_clear_mappings();
             kb_pci_subsystem_irq_vectors_clear();
-            free(table_entries);
+            kb_kfree(table_entries);
             return status;
         }
         linux_vectors[i] = linux_irq;
@@ -1348,10 +1685,10 @@ int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec)
     if (kb_pci_msix_unmask_entries(dev, table_entries, (unsigned int)vectors) != 0) {
         kb_irq_clear_mappings();
         kb_pci_subsystem_irq_vectors_clear();
-        free(table_entries);
+        kb_kfree(table_entries);
         return -5;
     }
-    free(table_entries);
+    kb_kfree(table_entries);
 
     control |= KB_PCI_MSIX_CONTROL_ENABLE;
     control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
@@ -1434,6 +1771,24 @@ void *kb_pci_iomap(void *dev, int bar, unsigned long max)
         return NULL;
     }
 
+    shim_mmio_mapping_t *existing = retain_mmio_mapping_for_bar(backend, device, bar);
+    if (existing != NULL) {
+        if (trace_pci_enabled()) {
+            fprintf(
+                stderr,
+                "kobox pci: pci_iomap reuse bar=%d addr=%p size=%llu refs=%u\n",
+                bar,
+                existing->region.addr,
+                (unsigned long long)existing->region.size,
+                existing->refs);
+        }
+        if (bar == 0) {
+            mapped_bar0_addr = existing->region.addr;
+            mapped_bar0_size = (size_t)existing->region.size;
+        }
+        return existing->region.addr;
+    }
+
     kb_mmio_region_t region;
     if (ops->map_bar(device, (unsigned)bar, &region) != KB_OK) {
         return NULL;
@@ -1503,6 +1858,27 @@ void *kb_ioremap(uint64_t phys_addr, size_t size)
         return NULL;
     }
 
+    shim_mmio_mapping_t *existing = retain_mmio_mapping_for_bar(backend, device, 0);
+    if (existing != NULL) {
+        uint64_t offset = phys_addr - bar.start;
+        if (offset <= existing->region.size && size <= existing->region.size - offset) {
+            void *mapped_addr = (unsigned char *)existing->region.addr + offset;
+            if (trace_pci_enabled()) {
+                fprintf(
+                    stderr,
+                    "kobox pci: ioremap reuse phys=0x%llx size=%zu addr=%p refs=%u\n",
+                    (unsigned long long)phys_addr,
+                    size,
+                    mapped_addr,
+                    existing->refs);
+            }
+            mapped_bar0_addr = existing->region.addr;
+            mapped_bar0_size = (size_t)existing->region.size;
+            return mapped_addr;
+        }
+        (void)take_mmio_mapping(existing->region.addr);
+    }
+
     kb_mmio_region_t region;
     if (ops->map_bar(device, 0, &region) != KB_OK) {
         return NULL;
@@ -1531,18 +1907,25 @@ int kb_pci_xhci_irq_pending(void)
         KB_XHCI_CAPLENGTH_OFFSET = 0x00,
         KB_XHCI_HCSPARAMS1_OFFSET = 0x04,
         KB_XHCI_HCIVERSION_OFFSET = 0x02,
+        KB_XHCI_RTSOFF_OFFSET = 0x18,
         KB_XHCI_USBSTS_OFFSET = 0x04,
         KB_XHCI_PORT_REGS_OFFSET = 0x400,
         KB_XHCI_PORT_REGS_STRIDE = 0x10,
         KB_XHCI_USBSTS_EINT = 1u << 3,
         KB_XHCI_PORTSC_CHANGE_MASK = 0x00fe0000u,
+        KB_XHCI_INTERRUPTER0_OFFSET = 0x20,
+        KB_XHCI_IMAN_OFFSET = 0x00,
+        KB_XHCI_ERSTSZ_OFFSET = 0x08,
+        KB_XHCI_ERSTBA_OFFSET = 0x10,
+        KB_XHCI_ERDP_OFFSET = 0x18,
     };
 
-    if (mapped_bar0_addr == NULL || mapped_bar0_size < 0x40) {
+    volatile unsigned char *base = NULL;
+    size_t bar0_size = 0;
+    if (!cached_bar0_snapshot(&base, &bar0_size)) {
         return 0;
     }
 
-    volatile unsigned char *base = mapped_bar0_addr;
     uint32_t cap_header = *(volatile uint32_t *)(base + KB_XHCI_CAPLENGTH_OFFSET);
     uint8_t caplength = (uint8_t)(cap_header & 0xffu);
     uint16_t raw_version = (uint16_t)((cap_header >> 16) & 0xffffu);
@@ -1550,14 +1933,14 @@ int kb_pci_xhci_irq_pending(void)
         static unsigned trace_count;
         if ((trace_count++ & 0x3fu) == 0) {
             fprintf(stderr, "kobox xhci: bar=%p size=%zu header=0x%08x cap=0x%02x version=0x%04x\n",
-                mapped_bar0_addr,
-                mapped_bar0_size,
+                (const void *)base,
+                bar0_size,
                 cap_header,
                 caplength,
                 raw_version);
         }
     }
-    if (caplength < 0x20 || (size_t)caplength + KB_XHCI_USBSTS_OFFSET + sizeof(uint32_t) > mapped_bar0_size) {
+    if (caplength < 0x20 || (size_t)caplength + KB_XHCI_USBSTS_OFFSET + sizeof(uint32_t) > bar0_size) {
         return 0;
     }
 
@@ -1572,7 +1955,7 @@ int kb_pci_xhci_irq_pending(void)
     for (unsigned port = 0; port < max_ports; port++) {
         size_t portsc_offset = (size_t)caplength + KB_XHCI_PORT_REGS_OFFSET +
             ((size_t)port * KB_XHCI_PORT_REGS_STRIDE);
-        if (portsc_offset + sizeof(uint32_t) > mapped_bar0_size) {
+        if (portsc_offset + sizeof(uint32_t) > bar0_size) {
             break;
         }
         volatile uint32_t *portsc = (volatile uint32_t *)(base + portsc_offset);
@@ -1581,16 +1964,54 @@ int kb_pci_xhci_irq_pending(void)
             break;
         }
     }
+    int event_ring_pending = 0;
+    uint32_t rtsoff = *(volatile uint32_t *)(base + KB_XHCI_RTSOFF_OFFSET) & ~UINT32_C(31);
+    unsigned int max_intrs = xhci_max_interrupters(hcsparams1);
+    for (unsigned int intr = 0; intr < max_intrs; intr++) {
+        xhci_interrupter_snapshot_t snapshot;
+        if (!xhci_interrupter_snapshot(base, bar0_size, rtsoff, intr, &snapshot)) {
+            break;
+        }
+        if (snapshot.event_pending) {
+            event_ring_pending = 1;
+            break;
+        }
+    }
     if (trace_xhci_enabled()) {
         static unsigned status_trace_count;
         if ((status_trace_count++ & 0x3fu) == 0) {
             volatile uint32_t *usbcmd = (volatile uint32_t *)(base + caplength);
+            volatile uint32_t *config = (volatile uint32_t *)(base + caplength + 0x38);
             fprintf(
                 stderr,
-                "kobox xhci: usbcmd=0x%08x usbsts=0x%08x port_change=%d\n",
+                "kobox xhci: usbcmd=0x%08x usbsts=0x%08x config=0x%08x port_change=%d event_pending=%d rtsoff=0x%08x max_intrs=%u\n",
                 *usbcmd,
                 *usbsts,
-                port_change_pending);
+                *config,
+                port_change_pending,
+                event_ring_pending,
+                rtsoff,
+                max_intrs);
+            for (unsigned int intr = 0; intr < max_intrs; intr++) {
+                xhci_interrupter_snapshot_t snapshot;
+                if (!xhci_interrupter_snapshot(base, bar0_size, rtsoff, intr, &snapshot)) {
+                    break;
+                }
+                fprintf(
+                    stderr,
+                    "kobox xhci: intr%u iman=0x%08x erstsz=0x%08x erstba=0x%016llx erdp=0x%016llx event_visible=%d event_pending=%d event=%08x %08x %08x %08x\n",
+                    intr,
+                    snapshot.iman,
+                    snapshot.erstsz,
+                    (unsigned long long)snapshot.erstba,
+                    (unsigned long long)snapshot.erdp,
+                    snapshot.event_visible,
+                    snapshot.event_pending,
+                    snapshot.event_words[0],
+                    snapshot.event_words[1],
+                    snapshot.event_words[2],
+                    snapshot.event_words[3]);
+            }
             unsigned trace_ports = max_ports;
             if (trace_ports > 8u) {
                 trace_ports = 8u;
@@ -1598,36 +2019,492 @@ int kb_pci_xhci_irq_pending(void)
             for (unsigned port = 0; port < trace_ports; port++) {
                 size_t portsc_offset = (size_t)caplength + KB_XHCI_PORT_REGS_OFFSET +
                     ((size_t)port * KB_XHCI_PORT_REGS_STRIDE);
-                if (portsc_offset + sizeof(uint32_t) > mapped_bar0_size) {
+                if (portsc_offset + sizeof(uint32_t) > bar0_size) {
                     break;
                 }
                 volatile uint32_t *portsc = (volatile uint32_t *)(base + portsc_offset);
                 fprintf(stderr, "kobox xhci: port%u portsc=0x%08x\n", port + 1u, *portsc);
             }
+            trace_msix_state(binding.pci_dev_storage, "irq-pending");
         }
     }
-    return ((*usbsts & KB_XHCI_USBSTS_EINT) != 0 || port_change_pending) ? 1 : 0;
+    return ((*usbsts & KB_XHCI_USBSTS_EINT) != 0 || port_change_pending || event_ring_pending) ? 1 : 0;
+}
+
+static int xhci_mmio_layout(
+    volatile unsigned char **base_out,
+    size_t *size_out,
+    uint8_t *caplength_out,
+    unsigned int *max_ports_out)
+{
+    enum {
+        KB_XHCI_CAPLENGTH_OFFSET = 0x00,
+        KB_XHCI_HCSPARAMS1_OFFSET = 0x04,
+    };
+
+    if (base_out != NULL) {
+        *base_out = NULL;
+    }
+    if (size_out != NULL) {
+        *size_out = 0;
+    }
+    if (caplength_out != NULL) {
+        *caplength_out = 0;
+    }
+    if (max_ports_out != NULL) {
+        *max_ports_out = 0;
+    }
+    volatile unsigned char *base = NULL;
+    size_t bar0_size = 0;
+    if (!cached_bar0_snapshot(&base, &bar0_size)) {
+        return 0;
+    }
+
+    uint32_t cap_header = *(volatile uint32_t *)(base + KB_XHCI_CAPLENGTH_OFFSET);
+    uint8_t caplength = (uint8_t)(cap_header & 0xffu);
+    uint16_t raw_version = (uint16_t)((cap_header >> 16) & 0xffffu);
+    if (caplength < 0x20 || raw_version < 0x0090 || raw_version > 0x0120) {
+        return 0;
+    }
+
+    uint32_t hcsparams1 = *(volatile uint32_t *)(base + KB_XHCI_HCSPARAMS1_OFFSET);
+    unsigned int max_ports = (hcsparams1 >> 24) & 0xffu;
+    if (max_ports == 0) {
+        return 0;
+    }
+
+    if (base_out != NULL) {
+        *base_out = base;
+    }
+    if (size_out != NULL) {
+        *size_out = bar0_size;
+    }
+    if (caplength_out != NULL) {
+        *caplength_out = caplength;
+    }
+    if (max_ports_out != NULL) {
+        *max_ports_out = max_ports;
+    }
+    return 1;
+}
+
+unsigned int kb_pci_xhci_max_ports(void)
+{
+    unsigned int max_ports = 0;
+    return xhci_mmio_layout(NULL, NULL, NULL, &max_ports) ? max_ports : 0;
+}
+
+int kb_pci_xhci_port_status(unsigned int port, uint16_t *status_out, uint16_t *change_out)
+{
+    enum {
+        KB_XHCI_PORT_REGS_OFFSET = 0x400,
+        KB_XHCI_PORT_REGS_STRIDE = 0x10,
+        KB_XHCI_PORTSC_CCS = 1u << 0,
+        KB_XHCI_PORTSC_PED = 1u << 1,
+        KB_XHCI_PORTSC_OCA = 1u << 3,
+        KB_XHCI_PORTSC_PR = 1u << 4,
+        KB_XHCI_PORTSC_PP = 1u << 9,
+        KB_XHCI_PORTSC_SPEED_SHIFT = 10,
+        KB_XHCI_PORTSC_SPEED_MASK = 0xfu << KB_XHCI_PORTSC_SPEED_SHIFT,
+        KB_XHCI_PORTSC_CSC = 1u << 17,
+        KB_XHCI_PORTSC_PEC = 1u << 18,
+        KB_XHCI_PORTSC_OCC = 1u << 20,
+        KB_XHCI_PORTSC_PRC = 1u << 21,
+        KB_XHCI_PORTSC_PLC = 1u << 22,
+        KB_XHCI_PORTSC_CEC = 1u << 23,
+        USB_PORT_STAT_CONNECTION = 0x0001,
+        USB_PORT_STAT_ENABLE = 0x0002,
+        USB_PORT_STAT_OVER_CURRENT = 0x0008,
+        USB_PORT_STAT_RESET = 0x0010,
+        USB_PORT_STAT_POWER = 0x0100,
+        USB_PORT_STAT_LOW_SPEED = 0x0200,
+        USB_PORT_STAT_HIGH_SPEED = 0x0400,
+        USB_PORT_STAT_SUPER_SPEED = 0x0800,
+        USB_PORT_STAT_C_CONNECTION = 0x0001,
+        USB_PORT_STAT_C_ENABLE = 0x0002,
+        USB_PORT_STAT_C_OVER_CURRENT = 0x0008,
+        USB_PORT_STAT_C_RESET = 0x0010,
+        USB_PORT_STAT_C_LINK_STATE = 0x0040,
+        USB_PORT_STAT_C_CONFIG_ERROR = 0x0080,
+    };
+
+    if (status_out != NULL) {
+        *status_out = 0;
+    }
+    if (change_out != NULL) {
+        *change_out = 0;
+    }
+
+    volatile unsigned char *base = NULL;
+    size_t bar0_size = 0;
+    uint8_t caplength = 0;
+    unsigned int max_ports = 0;
+    if (!xhci_mmio_layout(&base, &bar0_size, &caplength, &max_ports) || port == 0 || port > max_ports) {
+        return -19;
+    }
+
+    size_t portsc_offset = (size_t)caplength + KB_XHCI_PORT_REGS_OFFSET +
+        ((size_t)(port - 1u) * KB_XHCI_PORT_REGS_STRIDE);
+    if (portsc_offset + sizeof(uint32_t) > bar0_size) {
+        return -19;
+    }
+
+    uint32_t portsc = *(volatile uint32_t *)(base + portsc_offset);
+    uint16_t status = 0;
+    uint16_t change = 0;
+    if ((portsc & KB_XHCI_PORTSC_CCS) != 0) {
+        status |= USB_PORT_STAT_CONNECTION;
+    }
+    if ((portsc & KB_XHCI_PORTSC_PED) != 0) {
+        status |= USB_PORT_STAT_ENABLE;
+    }
+    if ((portsc & KB_XHCI_PORTSC_OCA) != 0) {
+        status |= USB_PORT_STAT_OVER_CURRENT;
+    }
+    if ((portsc & KB_XHCI_PORTSC_PR) != 0) {
+        status |= USB_PORT_STAT_RESET;
+    }
+    if ((portsc & KB_XHCI_PORTSC_PP) != 0) {
+        status |= USB_PORT_STAT_POWER;
+    }
+    unsigned int speed = (portsc & KB_XHCI_PORTSC_SPEED_MASK) >> KB_XHCI_PORTSC_SPEED_SHIFT;
+    if (speed == 2) {
+        status |= USB_PORT_STAT_LOW_SPEED;
+    } else if (speed == 3) {
+        status |= USB_PORT_STAT_HIGH_SPEED;
+    } else if (speed >= 4) {
+        status |= USB_PORT_STAT_SUPER_SPEED;
+    }
+
+    if ((portsc & KB_XHCI_PORTSC_CSC) != 0) {
+        change |= USB_PORT_STAT_C_CONNECTION;
+    }
+    if ((portsc & KB_XHCI_PORTSC_PEC) != 0) {
+        change |= USB_PORT_STAT_C_ENABLE;
+    }
+    if ((portsc & KB_XHCI_PORTSC_OCC) != 0) {
+        change |= USB_PORT_STAT_C_OVER_CURRENT;
+    }
+    if ((portsc & KB_XHCI_PORTSC_PRC) != 0) {
+        change |= USB_PORT_STAT_C_RESET;
+    }
+    if ((portsc & KB_XHCI_PORTSC_PLC) != 0) {
+        change |= USB_PORT_STAT_C_LINK_STATE;
+    }
+    if ((portsc & KB_XHCI_PORTSC_CEC) != 0) {
+        change |= USB_PORT_STAT_C_CONFIG_ERROR;
+    }
+
+    if (status_out != NULL) {
+        *status_out = status;
+    }
+    if (change_out != NULL) {
+        *change_out = change;
+    }
+    return 0;
+}
+
+int kb_pci_xhci_reset_port(unsigned int port)
+{
+    enum {
+        KB_XHCI_PORT_REGS_OFFSET = 0x400,
+        KB_XHCI_PORT_REGS_STRIDE = 0x10,
+        KB_XHCI_PORTSC_CCS = 1u << 0,
+        KB_XHCI_PORTSC_PED = 1u << 1,
+        KB_XHCI_PORTSC_PR = 1u << 4,
+        KB_XHCI_PORTSC_CHANGE_MASK = 0x00fe0000u,
+    };
+
+    volatile unsigned char *base = NULL;
+    size_t bar0_size = 0;
+    uint8_t caplength = 0;
+    unsigned int max_ports = 0;
+    if (!xhci_mmio_layout(&base, &bar0_size, &caplength, &max_ports) || port == 0 || port > max_ports) {
+        return -19;
+    }
+
+    size_t portsc_offset = (size_t)caplength + KB_XHCI_PORT_REGS_OFFSET +
+        ((size_t)(port - 1u) * KB_XHCI_PORT_REGS_STRIDE);
+    if (portsc_offset + sizeof(uint32_t) > bar0_size) {
+        return -19;
+    }
+
+    volatile uint32_t *portsc = (volatile uint32_t *)(base + portsc_offset);
+    uint32_t before = *portsc;
+    if ((before & KB_XHCI_PORTSC_CCS) == 0) {
+        return -19;
+    }
+
+    *portsc = (before & ~KB_XHCI_PORTSC_CHANGE_MASK) | KB_XHCI_PORTSC_PR;
+    for (unsigned int attempt = 0; attempt < 10000000u; attempt++) {
+        uint32_t current = *portsc;
+        if ((current & KB_XHCI_PORTSC_PR) != 0) {
+            continue;
+        }
+        if (trace_xhci_enabled()) {
+            fprintf(
+                stderr,
+                "kobox xhci: reset_port port=%u before=0x%08x after=0x%08x\n",
+                port,
+                before,
+                current);
+        }
+        return (current & (KB_XHCI_PORTSC_CCS | KB_XHCI_PORTSC_PED)) ==
+            (KB_XHCI_PORTSC_CCS | KB_XHCI_PORTSC_PED) ? 0 : -110;
+    }
+
+    if (trace_xhci_enabled()) {
+        fprintf(
+            stderr,
+            "kobox xhci: reset_port timeout port=%u before=0x%08x current=0x%08x\n",
+            port,
+            before,
+            *portsc);
+    }
+    return -110;
+}
+
+void kb_pci_xhci_ring_cmd_db(void *xhci)
+{
+    enum {
+        KB_LINUX_6_8_XHCI_DBA_OFFSET = 0x28,
+        KB_LINUX_6_8_XHCI_CMD_RING_OFFSET = 0x98,
+        KB_LINUX_6_8_XHCI_CMD_RING_STATE_OFFSET = 0xa0,
+        KB_XHCI_CAPLENGTH_OFFSET = 0x00,
+        KB_XHCI_HCSPARAMS1_OFFSET = 0x04,
+        KB_XHCI_HCCPARAMS1_OFFSET = 0x10,
+        KB_XHCI_DBOFF_OFFSET = 0x14,
+        KB_XHCI_RTSOFF_OFFSET = 0x18,
+        KB_XHCI_USBCMD_OFFSET = 0x00,
+        KB_XHCI_USBSTS_OFFSET = 0x04,
+        KB_XHCI_PAGESIZE_OFFSET = 0x08,
+        KB_XHCI_DNCTRL_OFFSET = 0x14,
+        KB_XHCI_CRCR_OFFSET = 0x18,
+        KB_XHCI_DCBAAP_OFFSET = 0x30,
+        KB_XHCI_CONFIG_OFFSET = 0x38,
+        KB_XHCI_INTERRUPTER0_OFFSET = 0x20,
+        KB_XHCI_IMAN_OFFSET = 0x00,
+        KB_XHCI_ERSTSZ_OFFSET = 0x08,
+        KB_XHCI_ERSTBA_OFFSET = 0x10,
+        KB_XHCI_ERDP_OFFSET = 0x18,
+        KB_LINUX_6_8_XHCI_RING_FIRST_SEG_OFFSET = 0x00,
+        KB_LINUX_6_8_XHCI_RING_ENQUEUE_OFFSET = 0x08,
+        KB_LINUX_6_8_XHCI_RING_ENQ_SEG_OFFSET = 0x10,
+        KB_LINUX_6_8_XHCI_RING_DEQUEUE_OFFSET = 0x18,
+        KB_LINUX_6_8_XHCI_RING_DEQ_SEG_OFFSET = 0x20,
+        KB_LINUX_6_8_XHCI_RING_CYCLE_OFFSET = 0x38,
+        KB_LINUX_6_8_XHCI_SEG_DMA_OFFSET = 0x08,
+        KB_LINUX_6_8_XHCI_SEG_NEXT_OFFSET = 0x10,
+    };
+
+    if ((uintptr_t)xhci < 4096u) {
+        if (trace_xhci_enabled()) {
+            fprintf(stderr, "kobox xhci: ring_cmd_db invalid xhci=%p\n", xhci);
+        }
+        return;
+    }
+
+    uintptr_t dba_addr = read_ulong_field((const unsigned char *)xhci + KB_LINUX_6_8_XHCI_DBA_OFFSET);
+    volatile unsigned char *base = NULL;
+    size_t bar0_size = 0;
+    if (!cached_bar0_snapshot(&base, &bar0_size)) {
+        if (trace_xhci_enabled()) {
+            fprintf(stderr, "kobox xhci: ring_cmd_db no bar xhci=%p dba=%p\n", xhci, (void *)dba_addr);
+        }
+        return;
+    }
+
+    uintptr_t base_addr = (uintptr_t)base;
+    if (dba_addr < base_addr || dba_addr - base_addr + sizeof(uint32_t) > bar0_size) {
+        if (trace_xhci_enabled()) {
+            uint32_t state = read_u32_field((const unsigned char *)xhci + KB_LINUX_6_8_XHCI_CMD_RING_STATE_OFFSET);
+            fprintf(
+                stderr,
+                "kobox xhci: ring_cmd_db outside-bar xhci=%p state=0x%08x dba=%p bar=%p size=%zu\n",
+                xhci,
+                state,
+                (void *)dba_addr,
+                (const void *)base,
+                bar0_size);
+        }
+        return;
+    }
+
+    volatile uint32_t *doorbell = (volatile uint32_t *)dba_addr;
+    if (trace_xhci_enabled()) {
+        uint32_t state = read_u32_field((const unsigned char *)xhci + KB_LINUX_6_8_XHCI_CMD_RING_STATE_OFFSET);
+        uint32_t cap_header = *(volatile uint32_t *)(base + KB_XHCI_CAPLENGTH_OFFSET);
+        uint8_t caplength = (uint8_t)(cap_header & 0xffu);
+        uint32_t hcsparams1 = *(volatile uint32_t *)(base + KB_XHCI_HCSPARAMS1_OFFSET);
+        uint32_t hccparams1 = *(volatile uint32_t *)(base + KB_XHCI_HCCPARAMS1_OFFSET);
+        uint32_t dboff = *(volatile uint32_t *)(base + KB_XHCI_DBOFF_OFFSET) & ~UINT32_C(3);
+        uint32_t rtsoff = *(volatile uint32_t *)(base + KB_XHCI_RTSOFF_OFFSET) & ~UINT32_C(31);
+        uint32_t usbcmd = 0;
+        uint32_t usbsts = 0;
+        uint32_t pagesize = 0;
+        uint32_t dnctrl = 0;
+        uint32_t config = 0;
+        uint64_t crcr = 0;
+        uint64_t dcbaap = 0;
+        if ((size_t)caplength + KB_XHCI_CONFIG_OFFSET + sizeof(uint32_t) <= bar0_size) {
+            volatile unsigned char *op = base + caplength;
+            usbcmd = *(volatile uint32_t *)(op + KB_XHCI_USBCMD_OFFSET);
+            usbsts = *(volatile uint32_t *)(op + KB_XHCI_USBSTS_OFFSET);
+            pagesize = *(volatile uint32_t *)(op + KB_XHCI_PAGESIZE_OFFSET);
+            dnctrl = *(volatile uint32_t *)(op + KB_XHCI_DNCTRL_OFFSET);
+            uint32_t crcr_low = *(volatile uint32_t *)(op + KB_XHCI_CRCR_OFFSET);
+            uint32_t crcr_high = *(volatile uint32_t *)(op + KB_XHCI_CRCR_OFFSET + sizeof(uint32_t));
+            uint32_t dcbaap_low = *(volatile uint32_t *)(op + KB_XHCI_DCBAAP_OFFSET);
+            uint32_t dcbaap_high = *(volatile uint32_t *)(op + KB_XHCI_DCBAAP_OFFSET + sizeof(uint32_t));
+            config = *(volatile uint32_t *)(op + KB_XHCI_CONFIG_OFFSET);
+            crcr = ((uint64_t)crcr_high << 32) | crcr_low;
+            dcbaap = ((uint64_t)dcbaap_high << 32) | dcbaap_low;
+        }
+        uint32_t iman = 0;
+        uint32_t erstsz = 0;
+        uint64_t erstba = 0;
+        uint64_t erdp = 0;
+        if ((size_t)rtsoff + KB_XHCI_INTERRUPTER0_OFFSET + KB_XHCI_ERDP_OFFSET +
+                sizeof(uint64_t) <= bar0_size)
+        {
+            volatile unsigned char *ir0 = base + rtsoff + KB_XHCI_INTERRUPTER0_OFFSET;
+            iman = *(volatile uint32_t *)(ir0 + KB_XHCI_IMAN_OFFSET);
+            erstsz = *(volatile uint32_t *)(ir0 + KB_XHCI_ERSTSZ_OFFSET);
+            uint32_t erstba_low = *(volatile uint32_t *)(ir0 + KB_XHCI_ERSTBA_OFFSET);
+            uint32_t erstba_high = *(volatile uint32_t *)(ir0 + KB_XHCI_ERSTBA_OFFSET + sizeof(uint32_t));
+            uint32_t erdp_low = *(volatile uint32_t *)(ir0 + KB_XHCI_ERDP_OFFSET);
+            uint32_t erdp_high = *(volatile uint32_t *)(ir0 + KB_XHCI_ERDP_OFFSET + sizeof(uint32_t));
+            erstba = ((uint64_t)erstba_high << 32) | erstba_low;
+            erdp = ((uint64_t)erdp_high << 32) | erdp_low;
+        }
+        uintptr_t cmd_ring_addr = read_ptr_field((const unsigned char *)xhci + KB_LINUX_6_8_XHCI_CMD_RING_OFFSET);
+        uintptr_t first_seg = 0;
+        uintptr_t enqueue = 0;
+        uintptr_t enq_seg = 0;
+        uintptr_t dequeue = 0;
+        uintptr_t deq_seg = 0;
+        uint32_t cycle = 0;
+        uint64_t seg_dma = 0;
+        uintptr_t seg_next = 0;
+        if (cmd_ring_addr >= 4096u) {
+            const unsigned char *cmd_ring = (const unsigned char *)cmd_ring_addr;
+            first_seg = read_ptr_field(cmd_ring + KB_LINUX_6_8_XHCI_RING_FIRST_SEG_OFFSET);
+            enqueue = read_ptr_field(cmd_ring + KB_LINUX_6_8_XHCI_RING_ENQUEUE_OFFSET);
+            enq_seg = read_ptr_field(cmd_ring + KB_LINUX_6_8_XHCI_RING_ENQ_SEG_OFFSET);
+            dequeue = read_ptr_field(cmd_ring + KB_LINUX_6_8_XHCI_RING_DEQUEUE_OFFSET);
+            deq_seg = read_ptr_field(cmd_ring + KB_LINUX_6_8_XHCI_RING_DEQ_SEG_OFFSET);
+            cycle = read_u32_field(cmd_ring + KB_LINUX_6_8_XHCI_RING_CYCLE_OFFSET);
+        }
+        if (first_seg >= 4096u) {
+            const unsigned char *seg = (const unsigned char *)first_seg;
+            seg_dma = read_ulong_field(seg + KB_LINUX_6_8_XHCI_SEG_DMA_OFFSET);
+            seg_next = read_ptr_field(seg + KB_LINUX_6_8_XHCI_SEG_NEXT_OFFSET);
+        }
+        fprintf(
+            stderr,
+            "kobox xhci: ring_cmd_db regs xhci=%p state=0x%08x cap=0x%02x hcs=0x%08x hcc=0x%08x dboff=0x%08x rtsoff=0x%08x usbcmd=0x%08x usbsts=0x%08x pagesize=0x%08x dnctrl=0x%08x crcr=0x%016llx dcbaap=0x%016llx config=0x%08x iman=0x%08x erstsz=0x%08x erstba=0x%016llx erdp=0x%016llx dba=%p offset=0x%zx\n",
+            xhci,
+            state,
+            caplength,
+            hcsparams1,
+            hccparams1,
+            dboff,
+            rtsoff,
+            usbcmd,
+            usbsts,
+            pagesize,
+            dnctrl,
+            (unsigned long long)crcr,
+            (unsigned long long)dcbaap,
+            config,
+            iman,
+            erstsz,
+            (unsigned long long)erstba,
+            (unsigned long long)erdp,
+            (void *)dba_addr,
+            (size_t)(dba_addr - base_addr));
+        fprintf(
+            stderr,
+            "kobox xhci: ring_cmd_db ring cmd_ring=%p first_seg=%p enqueue=%p enq_seg=%p dequeue=%p deq_seg=%p cycle=0x%08x seg_dma=0x%016llx seg_next=%p\n",
+            (void *)cmd_ring_addr,
+            (void *)first_seg,
+            (void *)enqueue,
+            (void *)enq_seg,
+            (void *)dequeue,
+            (void *)deq_seg,
+            cycle,
+            (unsigned long long)seg_dma,
+            (void *)seg_next);
+        unsigned int max_intrs = xhci_max_interrupters(hcsparams1);
+        for (unsigned int intr = 0; intr < max_intrs; intr++) {
+            xhci_interrupter_snapshot_t snapshot;
+            if (!xhci_interrupter_snapshot(base, bar0_size, rtsoff, intr, &snapshot)) {
+                break;
+            }
+            fprintf(
+                stderr,
+                "kobox xhci: ring_cmd_db intr%u iman=0x%08x erstsz=0x%08x erstba=0x%016llx erdp=0x%016llx event_visible=%d event_pending=%d event=%08x %08x %08x %08x\n",
+                intr,
+                snapshot.iman,
+                snapshot.erstsz,
+                (unsigned long long)snapshot.erstba,
+                (unsigned long long)snapshot.erdp,
+                snapshot.event_visible,
+                snapshot.event_pending,
+                snapshot.event_words[0],
+                snapshot.event_words[1],
+                snapshot.event_words[2],
+                snapshot.event_words[3]);
+        }
+        if ((crcr & ~UINT64_C(0x3f)) != 0) {
+            trace_xhci_dma_window("cmd", crcr & ~UINT64_C(0x3f), 64);
+        }
+        if (dcbaap != 0) {
+            trace_xhci_dma_window("dcbaa", dcbaap, 64);
+        }
+        if (erstba != 0) {
+            trace_xhci_dma_window("erst", erstba, 64);
+        }
+        if ((erdp & ~UINT64_C(0xf)) != 0) {
+            trace_xhci_dma_window("event", erdp & ~UINT64_C(0xf), 64);
+        }
+        trace_msix_state(binding.pci_dev_storage, "before-doorbell");
+    }
+    *doorbell = 0;
+    if (trace_xhci_enabled()) {
+        trace_msix_state(binding.pci_dev_storage, "after-doorbell");
+        fprintf(stderr, "kobox xhci: ring_cmd_db end xhci=%p dba=%p\n", xhci, (void *)dba_addr);
+    }
 }
 
 void kb_pci_xhci_ack_pending(void)
 {
-    enum {
-        KB_XHCI_CAPLENGTH_OFFSET = 0x00,
-        KB_XHCI_USBSTS_OFFSET = 0x04,
-        KB_XHCI_USBSTS_EINT = 1u << 3,
-        KB_XHCI_USBSTS_PCD = 1u << 4,
-    };
-
-    if (mapped_bar0_addr == NULL || mapped_bar0_size < 0x40) {
+    if (pachaos_backend_active()) {
         return;
     }
 
-    volatile unsigned char *base = mapped_bar0_addr;
+    enum {
+        KB_XHCI_CAPLENGTH_OFFSET = 0x00,
+        KB_XHCI_HCSPARAMS1_OFFSET = 0x04,
+        KB_XHCI_USBSTS_OFFSET = 0x04,
+        KB_XHCI_PORT_REGS_OFFSET = 0x400,
+        KB_XHCI_PORT_REGS_STRIDE = 0x10,
+        KB_XHCI_USBSTS_EINT = 1u << 3,
+        KB_XHCI_USBSTS_PCD = 1u << 4,
+        KB_XHCI_PORTSC_CHANGE_MASK = 0x00fe0000u,
+    };
+
+    volatile unsigned char *base = NULL;
+    size_t bar0_size = 0;
+    if (!cached_bar0_snapshot(&base, &bar0_size)) {
+        return;
+    }
+
     uint32_t cap_header = *(volatile uint32_t *)(base + KB_XHCI_CAPLENGTH_OFFSET);
     uint8_t caplength = (uint8_t)(cap_header & 0xffu);
     uint16_t raw_version = (uint16_t)((cap_header >> 16) & 0xffffu);
     if (caplength < 0x20 || raw_version < 0x0090 || raw_version > 0x0120 ||
-        (size_t)caplength + KB_XHCI_USBSTS_OFFSET + sizeof(uint32_t) > mapped_bar0_size)
+        (size_t)caplength + KB_XHCI_USBSTS_OFFSET + sizeof(uint32_t) > bar0_size)
     {
         return;
     }
@@ -1637,6 +2514,22 @@ void kb_pci_xhci_ack_pending(void)
     uint32_t status_ack = status & (KB_XHCI_USBSTS_EINT | KB_XHCI_USBSTS_PCD);
     if (status_ack != 0) {
         *usbsts = status_ack;
+    }
+
+    uint32_t hcsparams1 = *(volatile uint32_t *)(base + KB_XHCI_HCSPARAMS1_OFFSET);
+    unsigned max_ports = (hcsparams1 >> 24) & 0xffu;
+    for (unsigned port = 0; port < max_ports; port++) {
+        size_t portsc_offset = (size_t)caplength + KB_XHCI_PORT_REGS_OFFSET +
+            ((size_t)port * KB_XHCI_PORT_REGS_STRIDE);
+        if (portsc_offset + sizeof(uint32_t) > bar0_size) {
+            break;
+        }
+        volatile uint32_t *portsc = (volatile uint32_t *)(base + portsc_offset);
+        uint32_t value = *portsc;
+        uint32_t change = value & KB_XHCI_PORTSC_CHANGE_MASK;
+        if (change != 0) {
+            *portsc = (value & ~KB_XHCI_PORTSC_CHANGE_MASK) | change;
+        }
     }
 }
 

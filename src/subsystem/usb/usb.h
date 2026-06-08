@@ -16,6 +16,7 @@ typedef struct kb_usb_hcd_record {
     void *hcd;
     void *primary_hcd;
     void *regs;
+    int owns_storage;
     unsigned int irq;
     int irq_registered;
     int added;
@@ -28,6 +29,8 @@ typedef struct kb_usb_hcd_record {
     uint32_t port_resume_end_count;
     uint32_t wakeup_notification_count;
     uint32_t remote_wakeup_quirk_count;
+    unsigned long hub_event_bits;
+    struct kb_usb_hcd_record *next;
 } kb_usb_hcd_record_t;
 
 typedef struct kb_usb_hub_event_update {
@@ -214,6 +217,7 @@ typedef struct kb_usb_driver_snapshot {
 } kb_usb_driver_snapshot_t;
 
 kb_usb_hcd_record_t *kb_usb_subsystem_hcd_alloc(size_t storage_size);
+kb_usb_hcd_record_t *kb_usb_subsystem_hcd_track(void *hcd);
 kb_usb_hcd_record_t *kb_usb_subsystem_hcd_for_hcd(void *hcd);
 kb_usb_hcd_record_t *kb_usb_subsystem_primary_hcd_for_owner(void *owner);
 void kb_usb_subsystem_hcd_release(kb_usb_hcd_record_t *record);
@@ -246,6 +250,10 @@ void kb_usb_subsystem_urb_submit(void *hcd, void *urb, unsigned int mem_flags, i
 void kb_usb_subsystem_urb_kill(void *hcd, void *urb);
 void kb_usb_subsystem_urb_giveback(void *hcd, void *urb, int status);
 int kb_usb_subsystem_urb_snapshot(const void *urb, kb_usb_urb_snapshot_t *out_snapshot);
+size_t kb_usb_subsystem_urb_count(void);
+int kb_usb_subsystem_for_each_urb(
+    int (*callback)(const kb_usb_urb_snapshot_t *snapshot, void *ctx),
+    void *ctx);
 int kb_usb_subsystem_device_observe(const kb_usb_device_update_t *update);
 void kb_usb_subsystem_device_remove(void *udev);
 int kb_usb_subsystem_device_snapshot(const void *udev, kb_usb_device_snapshot_t *out_snapshot);

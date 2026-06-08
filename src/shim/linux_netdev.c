@@ -1,5 +1,7 @@
 #include "kobox/shim.h"
 
+#include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,12 +20,61 @@ typedef struct kb_netdev_record {
     int registered;
 } kb_netdev_record_t;
 
+typedef struct kb_rwsem_record {
+    void *sem;
+    unsigned int readers;
+    unsigned int writer;
+    struct kb_rwsem_record *next;
+} kb_rwsem_record_t;
+
 static unsigned long possible_cpu_mask_storage = 1;
 unsigned long *__cpu_possible_mask = &possible_cpu_mask_storage;
 unsigned int nr_cpu_ids = 1;
 unsigned long this_cpu_off = 0;
 char pernet_ops_rwsem[64];
 static kb_netdev_record_t netdev_records[KB_NETDEV_TRACKED_MAX];
+static atomic_flag rwsem_records_lock = ATOMIC_FLAG_INIT;
+static kb_rwsem_record_t *rwsem_records;
+
+static int trace_lock_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *value = getenv("KOBOX_TRACE_LOCK");
+    cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    return cached;
+}
+
+static void rwsem_table_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&rwsem_records_lock, memory_order_acquire)) {
+    }
+}
+
+static void rwsem_table_unlock(void)
+{
+    atomic_flag_clear_explicit(&rwsem_records_lock, memory_order_release);
+}
+
+static kb_rwsem_record_t *rwsem_record_get_locked(void *sem)
+{
+    for (kb_rwsem_record_t *record = rwsem_records; record != NULL; record = record->next) {
+        if (record->sem == sem) {
+            return record;
+        }
+    }
+
+    kb_rwsem_record_t *record = calloc(1, sizeof(*record));
+    if (record == NULL) {
+        return NULL;
+    }
+    record->sem = sem;
+    record->next = rwsem_records;
+    rwsem_records = record;
+    return record;
+}
 
 static kb_netdev_record_t *find_netdev_record(void *dev)
 {
@@ -229,14 +280,97 @@ int kb_ethtool_op_get_ts_info(void *dev, void *info)
     return 0;
 }
 
+void kb_init_rwsem(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    rwsem_table_lock();
+    kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
+    if (record != NULL) {
+        record->readers = 0;
+        record->writer = 0;
+    }
+    rwsem_table_unlock();
+    if (trace_lock_enabled()) {
+        fprintf(stderr, "kobox lock: init_rwsem sem=%p\n", sem);
+    }
+}
+
+void kb_down_read(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    for (;;) {
+        rwsem_table_lock();
+        kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
+        if (record == NULL || record->writer == 0) {
+            if (record != NULL) {
+                record->readers++;
+            }
+            rwsem_table_unlock();
+            if (trace_lock_enabled()) {
+                fprintf(stderr, "kobox lock: down_read sem=%p\n", sem);
+            }
+            return;
+        }
+        rwsem_table_unlock();
+    }
+}
+
+void kb_up_read(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    rwsem_table_lock();
+    kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
+    if (record != NULL && record->readers > 0) {
+        record->readers--;
+    }
+    rwsem_table_unlock();
+    if (trace_lock_enabled()) {
+        fprintf(stderr, "kobox lock: up_read sem=%p\n", sem);
+    }
+}
+
 void kb_down_write(void *sem)
 {
-    (void)sem;
+    if (sem == NULL) {
+        return;
+    }
+    for (;;) {
+        rwsem_table_lock();
+        kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
+        if (record == NULL || (record->writer == 0 && record->readers == 0)) {
+            if (record != NULL) {
+                record->writer = 1;
+            }
+            rwsem_table_unlock();
+            if (trace_lock_enabled()) {
+                fprintf(stderr, "kobox lock: down_write sem=%p\n", sem);
+            }
+            return;
+        }
+        rwsem_table_unlock();
+    }
 }
 
 void kb_up_write(void *sem)
 {
-    (void)sem;
+    if (sem == NULL) {
+        return;
+    }
+    rwsem_table_lock();
+    kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
+    if (record != NULL) {
+        record->writer = 0;
+    }
+    rwsem_table_unlock();
+    if (trace_lock_enabled()) {
+        fprintf(stderr, "kobox lock: up_write sem=%p\n", sem);
+    }
 }
 
 unsigned long kb_find_next_bit(const unsigned long *addr, unsigned long size, unsigned long offset)

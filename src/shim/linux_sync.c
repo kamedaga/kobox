@@ -1,14 +1,22 @@
 #include "kobox/shim.h"
+#include "subsystem/usb/usb.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#define fprintf(stream, ...) kb_tracef(__VA_ARGS__)
+
 static int trace_work_enabled(void)
 {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
     const char *value = getenv("KOBOX_TRACE_WORK");
-    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    return cached;
 }
 
 void kb_mutex_init(void *lock)
@@ -79,6 +87,9 @@ static void run_wait_progress(void)
     } else {
         kb_run_deferred_work();
     }
+    if (kb_usb_root_hub_poll_needed()) {
+        (void)kb_usb_poll_root_hubs();
+    }
 }
 
 unsigned long kb_wait_for_completion(void *completion)
@@ -87,9 +98,12 @@ unsigned long kb_wait_for_completion(void *completion)
         return 0;
     }
     if (trace_work_enabled()) {
-        fprintf(stderr, "kobox work: wait_for_completion completion=%p\n", completion);
+        fprintf(stderr,
+            "kobox work: wait_for_completion completion=%p caller=%p\n",
+            completion,
+            __builtin_return_address(0));
     }
-    for (unsigned i = 0; i < 20; i++) {
+    for (unsigned i = 0; i < 10000; i++) {
         run_wait_progress();
         (void)kb_handle_any_irq_no_work(0);
         uint32_t done = 0;
@@ -98,13 +112,21 @@ unsigned long kb_wait_for_completion(void *completion)
             done--;
             memcpy(completion, &done, sizeof(done));
             if (trace_work_enabled()) {
-                fprintf(stderr, "kobox work: wait_for_completion done completion=%p remaining=%u\n", completion, done);
+                fprintf(stderr,
+                    "kobox work: wait_for_completion done completion=%p remaining=%u caller=%p\n",
+                    completion,
+                    done,
+                    __builtin_return_address(0));
             }
             return 1;
         }
+        (void)kb_handle_any_irq_no_work(1000000ull);
     }
     if (trace_work_enabled()) {
-        fprintf(stderr, "kobox work: wait_for_completion timeout completion=%p\n", completion);
+        fprintf(stderr,
+            "kobox work: wait_for_completion timeout completion=%p caller=%p\n",
+            completion,
+            __builtin_return_address(0));
     }
     return 0;
 }
@@ -115,9 +137,13 @@ unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long 
         return 0;
     }
     if (trace_work_enabled()) {
-        fprintf(stderr, "kobox work: wait_for_completion_timeout completion=%p timeout=%lu\n", completion, timeout);
+        fprintf(stderr,
+            "kobox work: wait_for_completion_timeout completion=%p timeout=%lu caller=%p\n",
+            completion,
+            timeout,
+            __builtin_return_address(0));
     }
-    const unsigned long loops = timeout == 0 ? 20 : (timeout > 100 ? 100 : timeout);
+    const unsigned long loops = timeout == 0 ? 20 : (timeout > 10000 ? 10000 : timeout);
     for (unsigned long i = 0; i < loops; i++) {
         run_wait_progress();
         (void)kb_handle_any_irq_no_work(0);
@@ -129,17 +155,22 @@ unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long 
             if (trace_work_enabled()) {
                 fprintf(
                     stderr,
-                    "kobox work: wait_for_completion_timeout done completion=%p remaining=%u left=%lu\n",
+                    "kobox work: wait_for_completion_timeout done completion=%p remaining=%u left=%lu caller=%p\n",
                     completion,
                     done,
-                    timeout == 0 ? 1 : timeout - i);
+                    timeout == 0 ? 1 : timeout - i,
+                    __builtin_return_address(0));
             }
             return timeout == 0 ? 1 : timeout - i;
         }
         (void)kb_handle_any_irq_no_work(1000000ull);
     }
     if (trace_work_enabled()) {
-        fprintf(stderr, "kobox work: wait_for_completion_timeout expired completion=%p timeout=%lu\n", completion, timeout);
+        fprintf(stderr,
+            "kobox work: wait_for_completion_timeout expired completion=%p timeout=%lu caller=%p\n",
+            completion,
+            timeout,
+            __builtin_return_address(0));
     }
     return 0;
 }

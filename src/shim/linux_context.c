@@ -5,6 +5,7 @@
 #include "kobox/shim.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #if !defined(_WIN32) && defined(__x86_64__)
@@ -68,5 +69,11 @@ void kb_shim_leave_kernel_gs(unsigned long old_gs)
 
 void kb_stack_chk_fail(void)
 {
+    fprintf(stderr,
+        "kobox-shim: stack check failure caller=%p external_target=%p caller_gs=0x%lx callee_gs=0x%lx\n",
+        __builtin_return_address(0),
+        kb_module_current_external_call_target(),
+        kb_module_current_external_call_caller_gs(),
+        kb_module_current_external_call_callee_gs());
     abort();
 }

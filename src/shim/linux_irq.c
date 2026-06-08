@@ -1,4 +1,5 @@
 #include "kobox/shim.h"
+#include "subsystem/usb/usb.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,15 @@ typedef struct shim_irq {
 } shim_irq_t;
 
 static shim_irq_t *irq_list;
+
+static int irq_entry_is_usb_hcd(const shim_irq_t *entry)
+{
+    if (entry == NULL || entry->dev_id == NULL) {
+        return 0;
+    }
+    kb_usb_hcd_snapshot_t snapshot;
+    return kb_usb_subsystem_hcd_snapshot(entry->dev_id, &snapshot) == 0;
+}
 
 enum {
     KB_IRQ_BACKEND_KIND_SHIFT = 30,
@@ -95,12 +105,23 @@ static void irq_trampoline(void *ctx)
 {
     shim_irq_t *irq = ctx;
     unsigned long old_gs = 0;
-    int has_gs = kb_shim_enter_kernel_gs(irq->kernel_gs, &old_gs) == 0;
+    unsigned long handler_gs = irq->handler == NULL ? 0 : kb_module_kernel_gs_for_address((const void *)irq->handler);
+    unsigned long thread_gs = irq->thread_fn == NULL ? 0 : kb_module_kernel_gs_for_address((const void *)irq->thread_fn);
+    unsigned long kernel_gs = handler_gs != 0 ? handler_gs : thread_gs;
+    if (kernel_gs == 0) {
+        kernel_gs = irq->kernel_gs;
+    }
+    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
     if (irq->handler != NULL) {
-        (void)irq->handler((int)irq->irq, irq->dev_id);
+        (void)kb_linux_call_int_int_ptr(irq->handler, (int)irq->irq, irq->dev_id);
+    }
+    if (has_gs && handler_gs != 0 && thread_gs != 0 && handler_gs != thread_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+        kernel_gs = thread_gs;
+        has_gs = kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
     }
     if (irq->thread_fn != NULL) {
-        (void)irq->thread_fn((int)irq->irq, irq->dev_id);
+        (void)kb_linux_call_int_int_ptr(irq->thread_fn, (int)irq->irq, irq->dev_id);
     }
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
@@ -109,8 +130,11 @@ static void irq_trampoline(void *ctx)
 
 static void poll_root_hub_for_irq(const shim_irq_t *irq)
 {
+    if (!kb_usb_root_hub_poll_needed()) {
+        return;
+    }
     unsigned long old_gs = 0;
-    int has_gs = kb_shim_enter_kernel_gs(irq->kernel_gs, &old_gs) == 0;
+    int has_gs = irq->kernel_gs != 0 && kb_shim_enter_kernel_gs(irq->kernel_gs, &old_gs) == 0;
     (void)kb_usb_poll_root_hub(irq->dev_id);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
@@ -138,7 +162,7 @@ int kb_request_threaded_irq(
         return -19;
     }
 
-    shim_irq_t *entry = calloc(1, sizeof(*entry));
+    shim_irq_t *entry = kb_kzalloc(sizeof(*entry), 0);
     if (entry == NULL) {
         return -12;
     }
@@ -150,7 +174,27 @@ int kb_request_threaded_irq(
     entry->kernel_gs = kb_shim_current_kernel_gs();
 
     const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    if (ops == NULL || ops->irq_register == NULL) {
+        kb_kfree(entry);
+        return -19;
+    }
     unsigned int backend_vector = kb_irq_backend_vector(irq);
+    if (trace_irq_enabled()) {
+        void *device_backend = device == NULL ? NULL : *(void **)device;
+        fprintf(
+            stderr,
+            "kobox irq: dispatch irq=%u backend_vector=0x%x backend=%p ops=%p irq_register=%p device=%p device_backend=%p handler=%p thread=%p dev_id=%p\n",
+            irq,
+            backend_vector,
+            (void *)backend,
+            (const void *)ops,
+            (void *)ops->irq_register,
+            (void *)device,
+            device_backend,
+            (void *)handler,
+            (void *)thread_fn,
+            dev_id);
+    }
     status = ops->irq_register(device, backend_vector, irq_trampoline, entry, &entry->backend_irq);
     if (status != KB_OK) {
         fprintf(
@@ -160,7 +204,7 @@ int kb_request_threaded_irq(
             backend_vector,
             dev_id,
             status);
-        free(entry);
+        kb_kfree(entry);
         return -5;
     }
 
@@ -187,7 +231,7 @@ void kb_free_irq(unsigned int irq, void *dev_id)
             if (ops != NULL && ops->irq_unregister != NULL) {
                 ops->irq_unregister(entry->device, entry->backend_irq);
             }
-            free(entry);
+            kb_kfree(entry);
             return;
         }
         cursor = &entry->next;
@@ -206,7 +250,7 @@ void kb_free_all_irqs(void)
         if (ops != NULL && ops->irq_unregister != NULL) {
             ops->irq_unregister(entry->device, entry->backend_irq);
         }
-        free(entry);
+        kb_kfree(entry);
     }
 }
 
@@ -228,15 +272,21 @@ int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
         entry->thread_fn = NULL;
         kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
         int xhci_pending = kb_pci_xhci_irq_pending();
+        int usb_hcd_irq = irq_entry_is_usb_hcd(entry);
+        entry->handler = handler;
+        entry->thread_fn = thread_fn;
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (xhci_pending) {
+        if (xhci_pending && status != KB_OK) {
+            irq_trampoline(entry);
+        }
+        if (xhci_pending || (status == KB_OK && usb_hcd_irq)) {
             poll_root_hub_for_irq(entry);
+        }
+        if (xhci_pending) {
             kb_pci_xhci_ack_pending();
         }
-        entry->handler = handler;
-        entry->thread_fn = thread_fn;
         kb_run_deferred_work();
         if (trace_irq_enabled()) {
             fprintf(stderr, "kobox irq: wait dev_id=%p status=%d\n", dev_id, status);
@@ -291,13 +341,19 @@ int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
         entry->thread_fn = NULL;
         kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
         int xhci_pending = kb_pci_xhci_irq_pending();
+        int usb_hcd_irq = irq_entry_is_usb_hcd(entry);
         entry->handler = handler;
         entry->thread_fn = thread_fn;
         if (status == KB_OK) {
             irq_trampoline(entry);
         }
-        if (xhci_pending) {
+        if (xhci_pending && status != KB_OK) {
+            irq_trampoline(entry);
+        }
+        if (xhci_pending || (status == KB_OK && usb_hcd_irq)) {
             poll_root_hub_for_irq(entry);
+        }
+        if (xhci_pending) {
             kb_pci_xhci_ack_pending();
         }
         kb_run_deferred_work();
@@ -315,33 +371,46 @@ static int handle_any_irq(uint64_t timeout_ns, int run_work)
     if (ops == NULL || ops->irq_wait == NULL) {
         return -95;
     }
+    int handled = 0;
+    int saw_xhci_pending = 0;
     for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
         int (*handler)(int, void *) = entry->handler;
         int (*thread_fn)(int, void *) = entry->thread_fn;
         entry->handler = NULL;
         entry->thread_fn = NULL;
-        kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, timeout_ns);
-        int xhci_pending = kb_pci_xhci_irq_pending();
+        kb_status_t status = ops->irq_wait(entry->device, entry->backend_irq, handled ? 0 : timeout_ns);
+        int xhci_pending = !saw_xhci_pending && kb_pci_xhci_irq_pending();
+        int usb_hcd_irq = irq_entry_is_usb_hcd(entry);
         entry->handler = handler;
         entry->thread_fn = thread_fn;
         if (status == KB_OK) {
             irq_trampoline(entry);
+            handled = 1;
         }
-        if (xhci_pending) {
-            (void)kb_usb_synthesize_connected_storage();
-            kb_pci_xhci_ack_pending();
+        if (xhci_pending && status != KB_OK) {
+            irq_trampoline(entry);
+            handled = 1;
+        }
+        if (xhci_pending || (status == KB_OK && usb_hcd_irq)) {
+            saw_xhci_pending = 1;
+            handled = 1;
         }
         if (trace_irq_enabled()) {
             fprintf(stderr, "kobox irq: handle-any irq=%u dev_id=%p status=%d\n", entry->irq, entry->dev_id, status);
         }
-        if (status == KB_OK) {
-            if (run_work) {
-                kb_run_deferred_work();
-            } else {
-                kb_run_deferred_bottom_halves();
-            }
-            return 0;
+    }
+    if (saw_xhci_pending) {
+        (void)kb_usb_synthesize_connected_storage();
+        (void)kb_usb_synthesize_connected_hid_mouse();
+        kb_pci_xhci_ack_pending();
+    }
+    if (handled) {
+        if (run_work) {
+            kb_run_deferred_work();
+        } else {
+            kb_run_deferred_bottom_halves();
         }
+        return 0;
     }
     if (run_work) {
         kb_run_deferred_work();

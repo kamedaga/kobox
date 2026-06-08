@@ -11,9 +11,16 @@
 #include <string.h>
 #include <time.h>
 
+#define fprintf(stream, ...) kb_tracef(__VA_ARGS__)
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #endif
 
 kb_backend_t *kb_shim_current_backend(void);
@@ -34,6 +41,7 @@ enum {
     KB_LINUX_TIMER_EXPIRES_OFFSET = 16,
     KB_LINUX_TIMER_FUNCTION_OFFSET = 24,
     KB_DEFERRED_DRAIN_LIMIT = 1024,
+    KB_DEFERRED_LIST_WALK_LIMIT = 65536,
     KB_JIFFIES_STORAGE_MAX = 64,
     KB_WORK_STRUCT_PENDING_BIT = 0,
     KB_TASKLET_STATE_SCHED = 0,
@@ -53,8 +61,17 @@ typedef struct kb_deferred_item {
     struct kb_deferred_item *next;
 } kb_deferred_item_t;
 
+typedef struct kb_deferred_item_block {
+    struct kb_deferred_item_block *next;
+    size_t capacity;
+    size_t used;
+    kb_deferred_item_t items[];
+} kb_deferred_item_block_t;
+
 static kb_deferred_item_t *deferred_head;
 static kb_deferred_item_t *deferred_tail;
+static kb_deferred_item_t *deferred_free_list;
+static kb_deferred_item_block_t *deferred_blocks;
 static unsigned int draining_deferred_depth;
 static uint64_t time_base_ns;
 static unsigned long linux_jiffies;
@@ -62,8 +79,13 @@ static void *jiffies_storages[KB_JIFFIES_STORAGE_MAX];
 
 static int trace_work_enabled(void)
 {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
     const char *value = getenv("KOBOX_TRACE_WORK");
-    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    return cached;
 }
 
 static uint64_t monotonic_ns(void)
@@ -82,6 +104,30 @@ static uint64_t monotonic_ns(void)
         return 0;
     }
     return ((uint64_t)ts.tv_sec * KB_NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t host_time_ns(void)
+{
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) == 0) {
+        return 0;
+    }
+    return ((uint64_t)ts.tv_sec * KB_NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;
+}
+
+static int pachaos_backend_active(void)
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *backend = getenv("KOBOX_BACKEND");
+    if (backend != NULL && (strcmp(backend, "pachaos") == 0 || strcmp(backend, "pachaos_capsule") == 0)) {
+        cached = 1;
+        return cached;
+    }
+    cached = getenv("KOBOX_PACHAOS_DEVICE_CAPSULE") != NULL || getenv("KOBOX_PACHAOS_DEVICE_CATALOG") != NULL;
+    return cached;
 }
 
 static uint64_t elapsed_ns(void)
@@ -148,9 +194,22 @@ void kb_register_jiffies_storage(void *storage)
 static void sleep_ns(uint64_t ns)
 {
     refresh_linux_jiffies();
-    kb_run_deferred_bottom_halves();
-    (void)kb_handle_any_irq_no_work(0);
+    if (draining_deferred_depth == 0) {
+        kb_run_deferred_bottom_halves();
+        (void)kb_handle_any_irq_no_work(0);
+    }
     if (ns == 0) {
+        refresh_linux_jiffies();
+        return;
+    }
+
+    if (pachaos_backend_active()) {
+        uint64_t start = host_time_ns();
+        if (start != 0 && ns <= UINT64_MAX - start) {
+            uint64_t deadline = start + ns;
+            while (host_time_ns() < deadline) {
+            }
+        }
         refresh_linux_jiffies();
         return;
     }
@@ -224,9 +283,35 @@ static void write_ulong(void *base, size_t offset, unsigned long value)
     }
 }
 
+static void refresh_deferred_tail(void);
+
+static void repair_deferred_tail(const char *op)
+{
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: repair deferred list op=%s\n", op != NULL ? op : "?");
+    }
+    deferred_tail = NULL;
+    kb_deferred_item_t *item = deferred_head;
+    for (unsigned int count = 0; item != NULL; count++) {
+        if (count >= KB_DEFERRED_LIST_WALK_LIMIT) {
+            if (deferred_tail != NULL) {
+                deferred_tail->next = NULL;
+            }
+            return;
+        }
+        deferred_tail = item;
+        item = item->next;
+    }
+}
+
 static int deferred_contains(kb_deferred_kind_t kind, void *object)
 {
+    unsigned int count = 0;
     for (kb_deferred_item_t *item = deferred_head; item != NULL; item = item->next) {
+        if (count++ >= KB_DEFERRED_LIST_WALK_LIMIT) {
+            repair_deferred_tail("contains");
+            return 0;
+        }
         if (item->kind == kind && item->object == object) {
             return 1;
         }
@@ -236,7 +321,12 @@ static int deferred_contains(kb_deferred_kind_t kind, void *object)
 
 static kb_deferred_item_t *find_deferred(kb_deferred_kind_t kind, void *object)
 {
+    unsigned int count = 0;
     for (kb_deferred_item_t *item = deferred_head; item != NULL; item = item->next) {
+        if (count++ >= KB_DEFERRED_LIST_WALK_LIMIT) {
+            repair_deferred_tail("find");
+            return NULL;
+        }
         if (item->kind == kind && item->object == object) {
             return item;
         }
@@ -244,7 +334,69 @@ static kb_deferred_item_t *find_deferred(kb_deferred_kind_t kind, void *object)
     return NULL;
 }
 
-static void refresh_deferred_tail(void);
+static kb_deferred_item_block_t *allocate_deferred_block(void)
+{
+    enum {
+        KB_DEFERRED_BLOCK_BYTES = 4096,
+    };
+
+    size_t header_size = sizeof(kb_deferred_item_block_t);
+    if (header_size >= KB_DEFERRED_BLOCK_BYTES) {
+        return NULL;
+    }
+#if defined(_WIN32)
+    kb_deferred_item_block_t *block = calloc(1, KB_DEFERRED_BLOCK_BYTES);
+#else
+    void *memory = mmap(
+        NULL,
+        KB_DEFERRED_BLOCK_BYTES,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0);
+    kb_deferred_item_block_t *block = memory == MAP_FAILED ? NULL : (kb_deferred_item_block_t *)memory;
+#endif
+    if (block == NULL) {
+        return NULL;
+    }
+    block->capacity = (KB_DEFERRED_BLOCK_BYTES - header_size) / sizeof(kb_deferred_item_t);
+    if (block->capacity == 0) {
+        return NULL;
+    }
+    block->next = deferred_blocks;
+    deferred_blocks = block;
+    return block;
+}
+
+static kb_deferred_item_t *allocate_deferred_item(void)
+{
+    kb_deferred_item_t *item = deferred_free_list;
+    if (item != NULL) {
+        deferred_free_list = item->next;
+        memset(item, 0, sizeof(*item));
+        return item;
+    }
+    kb_deferred_item_block_t *block = deferred_blocks;
+    if (block == NULL || block->used >= block->capacity) {
+        block = allocate_deferred_block();
+    }
+    if (block == NULL || block->used >= block->capacity) {
+        return NULL;
+    }
+    item = &block->items[block->used++];
+    memset(item, 0, sizeof(*item));
+    return item;
+}
+
+static void release_deferred_item(kb_deferred_item_t *item)
+{
+    if (item == NULL) {
+        return;
+    }
+    memset(item, 0, sizeof(*item));
+    item->next = deferred_free_list;
+    deferred_free_list = item;
+}
 
 static int remove_deferred(kb_deferred_kind_t kind, void *object)
 {
@@ -254,7 +406,7 @@ static int remove_deferred(kb_deferred_kind_t kind, void *object)
         kb_deferred_item_t *item = *cursor;
         if (item->kind == kind && item->object == object) {
             *cursor = item->next;
-            free(item);
+            release_deferred_item(item);
             removed = 1;
             continue;
         }
@@ -276,7 +428,7 @@ static int remove_due_deferred(kb_deferred_kind_t kind, void *object)
             (item->due_ns == 0 || item->due_ns <= now_ns))
         {
             *cursor = item->next;
-            free(item);
+            release_deferred_item(item);
             removed = 1;
             continue;
         }
@@ -291,32 +443,73 @@ static int queue_deferred(kb_deferred_kind_t kind, void *object, uint64_t due_ns
     if (object == NULL) {
         return 0;
     }
+    if (trace_work_enabled()) {
+        fprintf(
+            stderr,
+            "kobox work: queue_deferred begin kind=%u object=%p due_ns=%llu head=%p tail=%p free=%p\n",
+            (unsigned)kind,
+            object,
+            (unsigned long long)due_ns,
+            (void *)deferred_head,
+            (void *)deferred_tail,
+            (void *)deferred_free_list);
+    }
     if (deferred_contains(kind, object)) {
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: queue_deferred duplicate kind=%u object=%p\n", (unsigned)kind, object);
+        }
         return 0;
     }
 
-    kb_deferred_item_t *item = calloc(1, sizeof(*item));
+    kb_deferred_item_t *item = allocate_deferred_item();
     if (item == NULL) {
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: queue_deferred alloc failed kind=%u object=%p\n", (unsigned)kind, object);
+        }
         return 0;
+    }
+    if (trace_work_enabled()) {
+        fprintf(stderr, "kobox work: queue_deferred item=%p kind=%u object=%p\n", (void *)item, (unsigned)kind, object);
     }
     item->kind = kind;
     item->object = object;
     item->due_ns = due_ns;
     item->kernel_gs = kb_shim_current_kernel_gs();
+    refresh_deferred_tail();
     if (deferred_tail != NULL) {
         deferred_tail->next = item;
     } else {
         deferred_head = item;
     }
     deferred_tail = item;
+    if (trace_work_enabled()) {
+        fprintf(
+            stderr,
+            "kobox work: queue_deferred linked kind=%u object=%p head=%p tail=%p\n",
+            (unsigned)kind,
+            object,
+            (void *)deferred_head,
+            (void *)deferred_tail);
+    }
     return 1;
 }
 
 static void refresh_deferred_tail(void)
 {
     deferred_tail = NULL;
-    for (kb_deferred_item_t *item = deferred_head; item != NULL; item = item->next) {
+    kb_deferred_item_t *item = deferred_head;
+    for (unsigned int count = 0; item != NULL; count++) {
+        if (count >= KB_DEFERRED_LIST_WALK_LIMIT) {
+            if (deferred_tail != NULL) {
+                deferred_tail->next = NULL;
+            }
+            if (trace_work_enabled()) {
+                fprintf(stderr, "kobox work: truncated deferred list while refreshing tail\n");
+            }
+            return;
+        }
         deferred_tail = item;
+        item = item->next;
     }
 }
 
@@ -366,6 +559,29 @@ static void clear_work_pending(void *work)
     write_work_data(work, read_work_data(work) & ~(1ul << KB_WORK_STRUCT_PENDING_BIT));
 }
 
+static unsigned long callback_kernel_gs(const void *callback, unsigned long fallback_gs)
+{
+    unsigned long kernel_gs = kb_module_kernel_gs_for_address(callback);
+    if (kernel_gs == 0) {
+        kernel_gs = fallback_gs;
+    }
+    return kernel_gs;
+}
+
+static int enter_callback_gs(unsigned long kernel_gs, unsigned long *old_gs)
+{
+    if (kernel_gs == 0) {
+        return 0;
+    }
+    return kb_shim_enter_kernel_gs(kernel_gs, old_gs) == 0;
+}
+
+static int is_usb_root_hub_poll_function(void (*func)(void *))
+{
+    void *poll_rh_status = kb_module_lookup_exported_symbol("usb_hcd_poll_rh_status");
+    return poll_rh_status != NULL && (const void *)func == poll_rh_status;
+}
+
 static int is_usb_lpm_work_function(void (*func)(void *))
 {
     const unsigned char *code = (const unsigned char *)func;
@@ -399,7 +615,75 @@ static int is_usb_lpm_work_function(void (*func)(void *))
     return code[1] >= 1 && code[1] <= 4;
 }
 
-static int run_work(void *work)
+static const unsigned char *skip_linux_function_entry_prefix(const unsigned char *code)
+{
+    if (code == NULL) {
+        return NULL;
+    }
+    for (unsigned int pass = 0; pass < 3; pass++) {
+        for (unsigned int i = 0; i < 16 && code[0] == 0x90; i++) {
+            code++;
+        }
+        if (code[0] == 0xf3 && code[1] == 0x0f && code[2] == 0x1e && code[3] == 0xfa) {
+            code += 4;
+            continue;
+        }
+        if (code[0] == 0xe8) {
+            code += 5;
+            continue;
+        }
+        break;
+    }
+    return code;
+}
+
+static int is_obviously_not_work_function(void (*func)(void *))
+{
+    const unsigned char *entry = (const unsigned char *)func;
+    if (entry == NULL) {
+        return 1;
+    }
+
+    /*
+     * A work callback has one argument in %rdi. xHCI can pass non-work
+     * objects through delayed-work-looking paths while updating command
+     * timers; those functions immediately consume %rsi as a second
+     * argument. Treating them as work_structs corrupts the object by
+     * setting the pending bit at offset 0.
+     */
+    const unsigned char test_rsi_rsi[] = { 0x48, 0x85, 0xf6 };
+    if (memcmp(entry + 16u + 4u + 5u, test_rsi_rsi, sizeof(test_rsi_rsi)) == 0) {
+        return 1;
+    }
+
+    const unsigned char *code = skip_linux_function_entry_prefix(entry);
+    if (code == NULL) {
+        return 1;
+    }
+    return memcmp(code, test_rsi_rsi, sizeof(test_rsi_rsi)) == 0;
+}
+
+static int work_function_usable(void *work, void (*func)(void *), const char *op)
+{
+    if (func == NULL) {
+        return 0;
+    }
+    if (!kb_module_is_executable_address((const void *)func)) {
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: skip invalid %s work=%p func=%p\n", op, work, (void *)func);
+        }
+        return 0;
+    }
+    if (is_obviously_not_work_function(func)) {
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: skip non-work %s work=%p func=%p\n", op, work, (void *)func);
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int run_work(void *work, unsigned long fallback_gs)
 {
     if (work == NULL) {
         return 0;
@@ -407,7 +691,7 @@ static int run_work(void *work)
 
     void (*func)(void *) = (void (*)(void *))read_pointer(work, KB_LINUX_WORK_FUNC_OFFSET);
     clear_work_pending(work);
-    if (func == NULL) {
+    if (!work_function_usable(work, func, "run")) {
         return 0;
     }
     if (is_usb_lpm_work_function(func)) {
@@ -419,14 +703,26 @@ static int run_work(void *work)
     if (trace_work_enabled()) {
         fprintf(stderr, "kobox work: run work=%p func=%p\n", work, (void *)func);
     }
-    func(work);
+    if (!kb_usb_root_hub_poll_needed() && is_usb_root_hub_poll_function(func)) {
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: skip paused root hub poll work=%p func=%p\n", work, (void *)func);
+        }
+        return 1;
+    }
+    unsigned long kernel_gs = callback_kernel_gs((const void *)func, fallback_gs);
+    unsigned long old_gs = 0;
+    int has_gs = enter_callback_gs(kernel_gs, &old_gs);
+    kb_linux_call_void_ptr_gs(func, work, kernel_gs);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
     if (trace_work_enabled()) {
         fprintf(stderr, "kobox work: done work=%p func=%p\n", work, (void *)func);
     }
     return 1;
 }
 
-static int run_timer(void *timer)
+static int run_timer(void *timer, unsigned long fallback_gs)
 {
     if (timer == NULL) {
         return 0;
@@ -436,14 +732,26 @@ static int run_timer(void *timer)
     if (callback == NULL) {
         return 0;
     }
+    if (!kb_module_is_executable_address((const void *)callback)) {
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: skip invalid timer=%p callback=%p\n", timer, (void *)callback);
+        }
+        return 0;
+    }
     if (trace_work_enabled()) {
         fprintf(stderr, "kobox work: run timer=%p callback=%p\n", timer, (void *)callback);
     }
-    callback(timer);
+    unsigned long kernel_gs = callback_kernel_gs((const void *)callback, fallback_gs);
+    unsigned long old_gs = 0;
+    int has_gs = enter_callback_gs(kernel_gs, &old_gs);
+    kb_linux_call_void_ptr_gs(callback, timer, kernel_gs);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
     return 1;
 }
 
-static int run_tasklet(void *tasklet)
+static int run_tasklet(void *tasklet, unsigned long fallback_gs)
 {
     if (tasklet == NULL) {
         return 0;
@@ -469,10 +777,22 @@ static int run_tasklet(void *tasklet)
             data);
     }
     if (use_callback != 0 && callback != NULL) {
+        if (!kb_module_is_executable_address((const void *)callback)) {
+            if (trace_work_enabled()) {
+                fprintf(stderr, "kobox work: skip invalid tasklet=%p callback=%p\n", tasklet, (void *)callback);
+            }
+            return 0;
+        }
         if (trace_work_enabled()) {
             fprintf(stderr, "kobox work: run tasklet=%p callback=%p\n", tasklet, (void *)callback);
         }
-        callback(tasklet);
+        unsigned long kernel_gs = callback_kernel_gs((const void *)callback, fallback_gs);
+        unsigned long old_gs = 0;
+        int has_gs = enter_callback_gs(kernel_gs, &old_gs);
+        kb_linux_call_void_ptr_gs(callback, tasklet, kernel_gs);
+        if (has_gs) {
+            kb_shim_leave_kernel_gs(old_gs);
+        }
         return 1;
     }
 
@@ -482,10 +802,22 @@ static int run_tasklet(void *tasklet)
     if (func == NULL) {
         return 0;
     }
+    if (!kb_module_is_executable_address((const void *)func)) {
+        if (trace_work_enabled()) {
+            fprintf(stderr, "kobox work: skip invalid tasklet=%p func=%p\n", tasklet, (void *)func);
+        }
+        return 0;
+    }
     if (trace_work_enabled()) {
         fprintf(stderr, "kobox work: run tasklet=%p func=%p data=0x%lx\n", tasklet, (void *)func, data);
     }
-    func(data);
+    unsigned long kernel_gs = callback_kernel_gs((const void *)func, fallback_gs);
+    unsigned long old_gs = 0;
+    int has_gs = enter_callback_gs(kernel_gs, &old_gs);
+    kb_linux_call_void_ulong_gs(func, data, kernel_gs);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
     return 1;
 }
 
@@ -502,23 +834,20 @@ static void run_deferred_items(int include_work)
             break;
         }
 
-        unsigned long old_gs = 0;
-        int has_gs = kb_shim_enter_kernel_gs(item->kernel_gs, &old_gs) == 0;
+        refresh_linux_jiffies();
         switch (item->kind) {
         case KB_DEFERRED_WORK:
-            (void)run_work(item->object);
+            (void)run_work(item->object, item->kernel_gs);
             break;
         case KB_DEFERRED_TASKLET:
-            (void)run_tasklet(item->object);
+            (void)run_tasklet(item->object, item->kernel_gs);
             break;
         case KB_DEFERRED_TIMER:
-            (void)run_timer(item->object);
+            (void)run_timer(item->object, item->kernel_gs);
             break;
         }
-        if (has_gs) {
-            kb_shim_leave_kernel_gs(old_gs);
-        }
-        free(item);
+        refresh_linux_jiffies();
+        release_deferred_item(item);
     }
     draining_deferred_depth--;
 }
@@ -553,8 +882,13 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
         return 0;
     }
 
+    void (*func)(void *) = (void (*)(void *))read_pointer(work, KB_LINUX_WORK_FUNC_OFFSET);
+    if (!work_function_usable(work, func, "queue")) {
+        clear_work_pending(work);
+        return 0;
+    }
+
     if (work_pending(work)) {
-        void *func = (void *)read_pointer(work, KB_LINUX_WORK_FUNC_OFFSET);
         if (deferred_contains(KB_DEFERRED_WORK, work)) {
             if (trace_work_enabled()) {
                 fprintf(stderr, "kobox work: queue_work skip wq=%p work=%p func=%p pending=1\n",
@@ -577,7 +911,7 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
         fprintf(stderr, "kobox work: queue_work wq=%p work=%p func=%p\n",
             wq,
             work,
-            (void *)read_pointer(work, KB_LINUX_WORK_FUNC_OFFSET));
+            (void *)func);
     }
     set_work_pending(work);
     if (!queue_deferred(KB_DEFERRED_WORK, work, 0)) {
@@ -594,6 +928,11 @@ int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay
     if (dwork == NULL) {
         return 0;
     }
+    void (*func)(void *) = (void (*)(void *))read_pointer(dwork, KB_LINUX_WORK_FUNC_OFFSET);
+    if (!work_function_usable(dwork, func, "delayed")) {
+        clear_work_pending(dwork);
+        return 0;
+    }
     if (work_pending(dwork)) {
         if (deferred_contains(KB_DEFERRED_WORK, dwork)) {
             return 0;
@@ -602,13 +941,23 @@ int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay
             fprintf(stderr, "kobox work: queue_delayed_work clear stale pending wq=%p work=%p func=%p delay=%lu\n",
                 wq,
                 dwork,
-                (void *)read_pointer(dwork, KB_LINUX_WORK_FUNC_OFFSET),
+                (void *)func,
                 delay);
         }
         clear_work_pending(dwork);
     }
     set_work_pending(dwork);
     uint64_t due_ns = delay == 0 ? 0 : elapsed_ns() + jiffies_to_ns(delay);
+    if (trace_work_enabled()) {
+        fprintf(stderr,
+            "kobox work: queue_delayed_work wq=%p work=%p func=%p delay=%lu due_ns=%llu caller=%p\n",
+            wq,
+            dwork,
+            (void *)func,
+            delay,
+            (unsigned long long)due_ns,
+            __builtin_return_address(0));
+    }
     if (!queue_deferred(KB_DEFERRED_WORK, dwork, due_ns)) {
         clear_work_pending(dwork);
         return 0;
@@ -633,7 +982,7 @@ int kb_flush_work(void *work)
     if (!was_queued) {
         return 0;
     }
-    return run_work(work);
+    return run_work(work, kb_shim_current_kernel_gs());
 }
 
 int kb_flush_delayed_work(void *dwork)
@@ -643,7 +992,7 @@ int kb_flush_delayed_work(void *dwork)
     if (!was_pending && !was_queued) {
         return 0;
     }
-    return run_work(dwork);
+    return run_work(dwork, kb_shim_current_kernel_gs());
 }
 
 int kb_cancel_work_sync(void *work)
@@ -720,7 +1069,7 @@ int kb_timer_delete(void *timer)
         kb_deferred_item_t *item = *cursor;
         if (item->kind == KB_DEFERRED_TIMER && item->object == timer) {
             *cursor = item->next;
-            free(item);
+            release_deferred_item(item);
             removed = 1;
             continue;
         }

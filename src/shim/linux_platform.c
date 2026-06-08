@@ -44,10 +44,7 @@ void kb_dynamic_dev_dbg(void *descriptor, const void *dev, const char *fmt, ...)
 {
     (void)descriptor;
     (void)dev;
-    va_list args;
-    va_start(args, fmt);
-    kb_vdev_log(fmt, args);
-    va_end(args);
+    (void)fmt;
 }
 
 void kb_dev_err(const void *dev, const char *fmt, ...)
@@ -61,6 +58,16 @@ void kb_dev_err(const void *dev, const char *fmt, ...)
 
 void kb_dev_warn(const void *dev, const char *fmt, ...)
 {
+    (void)dev;
+    va_list args;
+    va_start(args, fmt);
+    kb_vdev_log(fmt, args);
+    va_end(args);
+}
+
+void kb_dev_printk(const char *level, const void *dev, const char *fmt, ...)
+{
+    (void)level;
     (void)dev;
     va_list args;
     va_start(args, fmt);
@@ -102,7 +109,6 @@ void *kb_devm_kmalloc(void *dev, size_t size, unsigned int flags)
 char *kb_devm_kasprintf(void *dev, unsigned int flags, const char *fmt, ...)
 {
     (void)dev;
-    (void)flags;
     if (fmt == NULL) {
         return NULL;
     }
@@ -111,19 +117,20 @@ char *kb_devm_kasprintf(void *dev, unsigned int flags, const char *fmt, ...)
     va_start(args, fmt);
     va_list copy;
     va_copy(copy, args);
-    int needed = vsnprintf(NULL, 0, fmt, copy);
+    char stack_text[256];
+    int needed = kb_vsnprintf_safe(stack_text, sizeof(stack_text), fmt, copy);
     va_end(copy);
     if (needed < 0) {
         va_end(args);
         return NULL;
     }
 
-    char *text = malloc((size_t)needed + 1);
+    char *text = kb_kmalloc((size_t)needed + 1, flags);
     if (text == NULL) {
         va_end(args);
         return NULL;
     }
-    (void)vsnprintf(text, (size_t)needed + 1, fmt, args);
+    (void)kb_vsnprintf_safe(text, (size_t)needed + 1, fmt, args);
     va_end(args);
     return text;
 }
@@ -226,7 +233,7 @@ int kb_sysfs_emit(char *buf, const char *fmt, ...)
     }
     va_list args;
     va_start(args, fmt);
-    int result = vsnprintf(buf, 4096, fmt, args);
+    int result = kb_vsnprintf_safe(buf, 4096, fmt, args);
     va_end(args);
     return result;
 }
@@ -307,20 +314,20 @@ void *devm_kmalloc(void *dev, size_t size, unsigned int flags)
 char *devm_kasprintf(void *dev, unsigned int flags, const char *fmt, ...)
 {
     (void)dev;
-    (void)flags;
     va_list args;
     va_start(args, fmt);
     va_list copy;
     va_copy(copy, args);
-    int needed = fmt == NULL ? -1 : vsnprintf(NULL, 0, fmt, copy);
+    char stack_text[256];
+    int needed = fmt == NULL ? -1 : kb_vsnprintf_safe(stack_text, sizeof(stack_text), fmt, copy);
     va_end(copy);
     if (needed < 0) {
         va_end(args);
         return NULL;
     }
-    char *text = malloc((size_t)needed + 1);
+    char *text = kb_kmalloc((size_t)needed + 1, flags);
     if (text != NULL) {
-        (void)vsnprintf(text, (size_t)needed + 1, fmt, args);
+        (void)kb_vsnprintf_safe(text, (size_t)needed + 1, fmt, args);
     }
     va_end(args);
     return text;
@@ -403,7 +410,7 @@ int sysfs_emit(char *buf, const char *fmt, ...)
     }
     va_list args;
     va_start(args, fmt);
-    int result = vsnprintf(buf, 4096, fmt, args);
+    int result = kb_vsnprintf_safe(buf, 4096, fmt, args);
     va_end(args);
     return result;
 }

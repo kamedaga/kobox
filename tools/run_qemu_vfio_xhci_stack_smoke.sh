@@ -8,6 +8,7 @@ debs_dir="$repo_root/.artifacts/debs"
 root_dir="$work_dir/initramfs-root"
 serial_log="$work_dir/serial.log"
 qemu_stderr="$work_dir/qemu.stderr"
+qmp_port="${KOBOX_QEMU_QMP_PORT:-4447}"
 kernel_pkg="${KERNEL_IMAGE_PACKAGE:-linux-image-6.8.0-117-generic}"
 kernel_version="${KERNEL_VERSION:-6.8.0-117-generic}"
 modules_pkg="${KERNEL_MODULES_PACKAGE:-linux-modules-6.8.0-117-generic}"
@@ -21,22 +22,23 @@ expect_usb_storage="${KOBOX_EXPECT_USB_STORAGE:-0}"
 usb_storage_image="${KOBOX_USB_STORAGE_IMAGE:-$work_dir/usb-storage.img}"
 usb_storage_count="${KOBOX_USB_STORAGE_COUNT:-1}"
 run_drain_ms="${KOBOX_RUN_DRAIN_MS:-0}"
-run_trace_internal="${KOBOX_RUN_TRACE_INTERNAL:-}"
-run_trace_xhci="${KOBOX_RUN_TRACE_XHCI:-}"
-run_trace_irq="${KOBOX_RUN_TRACE_IRQ:-}"
-run_trace_usb="${KOBOX_RUN_TRACE_USB:-}"
-run_trace_work="${KOBOX_RUN_TRACE_WORK:-}"
-run_trace_dma="${KOBOX_RUN_TRACE_DMA:-}"
-run_trace_device="${KOBOX_RUN_TRACE_DEVICE:-}"
-run_trace_modules="${KOBOX_RUN_TRACE_MODULES:-}"
-run_trace_shim_calls="${KOBOX_RUN_TRACE_SHIM_CALLS:-}"
-run_trace_shim_calls_top="${KOBOX_RUN_TRACE_SHIM_CALLS_TOP:-}"
-run_crash_stack="${KOBOX_RUN_CRASH_STACK:-}"
 run_input_summary="${KOBOX_RUN_INPUT_SUMMARY:-$expect_usb_hid}"
 run_usb_storage_summary="${KOBOX_RUN_USB_STORAGE_SUMMARY:-$expect_usb_storage}"
 run_usb_storage_io_smoke="${KOBOX_RUN_USB_STORAGE_IO_SMOKE:-$expect_usb_storage}"
 run_enable_sysfs_dirent="${KOBOX_RUN_ENABLE_SYSFS_DIRENT:-}"
 run_enable_usb_event_inject="${KOBOX_RUN_ENABLE_USB_EVENT_INJECT:-${KOBOX_ENABLE_USB_EVENT_INJECT:-}}"
+run_usb_real_device="${KOBOX_RUN_USB_REAL_DEVICE:-${KOBOX_USB_REAL_DEVICE:-}}"
+run_usb_hid_mouse_live="${KOBOX_RUN_USB_HID_MOUSE_LIVE:-${KOBOX_USB_HID_MOUSE_LIVE:-}}"
+run_usb_hid_mouse_live_ms="${KOBOX_RUN_USB_HID_MOUSE_LIVE_MS:-${KOBOX_USB_HID_MOUSE_LIVE_MS:-}}"
+run_usb_hid_mouse_xhci_only="${KOBOX_RUN_USB_HID_MOUSE_XHCI_ONLY:-${KOBOX_USB_HID_MOUSE_XHCI_ONLY:-}}"
+run_trace_modules="${KOBOX_RUN_TRACE_MODULES:-${KOBOX_TRACE_MODULES:-}}"
+run_trace_xhci="${KOBOX_RUN_TRACE_XHCI:-${KOBOX_TRACE_XHCI:-}}"
+run_trace_usb="${KOBOX_RUN_TRACE_USB:-${KOBOX_TRACE_USB:-}}"
+run_trace_usb_control="${KOBOX_RUN_TRACE_USB_CONTROL:-${KOBOX_TRACE_USB_CONTROL:-}}"
+run_trace_usb_hub="${KOBOX_RUN_TRACE_USB_HUB:-${KOBOX_TRACE_USB_HUB:-}}"
+run_trace_work="${KOBOX_RUN_TRACE_WORK:-${KOBOX_TRACE_WORK:-}}"
+run_trace_dma="${KOBOX_RUN_TRACE_DMA:-${KOBOX_TRACE_DMA:-}}"
+qemu_mouse_input="${KOBOX_QEMU_MOUSE_INPUT:-$run_usb_hid_mouse_live}"
 
 mkdir -p "$debs_dir" "$work_dir"
 
@@ -270,19 +272,22 @@ echo "kobox-qemu-vfio-xhci-stack: group=$group"
 /usr/bin/kobox-ls-devices vfio "$xhci_bdf"
 
 set +e
-KOBOX_TRACE_INTERNAL="@RUN_TRACE_INTERNAL@" KOBOX_TRACE_XHCI="@RUN_TRACE_XHCI@" \
-KOBOX_TRACE_IRQ="@RUN_TRACE_IRQ@" KOBOX_TRACE_USB="@RUN_TRACE_USB@" \
-KOBOX_TRACE_WORK="@RUN_TRACE_WORK@" KOBOX_TRACE_DMA="@RUN_TRACE_DMA@" \
-KOBOX_TRACE_DEVICE="@RUN_TRACE_DEVICE@" \
-KOBOX_TRACE_MODULES="@RUN_TRACE_MODULES@" \
-KOBOX_TRACE_SHIM_CALLS="@RUN_TRACE_SHIM_CALLS@" \
-KOBOX_TRACE_SHIM_CALLS_TOP="@RUN_TRACE_SHIM_CALLS_TOP@" \
-KOBOX_CRASH_STACK="@RUN_CRASH_STACK@" \
 KOBOX_INPUT_SUMMARY="@RUN_INPUT_SUMMARY@" \
 KOBOX_USB_STORAGE_SUMMARY="@RUN_USB_STORAGE_SUMMARY@" \
 KOBOX_USB_STORAGE_IO_SMOKE="@RUN_USB_STORAGE_IO_SMOKE@" \
 KOBOX_ENABLE_SYSFS_DIRENT="@RUN_ENABLE_SYSFS_DIRENT@" \
 KOBOX_ENABLE_USB_EVENT_INJECT="@RUN_ENABLE_USB_EVENT_INJECT@" \
+KOBOX_USB_REAL_DEVICE="@RUN_USB_REAL_DEVICE@" \
+KOBOX_USB_HID_MOUSE_LIVE="@RUN_USB_HID_MOUSE_LIVE@" \
+KOBOX_USB_HID_MOUSE_LIVE_MS="@RUN_USB_HID_MOUSE_LIVE_MS@" \
+KOBOX_USB_HID_MOUSE_XHCI_ONLY="@RUN_USB_HID_MOUSE_XHCI_ONLY@" \
+KOBOX_TRACE_MODULES="@RUN_TRACE_MODULES@" \
+KOBOX_TRACE_XHCI="@RUN_TRACE_XHCI@" \
+KOBOX_TRACE_USB="@RUN_TRACE_USB@" \
+KOBOX_TRACE_USB_CONTROL="@RUN_TRACE_USB_CONTROL@" \
+KOBOX_TRACE_USB_HUB="@RUN_TRACE_USB_HUB@" \
+KOBOX_TRACE_WORK="@RUN_TRACE_WORK@" \
+KOBOX_TRACE_DMA="@RUN_TRACE_DMA@" \
     timeout 45 /usr/bin/kobox-run \
         --backend=vfio \
         --pci="$xhci_bdf" \
@@ -301,22 +306,22 @@ INIT
 chmod +x "$root_dir/init"
 sed -i "s/@KERNEL_VERSION@/$kernel_version/g" "$root_dir/init"
 sed -i "s/@RUN_DRAIN_MS@/$run_drain_ms/g" "$root_dir/init"
-trace_internal_escaped=$(printf '%s' "$run_trace_internal" | sed 's/[\/&]/\\&/g')
-trace_xhci_escaped=$(printf '%s' "$run_trace_xhci" | sed 's/[\/&]/\\&/g')
-trace_irq_escaped=$(printf '%s' "$run_trace_irq" | sed 's/[\/&]/\\&/g')
-trace_usb_escaped=$(printf '%s' "$run_trace_usb" | sed 's/[\/&]/\\&/g')
-trace_work_escaped=$(printf '%s' "$run_trace_work" | sed 's/[\/&]/\\&/g')
-trace_dma_escaped=$(printf '%s' "$run_trace_dma" | sed 's/[\/&]/\\&/g')
-trace_device_escaped=$(printf '%s' "$run_trace_device" | sed 's/[\/&]/\\&/g')
-trace_modules_escaped=$(printf '%s' "$run_trace_modules" | sed 's/[\/&]/\\&/g')
-trace_shim_calls_escaped=$(printf '%s' "$run_trace_shim_calls" | sed 's/[\/&]/\\&/g')
-trace_shim_calls_top_escaped=$(printf '%s' "$run_trace_shim_calls_top" | sed 's/[\/&]/\\&/g')
-crash_stack_escaped=$(printf '%s' "$run_crash_stack" | sed 's/[\/&]/\\&/g')
 input_summary_escaped=$(printf '%s' "$run_input_summary" | sed 's/[\/&]/\\&/g')
 usb_storage_summary_escaped=$(printf '%s' "$run_usb_storage_summary" | sed 's/[\/&]/\\&/g')
 usb_storage_io_smoke_escaped=$(printf '%s' "$run_usb_storage_io_smoke" | sed 's/[\/&]/\\&/g')
 enable_sysfs_dirent_escaped=$(printf '%s' "$run_enable_sysfs_dirent" | sed 's/[\/&]/\\&/g')
 enable_usb_event_inject_escaped=$(printf '%s' "$run_enable_usb_event_inject" | sed 's/[\/&]/\\&/g')
+usb_real_device_escaped=$(printf '%s' "$run_usb_real_device" | sed 's/[\/&]/\\&/g')
+usb_hid_mouse_live_escaped=$(printf '%s' "$run_usb_hid_mouse_live" | sed 's/[\/&]/\\&/g')
+usb_hid_mouse_live_ms_escaped=$(printf '%s' "$run_usb_hid_mouse_live_ms" | sed 's/[\/&]/\\&/g')
+usb_hid_mouse_xhci_only_escaped=$(printf '%s' "$run_usb_hid_mouse_xhci_only" | sed 's/[\/&]/\\&/g')
+trace_modules_escaped=$(printf '%s' "$run_trace_modules" | sed 's/[\/&]/\\&/g')
+trace_xhci_escaped=$(printf '%s' "$run_trace_xhci" | sed 's/[\/&]/\\&/g')
+trace_usb_escaped=$(printf '%s' "$run_trace_usb" | sed 's/[\/&]/\\&/g')
+trace_usb_control_escaped=$(printf '%s' "$run_trace_usb_control" | sed 's/[\/&]/\\&/g')
+trace_usb_hub_escaped=$(printf '%s' "$run_trace_usb_hub" | sed 's/[\/&]/\\&/g')
+trace_work_escaped=$(printf '%s' "$run_trace_work" | sed 's/[\/&]/\\&/g')
+trace_dma_escaped=$(printf '%s' "$run_trace_dma" | sed 's/[\/&]/\\&/g')
 usb_hid_deps=""
 if [ "$enable_usb_hid" = "1" ] || [ "$expect_usb_hid" = "1" ]; then
     usb_hid_deps="--dep=/usr/lib/kobox/hid.ko --dep=/usr/lib/kobox/hid-generic.ko --dep=/usr/lib/kobox/usbhid.ko"
@@ -327,22 +332,22 @@ if [ "$enable_usb_storage" = "1" ] || [ "$expect_usb_storage" = "1" ]; then
     usb_storage_deps="--dep=/usr/lib/kobox/usb-storage.ko"
 fi
 usb_storage_deps_escaped=$(printf '%s' "$usb_storage_deps" | sed 's/[\/&]/\\&/g')
-sed -i "s/@RUN_TRACE_INTERNAL@/$trace_internal_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_XHCI@/$trace_xhci_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_IRQ@/$trace_irq_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_USB@/$trace_usb_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_WORK@/$trace_work_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_DMA@/$trace_dma_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_DEVICE@/$trace_device_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_MODULES@/$trace_modules_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_SHIM_CALLS@/$trace_shim_calls_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_TRACE_SHIM_CALLS_TOP@/$trace_shim_calls_top_escaped/g" "$root_dir/init"
-sed -i "s/@RUN_CRASH_STACK@/$crash_stack_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_INPUT_SUMMARY@/$input_summary_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_USB_STORAGE_SUMMARY@/$usb_storage_summary_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_USB_STORAGE_IO_SMOKE@/$usb_storage_io_smoke_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_ENABLE_SYSFS_DIRENT@/$enable_sysfs_dirent_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_ENABLE_USB_EVENT_INJECT@/$enable_usb_event_inject_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_REAL_DEVICE@/$usb_real_device_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_HID_MOUSE_LIVE@/$usb_hid_mouse_live_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_HID_MOUSE_LIVE_MS@/$usb_hid_mouse_live_ms_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_USB_HID_MOUSE_XHCI_ONLY@/$usb_hid_mouse_xhci_only_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_TRACE_MODULES@/$trace_modules_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_TRACE_XHCI@/$trace_xhci_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_TRACE_USB@/$trace_usb_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_TRACE_USB_CONTROL@/$trace_usb_control_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_TRACE_USB_HUB@/$trace_usb_hub_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_TRACE_WORK@/$trace_work_escaped/g" "$root_dir/init"
+sed -i "s/@RUN_TRACE_DMA@/$trace_dma_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_USB_HID_DEPS@/$usb_hid_deps_escaped/g" "$root_dir/init"
 sed -i "s/@RUN_USB_STORAGE_DEPS@/$usb_storage_deps_escaped/g" "$root_dir/init"
 
@@ -361,6 +366,62 @@ if [ "$enable_usb_storage" = "1" ] || [ "$expect_usb_storage" = "1" ]; then
 fi
 
 rm -f "$serial_log" "$qemu_stderr"
+qmp_inject_pid=""
+if [ "$qemu_mouse_input" = "1" ]; then
+    (
+        python3 - "$qmp_port" <<'PY'
+import json
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+deadline = time.time() + 12.0
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+while True:
+    try:
+        sock.connect(("127.0.0.1", port))
+        break
+    except OSError:
+        if time.time() > deadline:
+            sys.exit(0)
+        time.sleep(0.05)
+
+def recv_some():
+    sock.settimeout(1.0)
+    try:
+        sock.recv(4096)
+    except OSError:
+        pass
+
+def send_qmp(obj):
+    try:
+        sock.sendall((json.dumps(obj) + "\r\n").encode("ascii"))
+        recv_some()
+    except OSError:
+        sys.exit(0)
+
+recv_some()
+send_qmp({"execute": "qmp_capabilities"})
+time.sleep(1.5)
+pattern = ((24, 6), (18, -5), (-12, 9), (7, -3), (10, 4), (-6, -6))
+for index in range(24):
+    dx, dy = pattern[index % len(pattern)]
+    send_qmp({
+        "execute": "input-send-event",
+        "arguments": {
+            "events": [
+                {"type": "rel", "data": {"axis": "x", "value": dx}},
+                {"type": "rel", "data": {"axis": "y", "value": dy}},
+            ]
+        },
+    })
+    time.sleep(0.25)
+sock.close()
+PY
+    ) &
+    qmp_inject_pid="$!"
+fi
 qemu-system-x86_64 \
     -enable-kvm \
     -machine q35,accel=kvm,kernel-irqchip=split \
@@ -375,8 +436,12 @@ qemu-system-x86_64 \
     ${qemu_usb_storage_args} \
     -no-reboot \
     -display none \
+    -qmp "tcp:127.0.0.1:$qmp_port,server=on,wait=off" \
     -serial "file:$serial_log" \
     2>"$qemu_stderr"
+if [ -n "$qmp_inject_pid" ]; then
+    wait "$qmp_inject_pid" || true
+fi
 
 cat "$serial_log"
 if [ -s "$qemu_stderr" ]; then
@@ -396,6 +461,9 @@ fi
 if [ "$expect_usb_hid" = "1" ]; then
     grep -Eq "hid-generic|USB HID|input:" "$serial_log"
     grep -q "kobox-input: device" "$serial_log"
+fi
+if [ "$run_usb_hid_mouse_live" = "1" ] && [ "$qemu_mouse_input" = "1" ]; then
+    grep -q "kobox-usb-hid-mouse-live-summary: .*result=ok" "$serial_log"
 fi
 if [ "$expect_usb_storage" = "1" ]; then
     grep -q "dependency /usr/lib/kobox/usb-storage.ko init_module returned 0" "$serial_log"

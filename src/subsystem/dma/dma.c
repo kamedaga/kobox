@@ -1,6 +1,5 @@
 #include "subsystem/dma/dma.h"
-
-#include <stdlib.h>
+#include "kobox/shim.h"
 
 typedef struct kb_subsystem_dma_mapping {
     void *cpu_addr;
@@ -47,7 +46,7 @@ void *kb_subsystem_dma_alloc(
         return NULL;
     }
 
-    kb_subsystem_dma_mapping_t *entry = calloc(1, sizeof(*entry));
+    kb_subsystem_dma_mapping_t *entry = kb_kzalloc(sizeof(*entry), 0);
     if (entry == NULL) {
         if (ops->dma_free != NULL) {
             ops->dma_free(device, &buffer);
@@ -86,7 +85,7 @@ void kb_subsystem_dma_free(
             if (ops != NULL && ops->dma_free != NULL) {
                 ops->dma_free(entry->device, &buffer);
             }
-            free(entry);
+            kb_kfree(entry);
             return;
         }
         cursor = &entry->next;

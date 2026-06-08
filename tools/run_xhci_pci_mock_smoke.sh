@@ -29,8 +29,6 @@ log="$work_dir/xhci-pci-mock-smoke.log"
 KOBOX_TRACE_PCI="${KOBOX_TRACE_PCI:-1}" \
 KOBOX_TRACE_USB="${KOBOX_TRACE_USB:-1}" \
 KOBOX_TRACE_MODULES="${KOBOX_TRACE_MODULES:-1}" \
-KOBOX_TRACE_SHIM_CALLS="${KOBOX_TRACE_SHIM_CALLS:-1}" \
-KOBOX_TRACE_SHIM_CALLS_TOP="${KOBOX_TRACE_SHIM_CALLS_TOP:-96}" \
 KOBOX_MOCK_PCI_ID="${KOBOX_MOCK_PCI_ID:-1912:0014:0c:03:30}" \
     "$build_dir/kobox-run" \
         run "$work_dir/xhci-pci.ko" >"$log" 2>&1

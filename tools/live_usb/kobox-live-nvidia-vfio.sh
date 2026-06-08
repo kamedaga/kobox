@@ -174,7 +174,6 @@ run_kobox() {
 
     kobox-ls-devices vfio "$bdf"
     KOBOX_TRACE_PCI="${KOBOX_TRACE_PCI:-1}" \
-    KOBOX_CRASH_STACK="${KOBOX_CRASH_STACK:-1}" \
         kobox-run --backend=vfio --pci="$bdf" run "$module"
 }
 

@@ -7,6 +7,7 @@
 #include "kobox/shim.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,7 @@ typedef struct loaded_section {
     uint64_t size;
     uint64_t offset;
     uint64_t alignment;
+    uint64_t flags;
 } loaded_section_t;
 
 enum {
@@ -45,10 +47,7 @@ enum {
     KB_LOCAL_CURRENT_MM_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4608,
     KB_LOCAL_CURRENT_TASK_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 8192,
     KB_LOCAL_USB_DATA_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 11264,
-    KB_LOCAL_TRACE_STUB_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 28672,
     KB_LOCAL_JIFFIES_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4096,
-    KB_LOCAL_TRACE_STUB_SIZE = 160,
-    KB_LOCAL_TRACE_STUB_COUNT = 24,
     KB_LOCAL_GS_SIZE = 4096,
     KB_LOCAL_GS_PCPU_HOT_OFFSET = 0x100,
     KB_LOCAL_USB_NUM_ONLINE_CPUS_OFFSET = 0,
@@ -58,7 +57,7 @@ enum {
     KB_LOCAL_USB_XHCI_TRACEPOINT_OFFSET = 704,
     KB_LOCAL_USB_MISC_DATA_OFFSET = 1024,
     KB_LOCAL_USB_MISC_DATA_STRIDE = 128,
-    KB_LOCAL_USB_CONTROL_MSG_TRACE_STUB_OFFSET = KB_LOCAL_USB_DATA_OFFSET + KB_LOCAL_USB_MISC_DATA_OFFSET,
+    KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET = KB_LOCAL_USB_DATA_OFFSET + KB_LOCAL_USB_MISC_DATA_OFFSET,
 };
 
 static int trace_modules_enabled(void)
@@ -115,17 +114,15 @@ struct kb_module {
     void *shim_current_mm;
     void *shim_current_task;
     char *module_name;
-    uint64_t *shim_call_counts;
-    size_t shim_call_count;
-    uint8_t *trace_stubs;
-    size_t trace_stub_count;
     loaded_section_t *sections;
     size_t section_count;
+    size_t external_stub_count;
     int (*init_module)(void);
     void (*cleanup_module)(void);
 #if !defined(_WIN32) && defined(__x86_64__)
     uint8_t kernel_gs[KB_LOCAL_GS_SIZE];
 #endif
+    struct kb_module *next_loaded;
 };
 
 typedef struct shim_symbol {
@@ -153,6 +150,10 @@ enum {
 
 static exported_symbol_t exported_symbols[KB_EXPORTED_SYMBOL_MAX];
 static kb_module_t *kb_active_module;
+static kb_module_t *kb_loaded_modules;
+uintptr_t kb_current_external_call_target;
+uintptr_t kb_current_external_call_caller_gs;
+uintptr_t kb_current_external_call_callee_gs;
 
 typedef struct kb_file_ops_view {
     void *owner;
@@ -533,13 +534,13 @@ static void kb_bitmap_shift_right_shim(unsigned long *dst, const unsigned long *
 
 static void *kb_krealloc_shim(void *ptr, size_t size, unsigned int flags)
 {
-    (void)flags;
-    return realloc(ptr, size);
+    return kb_krealloc_managed(ptr, size, flags);
 }
 
 static size_t kb_ksize_shim(const void *ptr)
 {
-    return ptr == NULL ? 0 : 4096;
+    size_t size = kb_kmalloc_usable_size(ptr);
+    return size != 0 ? size : (ptr == NULL ? 0 : 4096);
 }
 
 static void kb_memset_io_shim(void *addr, int value, size_t size)
@@ -559,26 +560,107 @@ static void kb_kernel_sort_shim(void *base, size_t num, size_t size, int (*cmp)(
 
 static char *kb_kvasprintf_shim(unsigned int flags, const char *fmt, va_list args)
 {
-    (void)flags;
     if (fmt == NULL) {
         return NULL;
     }
     va_list copy;
     va_copy(copy, args);
-    const int needed = vsnprintf(NULL, 0, fmt, copy);
+    const int needed = kb_vsnprintf_safe(NULL, 0, fmt, copy);
     va_end(copy);
     if (needed < 0) {
         return NULL;
     }
-    char *buffer = malloc((size_t)needed + 1u);
+    (void)flags;
+    char *buffer = kb_kmalloc((size_t)needed + 1u, flags);
     if (buffer == NULL) {
         return NULL;
     }
-    vsnprintf(buffer, (size_t)needed + 1u, fmt, args);
+    kb_vsnprintf_safe(buffer, (size_t)needed + 1u, fmt, args);
     return buffer;
 }
 
+static char *kb_kasprintf_shim(unsigned int flags, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char *result = kb_kvasprintf_shim(flags, fmt, args);
+    va_end(args);
+    return result;
+}
+
 #if defined(__x86_64__) && !defined(_WIN32)
+__attribute__((naked)) static void kb_shim_external_call_trampoline(void)
+{
+    __asm__ volatile(
+        "mov %rax, -8(%rsp)\n\t"
+        "mov %rsp, %rax\n\t"
+        "lea -704(%rsp), %rsp\n\t"
+        "and $-16, %rsp\n\t"
+        "mov %rax, 512(%rsp)\n\t"
+        "mov %r11, 520(%rsp)\n\t"
+        "mov %rdi, 528(%rsp)\n\t"
+        "mov %rsi, 536(%rsp)\n\t"
+        "mov %rdx, 544(%rsp)\n\t"
+        "mov %rcx, 552(%rsp)\n\t"
+        "mov %r8, 560(%rsp)\n\t"
+        "mov %r9, 568(%rsp)\n\t"
+        "mov %rbx, 576(%rsp)\n\t"
+        "mov %rbp, 584(%rsp)\n\t"
+        "mov %r12, 592(%rsp)\n\t"
+        "mov %r13, 600(%rsp)\n\t"
+        "mov %r14, 608(%rsp)\n\t"
+        "mov %r15, 616(%rsp)\n\t"
+        "mov %r10, 624(%rsp)\n\t"
+        "mov -8(%rax), %r10\n\t"
+        "mov %r10, 648(%rsp)\n\t"
+        "mov 512(%rsp), %rsi\n\t"
+        "lea 8(%rsi), %rsi\n\t"
+        "mov %rsp, %rdi\n\t"
+        "mov $64, %ecx\n\t"
+        "cld\n\t"
+        "rep movsq\n\t"
+        "mov 648(%rsp), %rsi\n\t"
+        "test %rsi, %rsi\n\t"
+        "jz 1f\n\t"
+        "mov $0x1001, %edi\n\t"
+        "mov $158, %eax\n\t"
+        "syscall\n\t"
+        "1:\n\t"
+        "mov 528(%rsp), %rdi\n\t"
+        "mov 536(%rsp), %rsi\n\t"
+        "mov 544(%rsp), %rdx\n\t"
+        "mov 552(%rsp), %rcx\n\t"
+        "mov 560(%rsp), %r8\n\t"
+        "mov 568(%rsp), %r9\n\t"
+        "mov 520(%rsp), %r11\n\t"
+        "mov %r11, kb_current_external_call_target(%rip)\n\t"
+        "mov 624(%rsp), %r10\n\t"
+        "mov %r10, kb_current_external_call_caller_gs(%rip)\n\t"
+        "mov 648(%rsp), %r10\n\t"
+        "mov %r10, kb_current_external_call_callee_gs(%rip)\n\t"
+        "xor %eax, %eax\n\t"
+        "call *%r11\n\t"
+        "mov %rax, 632(%rsp)\n\t"
+        "mov %rdx, 640(%rsp)\n\t"
+        "movq $0, kb_current_external_call_target(%rip)\n\t"
+        "mov 624(%rsp), %rsi\n\t"
+        "mov $0x1001, %edi\n\t"
+        "mov $158, %eax\n\t"
+        "syscall\n\t"
+        "2:\n\t"
+        "mov 632(%rsp), %rax\n\t"
+        "mov 640(%rsp), %rdx\n\t"
+        "mov 576(%rsp), %rbx\n\t"
+        "mov 584(%rsp), %rbp\n\t"
+        "mov 592(%rsp), %r12\n\t"
+        "mov 600(%rsp), %r13\n\t"
+        "mov 608(%rsp), %r14\n\t"
+        "mov 616(%rsp), %r15\n\t"
+        "mov 512(%rsp), %r11\n\t"
+        "mov %r11, %rsp\n\t"
+        "ret\n\t");
+}
+
 #define KB_DEFINE_X86_INDIRECT_THUNK(name, reg) \
     __attribute__((naked)) static void name(void) \
     { \
@@ -598,6 +680,11 @@ KB_DEFINE_X86_INDIRECT_THUNK(kb_x86_indirect_thunk_r14, "r14")
 KB_DEFINE_X86_INDIRECT_THUNK(kb_x86_indirect_thunk_r15, "r15")
 #undef KB_DEFINE_X86_INDIRECT_THUNK
 #else
+static void kb_shim_external_call_trampoline(void)
+{
+    abort();
+}
+
 #define KB_DEFINE_X86_INDIRECT_THUNK(name) static void name(void) { kb_noop(); }
 KB_DEFINE_X86_INDIRECT_THUNK(kb_x86_indirect_thunk_rax)
 KB_DEFINE_X86_INDIRECT_THUNK(kb_x86_indirect_thunk_rbx)
@@ -619,8 +706,16 @@ static int kb_nvidia_mock_nv_pci_count_devices(void)
     return 1;
 }
 
+static int kb_low_or_err_pointer(const void *ptr);
+
 static int kb_ascii_strcasecmp(const char *a, const char *b)
 {
+    if (kb_low_or_err_pointer(a)) {
+        a = "";
+    }
+    if (kb_low_or_err_pointer(b)) {
+        b = "";
+    }
     for (;;) {
         const unsigned char ca = (unsigned char)*a++;
         const unsigned char cb = (unsigned char)*b++;
@@ -634,6 +729,12 @@ static int kb_ascii_strcasecmp(const char *a, const char *b)
 
 static int kb_ascii_strncasecmp(const char *a, const char *b, size_t n)
 {
+    if (kb_low_or_err_pointer(a)) {
+        a = "";
+    }
+    if (kb_low_or_err_pointer(b)) {
+        b = "";
+    }
     for (size_t i = 0; i < n; i++) {
         const unsigned char ca = (unsigned char)a[i];
         const unsigned char cb = (unsigned char)b[i];
@@ -646,8 +747,157 @@ static int kb_ascii_strncasecmp(const char *a, const char *b, size_t n)
     return 0;
 }
 
+static int kb_low_or_err_pointer(const void *ptr)
+{
+    uintptr_t value = (uintptr_t)ptr;
+    return ptr == NULL || value < 4096u || value >= UINTPTR_MAX - 4095u;
+}
+
+static size_t kb_safe_strlen(const char *value)
+{
+    if (kb_low_or_err_pointer(value)) {
+        return 0;
+    }
+    return strlen(value);
+}
+
+static size_t kb_safe_strnlen(const char *value, size_t maxlen)
+{
+    if (kb_low_or_err_pointer(value)) {
+        return 0;
+    }
+    return strnlen(value, maxlen);
+}
+
+static int kb_safe_strcmp(const char *a, const char *b)
+{
+    if (kb_low_or_err_pointer(a)) {
+        a = "";
+    }
+    if (kb_low_or_err_pointer(b)) {
+        b = "";
+    }
+    return strcmp(a, b);
+}
+
+static int kb_safe_strncmp(const char *a, const char *b, size_t n)
+{
+    if (kb_low_or_err_pointer(a)) {
+        a = "";
+    }
+    if (kb_low_or_err_pointer(b)) {
+        b = "";
+    }
+    return strncmp(a, b, n);
+}
+
+static char *kb_safe_strchr(const char *value, int c)
+{
+    if (kb_low_or_err_pointer(value)) {
+        return NULL;
+    }
+    return strchr(value, c);
+}
+
+static char *kb_safe_strrchr(const char *value, int c)
+{
+    if (kb_low_or_err_pointer(value)) {
+        return NULL;
+    }
+    return strrchr(value, c);
+}
+
+static char *kb_safe_strstr(const char *haystack, const char *needle)
+{
+    if (kb_low_or_err_pointer(haystack)) {
+        return NULL;
+    }
+    if (kb_low_or_err_pointer(needle)) {
+        needle = "";
+    }
+    return strstr(haystack, needle);
+}
+
+static char *kb_safe_strcpy(char *dst, const char *src)
+{
+    if (kb_low_or_err_pointer(dst)) {
+        return dst;
+    }
+    if (kb_low_or_err_pointer(src)) {
+        src = "";
+    }
+    return strcpy(dst, src);
+}
+
+static char *kb_safe_strncpy(char *dst, const char *src, size_t n)
+{
+    if (kb_low_or_err_pointer(dst)) {
+        return dst;
+    }
+    if (kb_low_or_err_pointer(src)) {
+        src = "";
+    }
+    return strncpy(dst, src, n);
+}
+
+static char *kb_safe_strncat(char *dst, const char *src, size_t n)
+{
+    if (kb_low_or_err_pointer(dst)) {
+        return dst;
+    }
+    if (kb_low_or_err_pointer(src)) {
+        src = "";
+    }
+    return strncat(dst, src, n);
+}
+
+static void *kb_safe_memset(void *dst, int value, size_t n)
+{
+    if (n == 0 || kb_low_or_err_pointer(dst)) {
+        return dst;
+    }
+    return memset(dst, value, n);
+}
+
+static void *kb_safe_memcpy(void *dst, const void *src, size_t n)
+{
+    if (n == 0 || kb_low_or_err_pointer(dst) || kb_low_or_err_pointer(src)) {
+        return dst;
+    }
+    return memcpy(dst, src, n);
+}
+
+static void *kb_safe_memmove(void *dst, const void *src, size_t n)
+{
+    if (n == 0 || kb_low_or_err_pointer(dst) || kb_low_or_err_pointer(src)) {
+        return dst;
+    }
+    return memmove(dst, src, n);
+}
+
+static int kb_safe_memcmp(const void *a, const void *b, size_t n)
+{
+    if (n == 0) {
+        return 0;
+    }
+    if (kb_low_or_err_pointer(a) || kb_low_or_err_pointer(b)) {
+        return a == b ? 0 : 1;
+    }
+    return memcmp(a, b, n);
+}
+
+static int kb_sscanf_safe(const char *str, const char *fmt, ...)
+{
+    (void)str;
+    (void)fmt;
+    return 0;
+}
+
 static char *kb_ascii_strsep(char **stringp, const char *delim)
 {
+    if (kb_low_or_err_pointer(stringp) || kb_low_or_err_pointer(delim)) {
+        return NULL;
+    }
     char *start = *stringp;
     if (start == NULL) {
         return NULL;
@@ -667,16 +917,24 @@ static char *kb_ascii_strsep(char **stringp, const char *delim)
 
 static char *kb_copy_string(const char *value)
 {
-    if (value == NULL) {
+    if (kb_low_or_err_pointer(value)) {
         value = "(unnamed)";
     }
-    const size_t len = strlen(value);
+    const size_t len = strnlen(value, 4096);
     char *copy = malloc(len + 1u);
     if (copy == NULL) {
         return NULL;
     }
-    memcpy(copy, value, len + 1u);
+    memcpy(copy, value, len);
+    copy[len] = '\0';
     return copy;
+}
+
+static char *kb_kobject_get_path_shim(void *kobj, unsigned int flags)
+{
+    (void)kobj;
+    (void)flags;
+    return NULL;
 }
 
 static int trace_kernel_objects_enabled(void)
@@ -697,7 +955,7 @@ static uint32_t kb_decode_minor(uint64_t dev)
 
 static void *kb_read_ptr_field(const void *base, size_t offset)
 {
-    if (base == NULL) {
+    if (kb_low_or_err_pointer(base)) {
         return NULL;
     }
     void *value = NULL;
@@ -707,21 +965,21 @@ static void *kb_read_ptr_field(const void *base, size_t offset)
 
 static void kb_write_ptr_field(void *base, size_t offset, const void *value)
 {
-    if (base != NULL) {
+    if (!kb_low_or_err_pointer(base)) {
         memcpy((uint8_t *)base + offset, &value, sizeof(value));
     }
 }
 
 static void kb_write_u32_field(void *base, size_t offset, uint32_t value)
 {
-    if (base != NULL) {
+    if (!kb_low_or_err_pointer(base)) {
         memcpy((uint8_t *)base + offset, &value, sizeof(value));
     }
 }
 
 static void kb_write_u64_field(void *base, size_t offset, uint64_t value)
 {
-    if (base != NULL) {
+    if (!kb_low_or_err_pointer(base)) {
         memcpy((uint8_t *)base + offset, &value, sizeof(value));
     }
 }
@@ -730,6 +988,9 @@ static kb_file_ops_view_t kb_decode_file_ops(const void *fops)
 {
     kb_file_ops_view_t view;
     memset(&view, 0, sizeof(view));
+    if (kb_low_or_err_pointer(fops)) {
+        return view;
+    }
     view.owner = kb_read_ptr_field(fops, 0);
     view.llseek = kb_read_ptr_field(fops, 8);
     view.read = kb_read_ptr_field(fops, 16);
@@ -749,6 +1010,9 @@ static kb_proc_ops_view_t kb_decode_proc_ops(const void *ops)
 {
     kb_proc_ops_view_t view;
     memset(&view, 0, sizeof(view));
+    if (kb_low_or_err_pointer(ops)) {
+        return view;
+    }
     view.open = kb_read_ptr_field(ops, 8);
     view.read = kb_read_ptr_field(ops, 16);
     view.read_iter = kb_read_ptr_field(ops, 24);
@@ -1699,14 +1963,78 @@ static size_t kb_ascii_strlcat(char *dst, const char *src, size_t size)
     return dst_len + src_len;
 }
 
+static long kb_strscpy_shim(char *dst, const char *src, size_t size)
+{
+    if (dst == NULL || src == NULL) {
+        return -22;
+    }
+    if (size == 0) {
+        return -7;
+    }
+    size_t i = 0;
+    for (; i + 1u < size && src[i] != '\0'; i++) {
+        dst[i] = src[i];
+    }
+    if (i < size) {
+        dst[i] = '\0';
+    }
+    if (src[i] != '\0') {
+        return -7;
+    }
+    return (long)i;
+}
+
+static int kb_utf16s_to_utf8s_shim(
+    const uint16_t *src,
+    int utf16_len,
+    int endian,
+    char *dst,
+    int dst_len)
+{
+    if (dst == NULL || dst_len <= 0) {
+        return 0;
+    }
+    if (src == NULL || utf16_len <= 0) {
+        dst[0] = '\0';
+        return 0;
+    }
+
+    int written = 0;
+    for (int i = 0; i < utf16_len && written < dst_len; i++) {
+        uint16_t ch = src[i];
+        if (endian == 2) {
+            ch = (uint16_t)((ch >> 8) | (ch << 8));
+        }
+        if (ch == 0) {
+            break;
+        }
+        if (ch < 0x80) {
+            dst[written++] = (char)ch;
+        } else if (ch < 0x800) {
+            if (written + 2 > dst_len) {
+                break;
+            }
+            dst[written++] = (char)(0xc0u | (ch >> 6));
+            dst[written++] = (char)(0x80u | (ch & 0x3fu));
+        } else {
+            if (written + 3 > dst_len) {
+                break;
+            }
+            dst[written++] = (char)(0xe0u | (ch >> 12));
+            dst[written++] = (char)(0x80u | ((ch >> 6) & 0x3fu));
+            dst[written++] = (char)(0x80u | (ch & 0x3fu));
+        }
+    }
+    return written;
+}
+
 static char *kb_kstrdup_shim(const char *src, unsigned int flags)
 {
-    (void)flags;
     if (src == NULL) {
         return NULL;
     }
     const size_t len = strlen(src) + 1;
-    char *dst = malloc(len);
+    char *dst = kb_kmalloc(len, flags);
     if (dst != NULL) {
         memcpy(dst, src, len);
     }
@@ -1718,7 +2046,7 @@ static void *kb_memdup_user_shim(const void *src, size_t len)
     if (src == NULL && len != 0) {
         return NULL;
     }
-    void *dst = malloc(len == 0 ? 1 : len);
+    void *dst = kb_kmalloc(len == 0 ? 1 : len, 0);
     if (dst != NULL && len != 0) {
         memcpy(dst, src, len);
     }
@@ -1729,9 +2057,29 @@ static int kb_scnprintf_shim(char *buf, size_t size, const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    int written = vsnprintf(buf, size, fmt, args);
+    int written = kb_vsnprintf_safe(buf, size, fmt, args);
     va_end(args);
-    return written;
+    if (written < 0) {
+        return written;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    const size_t max_written = size - 1u;
+    return (size_t)written > max_written ? (int)max_written : written;
+}
+
+static int kb_vscnprintf_shim(char *buf, size_t size, const char *fmt, va_list args)
+{
+    int written = kb_vsnprintf_safe(buf, size, fmt, args);
+    if (written < 0) {
+        return written;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    const size_t max_written = size - 1u;
+    return (size_t)written > max_written ? (int)max_written : written;
 }
 
 static void *kb_devm_ioremap_shim(void *dev, uint64_t phys_addr, size_t size)
@@ -1770,6 +2118,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"pci_iomap", (void *)(uintptr_t)&kb_pci_iomap},
     {"pcim_iomap", (void *)(uintptr_t)&kb_pcim_iomap},
     {"pci_iounmap", (void *)(uintptr_t)&kb_pci_iounmap},
+    {"kobox_xhci_ring_cmd_db", (void *)(uintptr_t)&kb_pci_xhci_ring_cmd_db},
     {"ioread8", (void *)(uintptr_t)&kb_ioread8},
     {"iowrite8", (void *)(uintptr_t)&kb_iowrite8},
     {"ioread32", (void *)(uintptr_t)&kb_ioread32},
@@ -1782,6 +2131,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"__dynamic_dev_dbg", (void *)(uintptr_t)&kb_dynamic_dev_dbg},
     {"_dev_err", (void *)(uintptr_t)&kb_dev_err},
     {"_dev_warn", (void *)(uintptr_t)&kb_dev_warn},
+    {"hub_port_debounce", (void *)(uintptr_t)&kb_usb_hub_port_debounce},
     {"___drm_dbg", (void *)(uintptr_t)&kb_noop},
     {"__drm_err", (void *)(uintptr_t)&kb_noop},
     {"pm_runtime_enable", (void *)(uintptr_t)&kb_pm_runtime_enable},
@@ -1839,8 +2189,8 @@ static const shim_symbol_t shim_symbols[] = {
     {"input_set_abs_params", (void *)(uintptr_t)&kb_input_set_abs_params},
     {"input_alloc_absinfo", (void *)(uintptr_t)&kb_input_alloc_absinfo},
     {"input_mt_init_slots", (void *)(uintptr_t)&kb_input_mt_init_slots},
-    {"snprintf", (void *)(uintptr_t)&snprintf},
-    {"vsnprintf", (void *)(uintptr_t)&vsnprintf},
+    {"snprintf", (void *)(uintptr_t)&kb_snprintf_safe},
+    {"vsnprintf", (void *)(uintptr_t)&kb_vsnprintf_safe},
     {"__SCT__cond_resched", (void *)(uintptr_t)&kb_cond_resched},
     {"__alloc_percpu_gfp", (void *)(uintptr_t)&kb_alloc_percpu_gfp},
     {"free_percpu", (void *)(uintptr_t)&kb_free_percpu},
@@ -1881,11 +2231,11 @@ static const shim_symbol_t shim_symbols[] = {
     {"__bitmap_shift_right", (void *)(uintptr_t)&kb_bitmap_shift_right_shim},
     {"__do_once_done", (void *)(uintptr_t)&kb_noop},
     {"__do_once_start", (void *)(uintptr_t)&kb_return_zero},
-    {"__dynamic_pr_debug", (void *)(uintptr_t)&kb_dynamic_dev_dbg},
+    {"__dynamic_pr_debug", (void *)(uintptr_t)&kb_noop},
     {"__flush_workqueue", (void *)(uintptr_t)&kb_noop},
     {"__init_swait_queue_head", (void *)(uintptr_t)&kb_init_swait_queue_head},
     {"__init_waitqueue_head", (void *)(uintptr_t)&kb_init_waitqueue_head},
-    {"__init_rwsem", (void *)(uintptr_t)&kb_noop},
+    {"__init_rwsem", (void *)(uintptr_t)&kb_init_rwsem},
     {"__refrigerator", (void *)(uintptr_t)&kb_noop},
     {"__kmalloc_node", (void *)(uintptr_t)&kb_kmalloc_node},
     {"__msecs_to_jiffies", (void *)(uintptr_t)&kb_msecs_to_jiffies},
@@ -1941,7 +2291,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"dump_stack", (void *)(uintptr_t)&kb_noop},
     {"down", (void *)(uintptr_t)&kb_noop},
     {"down_interruptible", (void *)(uintptr_t)&kb_return_zero},
-    {"down_read", (void *)(uintptr_t)&kb_noop},
+    {"down_read", (void *)(uintptr_t)&kb_down_read},
     {"down_read_trylock", (void *)(uintptr_t)&kb_return_one},
     {"down_trylock", (void *)(uintptr_t)&kb_return_zero},
     {"down_write_trylock", (void *)(uintptr_t)&kb_return_one},
@@ -2007,28 +2357,28 @@ static const shim_symbol_t shim_symbols[] = {
     {"wait_for_completion_interruptible", (void *)(uintptr_t)&kb_wait_for_completion},
     {"wait_for_completion_interruptible_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"wait_for_completion_io_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
-    {"strlen", (void *)(uintptr_t)&strlen},
-    {"strchr", (void *)(uintptr_t)&strchr},
-    {"strcpy", (void *)(uintptr_t)&strcpy},
+    {"strlen", (void *)(uintptr_t)&kb_safe_strlen},
+    {"strchr", (void *)(uintptr_t)&kb_safe_strchr},
+    {"strcpy", (void *)(uintptr_t)&kb_safe_strcpy},
     {"strcasecmp", (void *)(uintptr_t)&kb_ascii_strcasecmp},
     {"strlcat", (void *)(uintptr_t)&kb_ascii_strlcat},
-    {"strncat", (void *)(uintptr_t)&strncat},
+    {"strncat", (void *)(uintptr_t)&kb_safe_strncat},
     {"strncasecmp", (void *)(uintptr_t)&kb_ascii_strncasecmp},
-    {"strncmp", (void *)(uintptr_t)&strncmp},
-    {"strncpy", (void *)(uintptr_t)&strncpy},
+    {"strncmp", (void *)(uintptr_t)&kb_safe_strncmp},
+    {"strncpy", (void *)(uintptr_t)&kb_safe_strncpy},
     {"strncpy_from_user", (void *)(uintptr_t)&kb_strncpy_from_user},
     {"strsep", (void *)(uintptr_t)&kb_ascii_strsep},
-    {"strstr", (void *)(uintptr_t)&strstr},
-    {"strnlen", (void *)(uintptr_t)&strnlen},
+    {"strstr", (void *)(uintptr_t)&kb_safe_strstr},
+    {"strnlen", (void *)(uintptr_t)&kb_safe_strnlen},
     {"strnlen_user", (void *)(uintptr_t)&kb_strnlen_user},
-    {"strrchr", (void *)(uintptr_t)&strrchr},
-    {"sscanf", (void *)(uintptr_t)&sscanf},
-    {"memset", (void *)(uintptr_t)&memset},
-    {"memcpy", (void *)(uintptr_t)&memcpy},
-    {"memmove", (void *)(uintptr_t)&memmove},
-    {"memcmp", (void *)(uintptr_t)&memcmp},
-    {"strcmp", (void *)(uintptr_t)&strcmp},
-    {"sprintf", (void *)(uintptr_t)&sprintf},
+    {"strrchr", (void *)(uintptr_t)&kb_safe_strrchr},
+    {"sscanf", (void *)(uintptr_t)&kb_sscanf_safe},
+    {"memset", (void *)(uintptr_t)&kb_safe_memset},
+    {"memcpy", (void *)(uintptr_t)&kb_safe_memcpy},
+    {"memmove", (void *)(uintptr_t)&kb_safe_memmove},
+    {"memcmp", (void *)(uintptr_t)&kb_safe_memcmp},
+    {"strcmp", (void *)(uintptr_t)&kb_safe_strcmp},
+    {"sprintf", (void *)(uintptr_t)&kb_sprintf_safe},
     {"__SCK__tp_func_block_bio_complete", (void *)(uintptr_t)&kb_noop},
     {"__SCK__tp_func_block_bio_remap", (void *)(uintptr_t)&kb_noop},
     {"__SCK__tp_func_nvme_sq", (void *)(uintptr_t)&kb_noop},
@@ -2370,9 +2720,9 @@ static const shim_symbol_t shim_symbols[] = {
     {"hwmon_device_unregister", (void *)(uintptr_t)&kb_noop},
     {"i2c_add_adapter", (void *)(uintptr_t)&kb_return_zero},
     {"i2c_del_adapter", (void *)(uintptr_t)&kb_noop},
-    {"ida_alloc_range", (void *)(uintptr_t)&kb_return_zero},
-    {"ida_destroy", (void *)(uintptr_t)&kb_noop},
-    {"ida_free", (void *)(uintptr_t)&kb_noop},
+    {"ida_alloc_range", (void *)(uintptr_t)&kb_ida_alloc_range},
+    {"ida_destroy", (void *)(uintptr_t)&kb_ida_destroy},
+    {"ida_free", (void *)(uintptr_t)&kb_ida_free},
     {"idr_get_next", (void *)(uintptr_t)&kb_return_zero},
     {"init_opal_dev", (void *)(uintptr_t)&kb_return_zero},
     {"init_srcu_struct", (void *)(uintptr_t)&kb_return_zero},
@@ -2391,7 +2741,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"jiffies_to_msecs", (void *)(uintptr_t)&kb_jiffies_to_msecs},
     {"jiffies_to_timespec64", (void *)(uintptr_t)&kb_jiffies_to_timespec64},
     {"jiffies_to_usecs", (void *)(uintptr_t)&kb_jiffies_to_usecs},
-    {"kasprintf", (void *)(uintptr_t)&kb_return_zero},
+    {"kasprintf", (void *)(uintptr_t)&kb_kasprintf_shim},
     {"kblockd_schedule_work", (void *)(uintptr_t)&kb_return_zero},
     {"kernel_read", (void *)(uintptr_t)&kb_return_zero},
     {"kernel_write", (void *)(uintptr_t)&kb_return_zero},
@@ -2531,7 +2881,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"single_release", (void *)(uintptr_t)&kb_return_zero},
     {"simple_strtoul", (void *)(uintptr_t)&strtoul},
     {"sort", (void *)(uintptr_t)&kb_kernel_sort_shim},
-    {"strscpy", (void *)(uintptr_t)&kb_return_zero},
+    {"strscpy", (void *)(uintptr_t)&kb_strscpy_shim},
     {"submit_bio_noacct", (void *)(uintptr_t)&kb_noop},
     {"synchronize_rcu", (void *)(uintptr_t)&kb_noop},
     {"synchronize_irq", (void *)(uintptr_t)&kb_noop},
@@ -2553,7 +2903,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"trace_seq_putc", (void *)(uintptr_t)&kb_noop},
     {"try_module_get", (void *)(uintptr_t)&kb_return_one},
     {"up", (void *)(uintptr_t)&kb_noop},
-    {"up_read", (void *)(uintptr_t)&kb_noop},
+    {"up_read", (void *)(uintptr_t)&kb_up_read},
     {"unregister_chrdev_region", (void *)(uintptr_t)&kb_unregister_chrdev_region_stub},
     {"unregister_acpi_notifier", (void *)(uintptr_t)&kb_return_zero},
     {"unmap_mapping_range", (void *)(uintptr_t)&kb_noop},
@@ -2574,30 +2924,8 @@ static const shim_symbol_t shim_symbols[] = {
     {"pm_runtime_allow", (void *)(uintptr_t)&kb_noop},
     {"pm_runtime_forbid", (void *)(uintptr_t)&kb_noop},
     {"usb_acpi_port_lpm_incapable", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_add_hcd", (void *)(uintptr_t)&kb_usb_add_hcd},
     {"usb_amd_quirk_pll_check", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_create_shared_hcd", (void *)(uintptr_t)&kb_usb_create_shared_hcd},
     {"usb_enable_intel_xhci_ports", (void *)(uintptr_t)&kb_return_zero},
-    {"usb_hcd_irq", (void *)(uintptr_t)&kb_usb_hcd_irq},
-    {"usb_hcd_is_primary_hcd", (void *)(uintptr_t)&kb_usb_hcd_is_primary_hcd},
-    {"usb_hcd_pci_probe", (void *)(uintptr_t)&kb_usb_hcd_pci_probe},
-    {"usb_hcd_pci_remove", (void *)(uintptr_t)&kb_usb_hcd_pci_remove},
-    {"usb_hcd_pci_shutdown", (void *)(uintptr_t)&kb_usb_hcd_pci_shutdown},
-    {"usb_put_hcd", (void *)(uintptr_t)&kb_usb_put_hcd},
-    {"usb_remove_hcd", (void *)(uintptr_t)&kb_usb_remove_hcd},
-    {"xhci_dbg_trace", (void *)(uintptr_t)&kb_xhci_dbg_trace},
-    {"xhci_ext_cap_init", (void *)(uintptr_t)&kb_xhci_ext_cap_init},
-    {"xhci_find_slot_id_by_port", (void *)(uintptr_t)&kb_xhci_find_slot_id_by_port},
-    {"xhci_gen_setup", (void *)(uintptr_t)&kb_xhci_gen_setup},
-    {"xhci_init_driver", (void *)(uintptr_t)&kb_xhci_init_driver},
-    {"xhci_msi_irq", (void *)(uintptr_t)&kb_xhci_msi_irq},
-    {"xhci_port_state_to_neutral", (void *)(uintptr_t)&kb_xhci_port_state_to_neutral},
-    {"xhci_resume", (void *)(uintptr_t)&kb_xhci_resume},
-    {"xhci_run", (void *)(uintptr_t)&kb_xhci_run},
-    {"xhci_shutdown", (void *)(uintptr_t)&kb_xhci_shutdown},
-    {"xhci_stop", (void *)(uintptr_t)&kb_xhci_stop},
-    {"xhci_suspend", (void *)(uintptr_t)&kb_xhci_suspend},
-    {"xhci_update_hub_device", (void *)(uintptr_t)&kb_xhci_update_hub_device},
     {"__devm_request_region", (void *)(uintptr_t)&kb_alloc_stub},
     {"__get_user_1", (void *)(uintptr_t)&kb_return_zero},
     {"__get_user_4", (void *)(uintptr_t)&kb_return_zero},
@@ -2605,8 +2933,8 @@ static const shim_symbol_t shim_symbols[] = {
     {"__kfifo_free", (void *)(uintptr_t)&kb_noop},
     {"__kfifo_in", (void *)(uintptr_t)&kb_return_zero},
     {"__kfifo_to_user", (void *)(uintptr_t)&kb_return_zero},
-    {"__list_add_valid_or_report", (void *)(uintptr_t)&kb_return_one},
-    {"__list_del_entry_valid_or_report", (void *)(uintptr_t)&kb_return_one},
+    {"__list_add_valid_or_report", (void *)(uintptr_t)&kb_list_add_valid_or_report},
+    {"__list_del_entry_valid_or_report", (void *)(uintptr_t)&kb_list_del_entry_valid_or_report},
     {"__pm_runtime_set_status", (void *)(uintptr_t)&kb_return_zero},
     {"__pm_runtime_suspend", (void *)(uintptr_t)&kb_return_zero},
     {"__pm_runtime_use_autosuspend", (void *)(uintptr_t)&kb_noop},
@@ -2615,7 +2943,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"__tasklet_hi_schedule", (void *)(uintptr_t)&kb_tasklet_schedule},
     {"__tasklet_schedule", (void *)(uintptr_t)&kb_tasklet_schedule},
     {"_dev_notice", (void *)(uintptr_t)&kb_dev_warn},
-    {"_dev_printk", (void *)(uintptr_t)&kb_dev_warn},
+    {"_dev_printk", (void *)(uintptr_t)&kb_dev_printk},
     {"acpi_bus_power_manageable", (void *)(uintptr_t)&kb_return_zero},
     {"acpi_bus_set_power", (void *)(uintptr_t)&kb_return_zero},
     {"acpi_check_dsm", (void *)(uintptr_t)&kb_return_zero},
@@ -2653,6 +2981,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"dev_pm_qos_expose_flags", (void *)(uintptr_t)&kb_return_zero},
     {"dev_pm_qos_flags", (void *)(uintptr_t)&kb_return_zero},
     {"dev_pm_qos_remove_request", (void *)(uintptr_t)&kb_return_zero},
+    {"dev_get_drvdata", (void *)(uintptr_t)&kb_dev_get_drvdata},
     {"device_attach", (void *)(uintptr_t)&kb_return_zero},
     {"device_bind_driver", (void *)(uintptr_t)&kb_return_zero},
     {"device_create", (void *)(uintptr_t)&kb_alloc_stub},
@@ -2673,6 +3002,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"device_unregister", (void *)(uintptr_t)&kb_noop},
     {"device_wakeup_disable", (void *)(uintptr_t)&kb_return_zero},
     {"device_wakeup_enable", (void *)(uintptr_t)&kb_return_zero},
+    {"dev_set_drvdata", (void *)(uintptr_t)&kb_dev_set_drvdata},
     {"devm_gen_pool_create", (void *)(uintptr_t)&kb_alloc_stub},
     {"devm_ioremap", (void *)(uintptr_t)&kb_devm_ioremap_shim},
     {"devm_memremap", (void *)(uintptr_t)&kb_alloc_stub},
@@ -2698,7 +3028,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"kernfs_notify", (void *)(uintptr_t)&kb_noop},
     {"kernfs_put", (void *)(uintptr_t)&kb_noop},
     {"kill_pid_usb_asyncio", (void *)(uintptr_t)&kb_noop},
-    {"kobject_get_path", (void *)(uintptr_t)&kb_return_zero},
+    {"kobject_get_path", (void *)(uintptr_t)&kb_kobject_get_path_shim},
     {"kobject_uevent", (void *)(uintptr_t)&kb_return_zero},
     {"kstrdup", (void *)(uintptr_t)&kb_kstrdup_shim},
     {"kstrtou16", (void *)(uintptr_t)&kb_return_zero},
@@ -2738,6 +3068,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"remove_wait_queue", (void *)(uintptr_t)&kb_noop},
     {"schedule_timeout_uninterruptible", (void *)(uintptr_t)&kb_schedule_timeout},
     {"scnprintf", (void *)(uintptr_t)&kb_scnprintf_shim},
+    {"vscnprintf", (void *)(uintptr_t)&kb_vscnprintf_shim},
     {"set_primary_fwnode", (void *)(uintptr_t)&kb_noop},
     {"sg_pcopy_from_buffer", (void *)(uintptr_t)&kb_return_zero},
     {"sg_pcopy_to_buffer", (void *)(uintptr_t)&kb_return_zero},
@@ -2755,7 +3086,7 @@ static const shim_symbol_t shim_symbols[] = {
     {"timer_delete", (void *)(uintptr_t)&kb_timer_delete},
     {"trace_seq_acquire", (void *)(uintptr_t)&kb_return_zero},
     {"unregister_acpi_bus_type", (void *)(uintptr_t)&kb_return_zero},
-    {"utf16s_to_utf8s", (void *)(uintptr_t)&kb_return_zero},
+    {"utf16s_to_utf8s", (void *)(uintptr_t)&kb_utf16s_to_utf8s_shim},
     {"usb_acpi_power_manageable", (void *)(uintptr_t)&kb_return_zero},
     {"usb_acpi_set_power_state", (void *)(uintptr_t)&kb_return_zero},
     {"usb_amd_dev_put", (void *)(uintptr_t)&kb_noop},
@@ -2763,6 +3094,8 @@ static const shim_symbol_t shim_symbols[] = {
     {"usb_amd_quirk_pll_disable", (void *)(uintptr_t)&kb_noop},
     {"usb_amd_quirk_pll_enable", (void *)(uintptr_t)&kb_noop},
     {"usb_asmedia_modifyflowcontrol", (void *)(uintptr_t)&kb_noop},
+    {"usb_add_hcd", (void *)(uintptr_t)&kb_usb_add_hcd},
+    {"usb_create_shared_hcd", (void *)(uintptr_t)&kb_usb_create_shared_hcd},
     {"usb_decode_interval", (void *)(uintptr_t)&kb_usb_decode_interval},
     {"usb_deregister", (void *)(uintptr_t)&kb_usb_deregister},
     {"usb_deregister_dev", (void *)(uintptr_t)&kb_usb_deregister_dev},
@@ -2778,6 +3111,9 @@ static const shim_symbol_t shim_symbols[] = {
     {"usb_hcd_giveback_urb", (void *)(uintptr_t)&kb_usb_hcd_giveback_urb},
     {"usb_hcd_link_urb_to_ep", (void *)(uintptr_t)&kb_usb_hcd_link_urb_to_ep},
     {"usb_hcd_map_urb_for_dma", (void *)(uintptr_t)&kb_usb_hcd_map_urb_for_dma},
+    {"usb_hcd_pci_probe", (void *)(uintptr_t)&kb_usb_hcd_pci_probe},
+    {"usb_hcd_pci_remove", (void *)(uintptr_t)&kb_usb_hcd_pci_remove},
+    {"usb_hcd_pci_shutdown", (void *)(uintptr_t)&kb_usb_hcd_pci_shutdown},
     {"usb_hcd_poll_rh_status", (void *)(uintptr_t)&kb_usb_hcd_poll_rh_status},
     {"usb_hcd_resume_root_hub", (void *)(uintptr_t)&kb_usb_hcd_resume_root_hub},
     {"usb_hcd_start_port_resume", (void *)(uintptr_t)&kb_usb_hcd_start_port_resume},
@@ -2785,14 +3121,16 @@ static const shim_symbol_t shim_symbols[] = {
     {"usb_hcd_unmap_urb_for_dma", (void *)(uintptr_t)&kb_usb_hcd_unmap_urb_for_dma},
     {"usb_hub_clear_tt_buffer", (void *)(uintptr_t)&kb_usb_hub_clear_tt_buffer},
     {"usb_kill_urb", (void *)(uintptr_t)&kb_usb_kill_urb},
+    {"usb_put_hcd", (void *)(uintptr_t)&kb_usb_put_hcd},
     {"usb_register_driver", (void *)(uintptr_t)&kb_usb_register_driver},
+    {"usb_remove_hcd", (void *)(uintptr_t)&kb_usb_remove_hcd},
     {"usb_root_hub_lost_power", (void *)(uintptr_t)&kb_usb_root_hub_lost_power},
     {"usb_speed_string", (void *)(uintptr_t)&kb_usb_speed_string},
     {"usb_state_string", (void *)(uintptr_t)&kb_usb_state_string},
     {"usb_submit_urb", (void *)(uintptr_t)&kb_usb_submit_urb},
     {"usb_unlink_urb", (void *)(uintptr_t)&kb_usb_unlink_urb},
     {"usb_wakeup_notification", (void *)(uintptr_t)&kb_usb_wakeup_notification},
-    {"kobox_usb_control_msg_trace", (void *)(uintptr_t)&kb_usb_control_msg_trace},
+    {"kobox_usb_control_msg_shim", (void *)(uintptr_t)&kb_usb_control_msg_shim},
     {"wait_for_completion_killable_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"wait_for_completion_timeout", (void *)(uintptr_t)&kb_wait_for_completion_io_timeout},
     {"yield", (void *)(uintptr_t)&kb_noop},
@@ -2827,48 +3165,49 @@ static void write_u64le(uint8_t *p, uint64_t value)
     write_u32le(p + 4, (uint32_t)(value >> 32));
 }
 
-static void write_abs_jump_stub(uint8_t *p, void *target, uint64_t *counter)
+static void write_abs_jump_stub(uint8_t *p, void *target, void *caller_gs, void *callee_gs)
 {
     memset(p, 0x90, KB_LOCAL_SHIM_STUB_SIZE);
     size_t i = 0;
-    if (counter != NULL) {
-        p[i++] = 0x49;
-        p[i++] = 0xbb;
-        write_u64le(p + i, (uint64_t)(uintptr_t)counter);
-        i += 8;
-        p[i++] = 0x49;
-        p[i++] = 0x83;
-        p[i++] = 0x03;
-        p[i++] = 0x01;
-    }
     p[i++] = 0x49;
-    p[i++] = 0x89;
-    p[i++] = 0xe3;
-    p[i++] = 0x48;
-    p[i++] = 0x83;
-    p[i++] = 0xe4;
-    p[i++] = 0xf0;
-    p[i++] = 0x48;
-    p[i++] = 0x83;
-    p[i++] = 0xec;
-    p[i++] = 0x10;
-    p[i++] = 0x4c;
-    p[i++] = 0x89;
-    p[i++] = 0x5c;
-    p[i++] = 0x24;
-    p[i++] = 0x08;
-    p[i++] = 0x48;
-    p[i++] = 0xb8;
+    p[i++] = 0xbb;
     write_u64le(p + i, (uint64_t)(uintptr_t)target);
     i += 8;
-    p[i++] = 0xff;
-    p[i++] = 0xd0;
+    p[i++] = 0x49;
+    p[i++] = 0xba;
+    write_u64le(p + i, (uint64_t)(uintptr_t)caller_gs);
+    i += 8;
     p[i++] = 0x48;
-    p[i++] = 0x8b;
-    p[i++] = 0x64;
-    p[i++] = 0x24;
-    p[i++] = 0x08;
-    p[i++] = 0xc3;
+    p[i++] = 0xb8;
+    write_u64le(p + i, (uint64_t)(uintptr_t)callee_gs);
+    i += 8;
+    p[i++] = 0xff;
+    p[i++] = 0x25;
+    write_u32le(p + i, 0);
+    i += 4;
+    write_u64le(p + i, (uint64_t)(uintptr_t)&kb_shim_external_call_trampoline);
+    i += 8;
+}
+
+static void *allocate_external_call_stub_for_caller(kb_module_t *module, void *target, void *caller_gs, void *callee_gs)
+{
+    const size_t shim_symbol_count = sizeof(shim_symbols) / sizeof(shim_symbols[0]);
+    if (module == NULL || module->shim_symbol_stubs == NULL || target == NULL || caller_gs == NULL || callee_gs == NULL) {
+        return NULL;
+    }
+    if (shim_symbol_count + module->external_stub_count >= KB_LOCAL_SHIM_STUB_COUNT) {
+        return NULL;
+    }
+    uint8_t *stub = module->shim_symbol_stubs +
+        ((shim_symbol_count + module->external_stub_count) * KB_LOCAL_SHIM_STUB_SIZE);
+    module->external_stub_count++;
+    write_abs_jump_stub(stub, target, caller_gs, callee_gs);
+    return stub;
+}
+
+static void *allocate_external_call_stub(kb_module_t *module, void *target, void *callee_gs)
+{
+    return allocate_external_call_stub_for_caller(module, target, module->kernel_gs, callee_gs);
 }
 
 static void write_abs_jump_raw_stub(uint8_t *p, void *target)
@@ -2881,134 +3220,6 @@ static void write_abs_jump_raw_stub(uint8_t *p, void *target)
     i += 8;
     p[i++] = 0xff;
     p[i++] = 0xe0;
-}
-
-static void kb_trace_internal_return(const char *name, uint64_t value)
-{
-    fprintf(stderr, "kobox-trace: %s returned 0x%llx (%lld)\n", name, (unsigned long long)value, (long long)value);
-}
-
-static void kb_trace_internal_enter(
-    const char *name,
-    uint64_t rdi,
-    uint64_t rsi,
-    uint64_t rdx,
-    uint64_t rcx)
-{
-    fprintf(
-        stderr,
-        "kobox-trace: %s rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx\n",
-        name,
-        (unsigned long long)rdi,
-        (unsigned long long)rsi,
-        (unsigned long long)rdx,
-        (unsigned long long)rcx);
-}
-
-static void write_internal_trace_stub(uint8_t *p, const char *name, uint64_t target)
-{
-    memset(p, 0x90, KB_LOCAL_TRACE_STUB_SIZE);
-    size_t i = 0;
-
-    p[i++] = 0x50;
-    p[i++] = 0x57;
-    p[i++] = 0x56;
-    p[i++] = 0x52;
-    p[i++] = 0x51;
-    p[i++] = 0x41;
-    p[i++] = 0x50;
-    p[i++] = 0x41;
-    p[i++] = 0x51;
-    p[i++] = 0x41;
-    p[i++] = 0x52;
-    p[i++] = 0x41;
-    p[i++] = 0x53;
-    p[i++] = 0x48;
-    p[i++] = 0xbf;
-    write_u64le(p + i, (uint64_t)(uintptr_t)name);
-    i += 8;
-    p[i++] = 0x48;
-    p[i++] = 0x8b;
-    p[i++] = 0x74;
-    p[i++] = 0x24;
-    p[i++] = 0x38;
-    p[i++] = 0x48;
-    p[i++] = 0x8b;
-    p[i++] = 0x54;
-    p[i++] = 0x24;
-    p[i++] = 0x30;
-    p[i++] = 0x48;
-    p[i++] = 0x8b;
-    p[i++] = 0x4c;
-    p[i++] = 0x24;
-    p[i++] = 0x28;
-    p[i++] = 0x4c;
-    p[i++] = 0x8b;
-    p[i++] = 0x44;
-    p[i++] = 0x24;
-    p[i++] = 0x20;
-    p[i++] = 0x48;
-    p[i++] = 0xb8;
-    write_u64le(p + i, (uint64_t)(uintptr_t)&kb_trace_internal_enter);
-    i += 8;
-    p[i++] = 0xff;
-    p[i++] = 0xd0;
-    p[i++] = 0x41;
-    p[i++] = 0x5b;
-    p[i++] = 0x41;
-    p[i++] = 0x5a;
-    p[i++] = 0x41;
-    p[i++] = 0x59;
-    p[i++] = 0x41;
-    p[i++] = 0x58;
-    p[i++] = 0x59;
-    p[i++] = 0x5a;
-    p[i++] = 0x5e;
-    p[i++] = 0x5f;
-    p[i++] = 0x58;
-
-    p[i++] = 0x48;
-    p[i++] = 0x83;
-    p[i++] = 0xec;
-    p[i++] = 0x08;
-    p[i++] = 0x49;
-    p[i++] = 0xbb;
-    write_u64le(p + i, target);
-    i += 8;
-    p[i++] = 0x41;
-    p[i++] = 0xff;
-    p[i++] = 0xd3;
-    p[i++] = 0x48;
-    p[i++] = 0x83;
-    p[i++] = 0xc4;
-    p[i++] = 0x08;
-
-    p[i++] = 0x50;
-    p[i++] = 0x52;
-    p[i++] = 0x48;
-    p[i++] = 0x83;
-    p[i++] = 0xec;
-    p[i++] = 0x08;
-    p[i++] = 0x48;
-    p[i++] = 0xbf;
-    write_u64le(p + i, (uint64_t)(uintptr_t)name);
-    i += 8;
-    p[i++] = 0x48;
-    p[i++] = 0x89;
-    p[i++] = 0xc6;
-    p[i++] = 0x48;
-    p[i++] = 0xb8;
-    write_u64le(p + i, (uint64_t)(uintptr_t)&kb_trace_internal_return);
-    i += 8;
-    p[i++] = 0xff;
-    p[i++] = 0xd0;
-    p[i++] = 0x48;
-    p[i++] = 0x83;
-    p[i++] = 0xc4;
-    p[i++] = 0x08;
-    p[i++] = 0x5a;
-    p[i++] = 0x58;
-    p[i++] = 0xc3;
 }
 
 static uint64_t page_size(void)
@@ -3044,6 +3255,32 @@ static void *alloc_section_memory(uint64_t size)
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #if defined(__x86_64__) && defined(MAP_32BIT)
     flags |= MAP_32BIT;
+    static uintptr_t next_module_hint = UINT64_C(0x40000000);
+    const uintptr_t min_exec_hint = UINT64_C(0x40000000);
+    const uintptr_t max_exec_hint = UINT64_C(0x78000000);
+    const uintptr_t stride = UINT64_C(0x02000000);
+    for (unsigned attempt = 0; attempt < 16; attempt++) {
+        uintptr_t hint = next_module_hint;
+        if (hint < min_exec_hint || hint >= max_exec_hint) {
+            hint = min_exec_hint;
+        }
+        next_module_hint = hint + stride;
+        void *memory = mmap(
+            (void *)hint,
+            (size_t)rounded_size,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            flags,
+            -1,
+            0);
+        if (memory == MAP_FAILED) {
+            continue;
+        }
+        const uintptr_t mapped = (uintptr_t)memory;
+        if (mapped >= min_exec_hint && mapped < max_exec_hint) {
+            return memory;
+        }
+        munmap(memory, (size_t)rounded_size);
+    }
 #endif
     void *memory = mmap(0, (size_t)rounded_size, PROT_READ | PROT_WRITE | PROT_EXEC, flags, -1, 0);
     return memory == MAP_FAILED ? 0 : memory;
@@ -3087,7 +3324,7 @@ static void *lookup_shim_symbol(const char *name)
 
 static int symbol_name_pointer_is_valid(const char *name)
 {
-    return (uintptr_t)name >= 4096u;
+    return !kb_low_or_err_pointer(name);
 }
 
 static void *lookup_exported_symbol(const char *name)
@@ -3096,7 +3333,7 @@ static void *lookup_exported_symbol(const char *name)
         return 0;
     }
     for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
-        if (symbol_name_pointer_is_valid(exported_symbols[i].name) && strcmp(exported_symbols[i].name, name) == 0) {
+        if (symbol_name_pointer_is_valid(exported_symbols[i].name) && kb_safe_strcmp(exported_symbols[i].name, name) == 0) {
             return (void *)(uintptr_t)exported_symbols[i].address;
         }
     }
@@ -3106,6 +3343,137 @@ static void *lookup_exported_symbol(const char *name)
 void *kb_module_lookup_exported_symbol(const char *name)
 {
     return lookup_exported_symbol(name);
+}
+
+static int module_contains_address(const kb_module_t *module, uintptr_t address)
+{
+    if (module == NULL || address == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < module->section_count; i++) {
+        const loaded_section_t *section = &module->sections[i];
+        if (section->base == NULL || section->size == 0) {
+            continue;
+        }
+        const uintptr_t begin = (uintptr_t)section->base;
+        const uintptr_t end = begin + (uintptr_t)section->size;
+        if (address >= begin && address < end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int module_contains_executable_address(const kb_module_t *module, uintptr_t address)
+{
+    if (module == NULL || address == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < module->section_count; i++) {
+        const loaded_section_t *section = &module->sections[i];
+        if (section->base == NULL ||
+            section->size == 0 ||
+            (section->flags & KB_ELF_SHF_EXECINSTR) == 0)
+        {
+            continue;
+        }
+        const uintptr_t begin = (uintptr_t)section->base;
+        const uintptr_t end = begin + (uintptr_t)section->size;
+        if (address >= begin && address < end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static kb_module_t *module_for_address(const void *address)
+{
+    const uintptr_t value = (uintptr_t)address;
+    for (kb_module_t *module = kb_loaded_modules; module != NULL; module = module->next_loaded) {
+        if (module_contains_address(module, value)) {
+            return module;
+        }
+    }
+    return NULL;
+}
+
+int kb_module_is_executable_address(const void *address)
+{
+    const uintptr_t value = (uintptr_t)address;
+    for (kb_module_t *module = kb_loaded_modules; module != NULL; module = module->next_loaded) {
+        if (module_contains_executable_address(module, value)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+unsigned long kb_module_kernel_gs_for_address(const void *address)
+{
+#if !defined(_WIN32) && defined(__x86_64__)
+    kb_module_t *module = module_for_address(address);
+    return module == NULL ? 0 : (unsigned long)(uintptr_t)module->kernel_gs;
+#else
+    (void)address;
+    return 0;
+#endif
+}
+
+void *kb_module_make_gs_call_stub(const void *target, unsigned long caller_gs)
+{
+#if !defined(_WIN32) && defined(__x86_64__)
+    kb_module_t *callee = module_for_address(target);
+    unsigned long callee_gs = kb_module_kernel_gs_for_address(target);
+    if (callee == NULL || caller_gs == 0 || callee_gs == 0) {
+        return NULL;
+    }
+    return allocate_external_call_stub_for_caller(
+        callee,
+        (void *)(uintptr_t)target,
+        (void *)(uintptr_t)caller_gs,
+        (void *)(uintptr_t)callee_gs);
+#else
+    (void)target;
+    (void)caller_gs;
+    return NULL;
+#endif
+}
+
+void *kb_module_current_external_call_target(void)
+{
+    return (void *)kb_current_external_call_target;
+}
+
+unsigned long kb_module_current_external_call_caller_gs(void)
+{
+    return (unsigned long)kb_current_external_call_caller_gs;
+}
+
+unsigned long kb_module_current_external_call_callee_gs(void)
+{
+    return (unsigned long)kb_current_external_call_callee_gs;
+}
+
+static void register_loaded_module(kb_module_t *module)
+{
+    if (module == NULL) {
+        return;
+    }
+    module->next_loaded = kb_loaded_modules;
+    kb_loaded_modules = module;
+}
+
+static void unregister_loaded_module(kb_module_t *module)
+{
+    kb_module_t **cursor = &kb_loaded_modules;
+    while (*cursor != NULL) {
+        if (*cursor == module) {
+            *cursor = module->next_loaded;
+            module->next_loaded = NULL;
+            return;
+        }
+        cursor = &(*cursor)->next_loaded;
+    }
 }
 
 static void unregister_module_exports(const kb_module_t *module)
@@ -3402,7 +3770,9 @@ static kb_status_t register_module_exports(kb_module_t *module)
 
             int already_registered = 0;
             for (size_t i = 0; i < KB_EXPORTED_SYMBOL_MAX; i++) {
-                if (symbol_name_pointer_is_valid(exported_symbols[i].name) && strcmp(exported_symbols[i].name, symbol.name) == 0) {
+                if (symbol_name_pointer_is_valid(exported_symbols[i].name) &&
+                    kb_safe_strcmp(exported_symbols[i].name, symbol.name) == 0)
+                {
                     already_registered = 1;
                     break;
                 }
@@ -3447,6 +3817,7 @@ static kb_status_t load_sections(kb_module_t *module)
         module->sections[i].offset = image_size;
         module->sections[i].size = section.size;
         module->sections[i].alignment = alignment;
+        module->sections[i].flags = section.flags;
         image_size += section.size;
     }
 
@@ -3466,11 +3837,6 @@ static kb_status_t load_sections(kb_module_t *module)
     memset(module->image_base, 0, (size_t)image_size);
     module->shim_region = (uint8_t *)module->image_base + shim_region_offset;
     module->shim_symbol_stubs = module->shim_region;
-    module->shim_call_count = sizeof(shim_symbols) / sizeof(shim_symbols[0]);
-    module->shim_call_counts = calloc(module->shim_call_count, sizeof(module->shim_call_counts[0]));
-    if (module->shim_call_counts == NULL) {
-        return KB_ERR_NOMEM;
-    }
     module->shim_printk = module->shim_region;
     module->shim_kfree = module->shim_printk + KB_LOCAL_SHIM_STUB_SIZE;
     module->shim_kmalloc = module->shim_kfree + KB_LOCAL_SHIM_STUB_SIZE;
@@ -3510,7 +3876,6 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_boot_cpu_data = module->shim_region + KB_LOCAL_BOOT_CPU_DATA_OFFSET;
     module->shim_current_mm = module->shim_region + KB_LOCAL_CURRENT_MM_OFFSET;
     module->shim_current_task = module->shim_region + KB_LOCAL_CURRENT_TASK_OFFSET;
-    module->trace_stubs = module->shim_region + KB_LOCAL_TRACE_STUB_OFFSET;
     write_u64le((uint8_t *)module->shim_cpu_possible_mask, 1);
     write_u64le((uint8_t *)module->shim_cpu_online_mask, 1);
     write_u32le((uint8_t *)module->shim_nr_cpu_ids, 1);
@@ -3521,11 +3886,12 @@ static kb_status_t load_sections(kb_module_t *module)
         write_abs_jump_stub(
             module->shim_symbol_stubs + (i * KB_LOCAL_SHIM_STUB_SIZE),
             shim_symbols[i].address,
-            &module->shim_call_counts[i]);
+            module->kernel_gs,
+            module->kernel_gs);
     }
     write_abs_jump_raw_stub(
-        module->shim_region + KB_LOCAL_USB_CONTROL_MSG_TRACE_STUB_OFFSET,
-        (void *)(uintptr_t)&kb_usb_control_msg_trace);
+        module->shim_region + KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET,
+        (void *)(uintptr_t)&kb_usb_control_msg_entry);
     const uint64_t pv_return_zero = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "crc32_le");
     const uint64_t pv_save_flags = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "kobox_x86_save_flags_if_enabled");
     const uint64_t pv_read_pat = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "kobox_x86_read_pat_msr");
@@ -3616,6 +3982,13 @@ static int value_fits_u32(int64_t value)
 static int value_fits_i32(int64_t value)
 {
     return value >= INT32_MIN && value <= INT32_MAX;
+}
+
+static int module_backend_is_pachaos(const kb_module_t *module)
+{
+    (void)module;
+    const char *backend = getenv("KOBOX_BACKEND");
+    return backend != NULL && (strcmp(backend, "pachaos") == 0 || strcmp(backend, "pachaos_capsule") == 0);
 }
 
 static int patch_local_x86_64_external(const kb_elf_symbol_t *symbol, const kb_elf_relocation_t *relocation, uint8_t *target)
@@ -3755,30 +4128,12 @@ static void *lookup_internal_symbol_override(kb_module_t *module, const char *na
         return lookup_module_shim_symbol(module, "crc32_le");
     }
     if (strcmp(name, "usb_control_msg") == 0) {
-        return module->shim_region + KB_LOCAL_USB_CONTROL_MSG_TRACE_STUB_OFFSET;
+        return module->shim_region + KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET;
     }
-    return 0;
-}
-
-static int trace_internal_symbol_enabled(const char *name)
-{
-    const char *list = getenv("KOBOX_TRACE_INTERNAL");
-    if (list == 0 || list[0] == '\0' || name == 0 || name[0] == '\0') {
-        return 0;
-    }
-
-    const size_t name_len = strlen(name);
-    const char *p = list;
-    while (*p != '\0') {
-        while (*p == ',' || isspace((unsigned char)*p)) {
-            p++;
-        }
-        const char *start = p;
-        while (*p != '\0' && *p != ',' && !isspace((unsigned char)*p)) {
-            p++;
-        }
-        if ((size_t)(p - start) == name_len && strncmp(start, name, name_len) == 0) {
-            return 1;
+    if (strcmp(name, "hub_port_debounce") == 0) {
+        const char *backend = getenv("KOBOX_BACKEND");
+        if (backend != NULL && strcmp(backend, "pachaos") == 0) {
+            return lookup_module_shim_symbol(module, "hub_port_debounce");
         }
     }
     return 0;
@@ -3790,6 +4145,9 @@ static int should_interpose_exported_symbol(const char *name)
            strcmp(name, "usb_deregister_dev") == 0 ||
            strcmp(name, "usb_find_common_endpoints") == 0 ||
            strcmp(name, "usb_find_interface") == 0 ||
+           strcmp(name, "usb_hcd_pci_probe") == 0 ||
+           strcmp(name, "usb_hcd_pci_remove") == 0 ||
+           strcmp(name, "usb_hcd_pci_shutdown") == 0 ||
            strcmp(name, "usb_kill_urb") == 0 ||
            strcmp(name, "usb_register_driver") == 0 ||
            strcmp(name, "usb_submit_urb") == 0 ||
@@ -3799,17 +4157,6 @@ static int should_interpose_exported_symbol(const char *name)
 static int relocation_is_direct_call(const uint8_t *target)
 {
     return target != 0 && target[-1] == 0xe8;
-}
-
-static uint64_t internal_trace_stub_address(kb_module_t *module, const char *name, uint64_t target)
-{
-    if (module->trace_stub_count >= KB_LOCAL_TRACE_STUB_COUNT) {
-        return 0;
-    }
-    uint8_t *stub = module->trace_stubs + (module->trace_stub_count * KB_LOCAL_TRACE_STUB_SIZE);
-    module->trace_stub_count++;
-    write_internal_trace_stub(stub, name, target);
-    return (uint64_t)(uintptr_t)stub;
 }
 
 static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_relocation_t *relocation)
@@ -3840,11 +4187,13 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
         }
 
         void *address = 0;
+        int address_from_exported_module = 0;
         if (should_interpose_exported_symbol(symbol.name)) {
             address = lookup_module_shim_symbol(module, symbol.name);
         }
         if (address == 0) {
             address = lookup_exported_symbol(symbol.name);
+            address_from_exported_module = address != 0;
         }
         if (address == 0) {
             address = lookup_module_shim_symbol(module, symbol.name);
@@ -3859,6 +4208,26 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
                     (unsigned long long)relocation->offset);
             }
             return KB_ERR_UNSUPPORTED;
+        }
+        if (address_from_exported_module && kb_module_is_executable_address(address)) {
+            unsigned long callee_gs = kb_module_kernel_gs_for_address(address);
+            if (callee_gs != 0 && callee_gs != (unsigned long)(uintptr_t)module->kernel_gs) {
+                void *stub = allocate_external_call_stub(module, address, (void *)(uintptr_t)callee_gs);
+                if (stub == NULL) {
+                    return KB_ERR_NOMEM;
+                }
+                if (trace_modules_enabled()) {
+                    fprintf(
+                        stderr,
+                        "kobox-loader: cross-module stub symbol=%s target=%p caller_gs=%p callee_gs=%p stub=%p\n",
+                        symbol.name,
+                        address,
+                        (void *)module->kernel_gs,
+                        (void *)(uintptr_t)callee_gs,
+                        stub);
+                }
+                address = stub;
+            }
         }
         symbol_address = (uint64_t)(uintptr_t)address;
     } else {
@@ -3885,17 +4254,6 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
         void *stub = lookup_module_shim_symbol(module, "kobox_nvidia_mock_nv_pci_count_devices");
         if (stub != NULL) {
             relocated_symbol_address = (uint64_t)(uintptr_t)stub;
-        }
-    }
-    if (symbol.section_index != KB_ELF_SHN_UNDEF &&
-        (relocation->type == KB_ELF_R_X86_64_PC32 || relocation->type == KB_ELF_R_X86_64_PLT32) &&
-        relocation->offset > 0 &&
-        relocation_is_direct_call(target) &&
-        trace_internal_symbol_enabled(symbol.name))
-    {
-        const uint64_t trace_stub = internal_trace_stub_address(module, symbol.name, symbol_address);
-        if (trace_stub != 0) {
-            relocated_symbol_address = trace_stub;
         }
     }
     const int64_t value = (int64_t)relocated_symbol_address + addend;
@@ -4000,6 +4358,191 @@ static kb_status_t apply_relocations(kb_module_t *module)
     return KB_OK;
 }
 
+static int symbol_is_static_trace_call(const kb_elf_symbol_t *symbol)
+{
+    static const char prefix[] = "__SCT__tp_func_";
+    return symbol != NULL &&
+        symbol_name_pointer_is_valid(symbol->name) &&
+        strncmp(symbol->name, prefix, sizeof(prefix) - 1u) == 0;
+}
+
+static kb_status_t patch_module_static_trace_calls(kb_module_t *module)
+{
+    const size_t section_count = kb_elf_section_count(&module->elf);
+    size_t patched_count = 0;
+
+    for (size_t section_index = 0; section_index < section_count; section_index++) {
+        kb_elf_section_t symbol_section;
+        kb_status_t status = kb_elf_section(&module->elf, section_index, &symbol_section);
+        if (status != KB_OK) {
+            return status;
+        }
+        if (symbol_section.type != KB_ELF_SHT_SYMTAB && symbol_section.type != KB_ELF_SHT_DYNSYM) {
+            continue;
+        }
+
+        size_t symbol_count = 0;
+        status = kb_elf_symbol_count(&module->elf, section_index, &symbol_count);
+        if (status != KB_OK) {
+            return status;
+        }
+        for (size_t symbol_index = 0; symbol_index < symbol_count; symbol_index++) {
+            kb_elf_symbol_t symbol;
+            status = kb_elf_symbol(&module->elf, section_index, symbol_index, &symbol);
+            if (status != KB_OK) {
+                return status;
+            }
+            if (!symbol_is_static_trace_call(&symbol) ||
+                symbol.section_index == KB_ELF_SHN_UNDEF ||
+                symbol.section_index >= module->section_count)
+            {
+                continue;
+            }
+
+            kb_elf_section_t target_section;
+            status = kb_elf_section(&module->elf, symbol.section_index, &target_section);
+            if (status != KB_OK) {
+                return status;
+            }
+            loaded_section_t *loaded = &module->sections[symbol.section_index];
+            if (loaded->base == NULL || (target_section.flags & KB_ELF_SHF_EXECINSTR) == 0 ||
+                symbol.value >= loaded->size)
+            {
+                continue;
+            }
+
+            uint8_t *code = (uint8_t *)loaded->base + symbol.value;
+            size_t remaining = (size_t)(loaded->size - symbol.value);
+            size_t patch_size = symbol.size != 0 && symbol.size < remaining ? (size_t)symbol.size : remaining;
+            if (patch_size > 8u) {
+                patch_size = 8u;
+            }
+            if (patch_size == 0) {
+                continue;
+            }
+
+            code[0] = 0xc3;
+            if (patch_size > 1u) {
+                memset(code + 1, 0x90, patch_size - 1u);
+            }
+            patched_count++;
+            if (trace_modules_enabled()) {
+                fprintf(
+                    stderr,
+                    "kobox-loader: patched static trace call module=%s symbol=%s addr=%p size=%zu\n",
+                    module->module_name != NULL ? module->module_name : "(unnamed)",
+                    symbol.name,
+                    (void *)code,
+                    patch_size);
+            }
+        }
+    }
+
+    if (patched_count != 0 && trace_modules_enabled()) {
+        fprintf(
+            stderr,
+            "kobox-loader: patched static trace calls module=%s count=%zu\n",
+            module->module_name != NULL ? module->module_name : "(unnamed)",
+            patched_count);
+    }
+    return KB_OK;
+}
+
+static int xhci_command_doorbell_helper_matches(const uint8_t *code, size_t remaining)
+{
+    static const uint8_t suffix[] = {
+        0x55,
+        0x48, 0x89, 0xe5,
+        0x53,
+        0x48, 0x89, 0xfb,
+        0x66, 0x90,
+        0x66, 0x90,
+        0x48, 0x8b, 0x53, 0x28,
+        0x31, 0xc0,
+        0x89, 0x02,
+        0x48, 0x8b, 0x43, 0x28,
+        0x8b, 0x00,
+    };
+    if (remaining < 5u + sizeof(suffix)) {
+        return 0;
+    }
+    int has_fentry_call = code[0] == 0xe8;
+    int has_patched_fentry_nops =
+        code[0] == 0x90 &&
+        code[1] == 0x90 &&
+        code[2] == 0x90 &&
+        code[3] == 0x90 &&
+        code[4] == 0x90;
+    if (!has_fentry_call && !has_patched_fentry_nops) {
+        return 0;
+    }
+    return memcmp(code + 5, suffix, sizeof(suffix)) == 0;
+}
+
+static kb_status_t patch_relative_jump(uint8_t *code, const void *target)
+{
+    const int64_t rel = (int64_t)(uintptr_t)target - ((int64_t)(uintptr_t)code + 5);
+    if (!value_fits_i32(rel)) {
+        return KB_ERR_UNSUPPORTED;
+    }
+    code[0] = 0xe9;
+    write_u32le(code + 1, (uint32_t)rel);
+    return KB_OK;
+}
+
+static kb_status_t patch_module_xhci_command_doorbell(kb_module_t *module)
+{
+    if (module == NULL || module->module_name == NULL ||
+        strstr(module->module_name, "xhci-hcd") == NULL ||
+        !module_backend_is_pachaos(module))
+    {
+        return KB_OK;
+    }
+
+    void *stub = lookup_module_shim_symbol(module, "kobox_xhci_ring_cmd_db");
+    if (stub == NULL) {
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    size_t patched_count = 0;
+    for (size_t section_index = 0; section_index < module->section_count; section_index++) {
+        loaded_section_t *section = &module->sections[section_index];
+        if (section->base == NULL || section->size == 0 ||
+            (section->flags & KB_ELF_SHF_EXECINSTR) == 0)
+        {
+            continue;
+        }
+        uint8_t *begin = (uint8_t *)section->base;
+        for (uint64_t offset = 0; offset + 31u <= section->size; offset++) {
+            uint8_t *code = begin + offset;
+            if (!xhci_command_doorbell_helper_matches(code, (size_t)(section->size - offset))) {
+                continue;
+            }
+            kb_status_t status = patch_relative_jump(code, stub);
+            if (status != KB_OK) {
+                return status;
+            }
+            patched_count++;
+            if (trace_modules_enabled()) {
+                fprintf(
+                    stderr,
+                    "kobox-loader: patched xhci command doorbell module=%s addr=%p stub=%p\n",
+                    module->module_name,
+                    (void *)code,
+                    stub);
+            }
+        }
+    }
+
+    if (patched_count == 0 && trace_modules_enabled()) {
+        fprintf(
+            stderr,
+            "kobox-loader: xhci command doorbell helper not found module=%s\n",
+            module->module_name);
+    }
+    return KB_OK;
+}
+
 static void free_loaded_sections(kb_module_t *module)
 {
     if (module == 0) {
@@ -4008,97 +4551,16 @@ static void free_loaded_sections(kb_module_t *module)
     free_section_memory(module->image_base, module->image_size);
 }
 
-static int trace_shim_calls_enabled(void)
-{
-    const char *value = getenv("KOBOX_TRACE_SHIM_CALLS");
-    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
-}
-
-static size_t trace_shim_call_limit(void)
-{
-    const char *value = getenv("KOBOX_TRACE_SHIM_CALLS_TOP");
-    if (value == NULL || value[0] == '\0') {
-        return 32;
-    }
-    char *end = NULL;
-    const unsigned long parsed = strtoul(value, &end, 10);
-    if (end == value || parsed == 0) {
-        return 32;
-    }
-    return parsed > 256ul ? 256u : (size_t)parsed;
-}
-
-static int shim_index_already_printed(const size_t *indices, size_t count, size_t index)
-{
-    for (size_t i = 0; i < count; i++) {
-        if (indices[i] == index) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void print_shim_call_summary(const kb_module_t *module)
-{
-    if (module == NULL || module->shim_call_counts == NULL || !trace_shim_calls_enabled()) {
-        return;
-    }
-    const char *module_name = module->module_name == NULL ? "(unnamed)" : module->module_name;
-
-    uint64_t total = 0;
-    size_t used_symbols = 0;
-    for (size_t i = 0; i < module->shim_call_count; i++) {
-        total += module->shim_call_counts[i];
-        used_symbols += module->shim_call_counts[i] != 0;
-    }
-    if (total == 0) {
-        fprintf(stderr, "kobox-shim-calls: module=%s total=0\n", module_name);
-        return;
-    }
-
-    const size_t limit = trace_shim_call_limit();
-    size_t printed_count = 0;
-    size_t printed_indices[256];
-    fprintf(
-        stderr,
-        "kobox-shim-calls: module=%s total=%llu used_symbols=%zu\n",
-        module_name,
-        (unsigned long long)total,
-        used_symbols);
-
-    while (printed_count < limit && printed_count < module->shim_call_count) {
-        size_t best = SIZE_MAX;
-        uint64_t best_count = 0;
-        for (size_t i = 0; i < module->shim_call_count; i++) {
-            if (module->shim_call_counts[i] > best_count && !shim_index_already_printed(printed_indices, printed_count, i)) {
-                best = i;
-                best_count = module->shim_call_counts[i];
-            }
-        }
-        if (best == SIZE_MAX || best_count == 0) {
-            break;
-        }
-        printed_indices[printed_count++] = best;
-        fprintf(
-            stderr,
-            "kobox-shim-calls: module=%s symbol=%s count=%llu\n",
-            module_name,
-            shim_symbols[best].name,
-            (unsigned long long)best_count);
-    }
-}
-
 static void destroy_module(kb_module_t *module)
 {
     if (module == 0) {
         return;
     }
-    print_shim_call_summary(module);
+    unregister_loaded_module(module);
     unregister_module_exports(module);
     free_loaded_sections(module);
     free(module->shim_node0);
     free(module->module_name);
-    free(module->shim_call_counts);
     free(module->sections);
     free(module);
 }
@@ -4110,11 +4572,43 @@ static kb_status_t enter_module_context(kb_module_t *module, unsigned long *out_
     }
     kb_shim_set_backend(module->backend);
 #if !defined(_WIN32) && defined(__x86_64__)
+    if (module_backend_is_pachaos(module)) {
+        (void)syscall(SYS_arch_prctl, ARCH_SET_GS, 0ul);
+    }
+    *out_old_gs = 0;
     if (syscall(SYS_arch_prctl, ARCH_GET_GS, out_old_gs) != 0) {
+        int saved_errno = errno;
+        fprintf(
+            stderr,
+            "kobox-loader: enter module context failed phase=get-gs module=%s errno=%d kernel_gs=%p old_gs=0x%lx\n",
+            module->module_name == NULL ? "(unnamed)" : module->module_name,
+            saved_errno,
+            (void *)module->kernel_gs,
+            *out_old_gs);
+        fflush(stderr);
         kb_shim_set_backend(0);
         return KB_ERR_UNSUPPORTED;
     }
-    if (syscall(SYS_arch_prctl, ARCH_SET_GS, (unsigned long)(uintptr_t)module->kernel_gs) != 0) {
+    const unsigned long desired_gs = (unsigned long)(uintptr_t)module->kernel_gs;
+    long set_gs_result = syscall(SYS_arch_prctl, ARCH_SET_GS, desired_gs);
+    if (set_gs_result != 0) {
+        int saved_errno = errno;
+        unsigned long current_gs = 0;
+        long get_after_set_result = syscall(SYS_arch_prctl, ARCH_GET_GS, &current_gs);
+        if (get_after_set_result == 0 && current_gs == desired_gs) {
+            return KB_OK;
+        }
+        fprintf(
+            stderr,
+            "kobox-loader: enter module context failed phase=set-gs module=%s result=%ld errno=%d get_after=%ld kernel_gs=%p old_gs=0x%lx current_gs=0x%lx\n",
+            module->module_name == NULL ? "(unnamed)" : module->module_name,
+            set_gs_result,
+            saved_errno,
+            get_after_set_result,
+            (void *)module->kernel_gs,
+            *out_old_gs,
+            current_gs);
+        fflush(stderr);
         kb_shim_set_backend(0);
         return KB_ERR_UNSUPPORTED;
     }
@@ -4141,6 +4635,14 @@ static kb_status_t prepare_module(kb_module_t *module)
         return status;
     }
     status = apply_relocations(module);
+    if (status != KB_OK) {
+        return status;
+    }
+    status = patch_module_static_trace_calls(module);
+    if (status != KB_OK) {
+        return status;
+    }
+    status = patch_module_xhci_command_doorbell(module);
     if (status != KB_OK) {
         return status;
     }
@@ -4225,15 +4727,20 @@ kb_status_t kb_module_open_image(
         destroy_module(module);
         return status;
     }
+    register_loaded_module(module);
 
     *out_module = module;
     if (trace_modules_enabled()) {
         fprintf(
             stderr,
-            "kobox-loader: loaded %s base=%p size=0x%llx\n",
+            "kobox-loader: loaded %s base=%p size=0x%llx shim=%p..%p usb_control_msg_stub=%p shim_stub_size=%u\n",
             image->name == NULL ? "(unnamed)" : image->name,
             module->image_base,
-            (unsigned long long)module->image_size);
+            (unsigned long long)module->image_size,
+            (void *)module->shim_region,
+            (void *)(module->shim_region + KB_LOCAL_SHIM_REGION_SIZE),
+            (void *)(module->shim_region + KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET),
+            (unsigned)KB_LOCAL_SHIM_STUB_SIZE);
     }
     return KB_OK;
 }
@@ -4269,6 +4776,13 @@ kb_status_t kb_module_call_cleanup(kb_module_t *module)
     unsigned long old_gs = 0;
     kb_status_t status = enter_module_context(module, &old_gs);
     if (status != KB_OK) {
+        fprintf(
+            stderr,
+            "kobox-loader: cleanup context failed module=%s status=%d cleanup=%p\n",
+            module->module_name == NULL ? "(unnamed)" : module->module_name,
+            status,
+            (void *)module->cleanup_module);
+        fflush(stderr);
         return status;
     }
     kb_active_module = module;

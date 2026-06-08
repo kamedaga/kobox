@@ -81,9 +81,6 @@ mkdir -p "$repo_root/.artifacts"
 
 KOBOX_TRACE_PCI="${KOBOX_TRACE_PCI:-1}" \
 KOBOX_TRACE_MODULES="${KOBOX_TRACE_MODULES:-1}" \
-KOBOX_TRACE_SHIM_CALLS="${KOBOX_TRACE_SHIM_CALLS:-1}" \
-KOBOX_TRACE_SHIM_CALLS_TOP="${KOBOX_TRACE_SHIM_CALLS_TOP:-128}" \
-KOBOX_TRACE_INTERNAL="${KOBOX_TRACE_INTERNAL:+$KOBOX_TRACE_INTERNAL,}uvm_va_range_create_mmap" \
 KOBOX_TRACE_KERNEL_OBJECTS="${KOBOX_TRACE_KERNEL_OBJECTS:-1}" \
 KOBOX_FOPS_SMOKE="${KOBOX_FOPS_SMOKE:-1}" \
 KOBOX_MOCK_PCI_ID="${KOBOX_MOCK_PCI_ID:-10de:25b6:03:00:00}" \
@@ -105,11 +102,6 @@ grep -q "cleanup_module returned" "$log"
 grep -q "dependency .*nvidia-uvm\\.ko cleanup_module returned" "$log"
 grep -q "dependency .*nvidia-modeset\\.ko cleanup_module returned" "$log"
 grep -q "dependency .*nvidia\\.ko cleanup_module returned" "$log"
-grep -q "kobox-shim-calls: module=.*nvidia\\.ko total=" "$log"
-grep -q "kobox-shim-calls: module=.*nvidia-modeset\\.ko total=" "$log"
-grep -q "kobox-shim-calls: module=.*nvidia-uvm\\.ko total=" "$log"
-grep -q "kobox-shim-calls: module=.*nvidia-drm\\.ko total=" "$log"
-grep -q "kobox-shim-calls: module=.*nvidia-drm\\.ko symbol=drm_dev_register count=1" "$log"
 grep -q "kobox-kobj: register_chrdev .*name=nvidia" "$log"
 grep -q "kobox-kobj: proc_create .*path=/proc/driver/nvidia" "$log"
 grep -q "kobox-kobj-summary: chrdev .*name=nvidia" "$log"
@@ -130,8 +122,6 @@ grep -q "kobox-fops-smoke: target=cdev:nvidia-uvm:0 op=ioctl name=UVM_PAGEABLE_M
 grep -q "kobox-fops-smoke: target=cdev:nvidia-uvm:0 op=ioctl name=UVM_PAGEABLE_MEM_ACCESS rmStatus=0x0" "$log"
 grep -q "kobox-fops-smoke: target=cdev:nvidia-uvm:0 op=ioctl name=UVM_PAGEABLE_MEM_ACCESS_ON_GPU" "$log"
 grep -q "kobox-fops-smoke: target=cdev:nvidia-uvm:0 op=mmap .* result=0" "$log"
-grep -q "kobox-trace: uvm_va_range_create_mmap rdi=" "$log"
-grep -q "kobox-trace: uvm_va_range_create_mmap returned 0x0 (0)" "$log"
 grep -q "kobox-fops-smoke: target=cdev:nvidia-uvm:0 op=ioctl name=UVM_DEINITIALIZE" "$log"
 grep -q "kobox-fd: filp_open path=/sys/bus/pci/devices/.*/config" "$log"
 if grep -q "probe routine was not called" "$log"; then

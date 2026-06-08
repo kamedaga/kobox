@@ -200,15 +200,6 @@ fi
 if [ -n "${KOBOX_TRACE_MODULES:-}" ]; then
     kobox_run_env="$kobox_run_env KOBOX_TRACE_MODULES=$KOBOX_TRACE_MODULES"
 fi
-if [ -n "${KOBOX_TRACE_SHIM_CALLS:-}" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_SHIM_CALLS=$KOBOX_TRACE_SHIM_CALLS"
-fi
-if [ -n "${KOBOX_TRACE_SHIM_CALLS_TOP:-}" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_TRACE_SHIM_CALLS_TOP=$KOBOX_TRACE_SHIM_CALLS_TOP"
-fi
-if [ -n "${KOBOX_CRASH_STACK:-}" ]; then
-    kobox_run_env="$kobox_run_env KOBOX_CRASH_STACK=$KOBOX_CRASH_STACK"
-fi
 if [ -n "$kobox_run_env" ]; then
     kobox_run_env=${kobox_run_env# }
     sed -i "s#^/usr/bin/kobox-run #$kobox_run_env /usr/bin/kobox-run #" "$root_dir/init"

@@ -25,9 +25,13 @@ add_library(kobox_runtime STATIC
     src/subsystem/nvme/nvme.c
     src/subsystem/pci/pci.c
     src/subsystem/scsi/scsi.c
+    src/subsystem/usb/config.c
+    src/subsystem/usb/port_state.c
     src/subsystem/usb/storage.c
+    src/subsystem/usb/synthetic.c
     src/subsystem/usb/usb.c
     src/shim/linux_context.c
+    src/shim/linux_call.c
     src/shim/linux_block.c
     src/shim/linux_device.c
     src/shim/linux_dma.c
@@ -62,6 +66,12 @@ target_compile_options(kobox_runtime PRIVATE
     -Wpedantic
     -Werror
 )
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(kobox_runtime PRIVATE
+        -mstackrealign
+    )
+endif()
 
 add_executable(kobox-inspect
     tools/kobox_inspect/main.c
@@ -178,10 +188,11 @@ add_test(NAME kobox-usb-subsystem-smoke COMMAND kobox-usb-subsystem-smoke)
 
 add_executable(kobox-input-subsystem-smoke
     tests/input_subsystem_smoke.c
-    src/subsystem/input/input.c
 )
 
+target_link_libraries(kobox-input-subsystem-smoke PRIVATE kobox_runtime)
 target_include_directories(kobox-input-subsystem-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_options(kobox-input-subsystem-smoke PRIVATE

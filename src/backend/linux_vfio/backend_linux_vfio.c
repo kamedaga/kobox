@@ -23,7 +23,6 @@
 enum {
     KB_VFIO_PATH_MAX = 4096,
     KB_VFIO_PCI_CONFIG_SIZE = 4096,
-    KB_VFIO_DMA_MAPPING_MAX = 128,
     KB_VFIO_DMA_IOVA_BASE = 0x01000000,
     KB_PCI_COMMAND_OFFSET = 0x04,
     KB_PCI_COMMAND_MEMORY = 0x0002,
@@ -69,6 +68,7 @@ typedef struct kb_vfio_dma_mapping {
     uint64_t iova;
     uint64_t vaddr;
     uint64_t size;
+    struct kb_vfio_dma_mapping *next;
 } kb_vfio_dma_mapping_t;
 
 struct kb_linux_vfio_backend {
@@ -78,7 +78,7 @@ struct kb_linux_vfio_backend {
     int device_fd;
     int group_id;
     uint64_t next_iova;
-    kb_vfio_dma_mapping_t dma_mappings[KB_VFIO_DMA_MAPPING_MAX];
+    kb_vfio_dma_mapping_t *dma_mappings;
     struct kb_device device;
 };
 
@@ -89,6 +89,12 @@ static void vfio_unmap_all_dma(kb_linux_vfio_backend_t *vfio);
 static kb_linux_vfio_backend_t *vfio_from_backend(kb_backend_t *backend)
 {
     return (kb_linux_vfio_backend_t *)backend;
+}
+
+static int vfio_low_or_err_pointer(const void *ptr)
+{
+    uintptr_t value = (uintptr_t)ptr;
+    return value < 4096u || value >= UINTPTR_MAX - 4095u;
 }
 
 static int path_join(char *dst, size_t dst_size, const char *a, const char *b)
@@ -116,26 +122,19 @@ static uint64_t align_up_u64(uint64_t value, uint64_t alignment)
 
 static kb_status_t remember_dma_mapping(kb_linux_vfio_backend_t *backend, uint64_t iova, uint64_t vaddr, uint64_t size)
 {
-    for (size_t i = 0; i < KB_VFIO_DMA_MAPPING_MAX; i++) {
-        if (backend->dma_mappings[i].size == 0) {
-            backend->dma_mappings[i].iova = iova;
-            backend->dma_mappings[i].vaddr = vaddr;
-            backend->dma_mappings[i].size = size;
-            return KB_OK;
-        }
+    if (backend == NULL) {
+        return KB_ERR_INVALID;
     }
-    return KB_ERR_NOMEM;
-}
-
-static kb_vfio_dma_mapping_t *find_dma_mapping(kb_linux_vfio_backend_t *backend, uint64_t dma_addr)
-{
-    for (size_t i = 0; i < KB_VFIO_DMA_MAPPING_MAX; i++) {
-        kb_vfio_dma_mapping_t *mapping = &backend->dma_mappings[i];
-        if (mapping->size != 0 && dma_addr >= mapping->iova && dma_addr < mapping->iova + mapping->size) {
-            return mapping;
-        }
+    kb_vfio_dma_mapping_t *mapping = calloc(1, sizeof(*mapping));
+    if (mapping == NULL) {
+        return KB_ERR_NOMEM;
     }
-    return NULL;
+    mapping->iova = iova;
+    mapping->vaddr = vaddr;
+    mapping->size = size;
+    mapping->next = backend->dma_mappings;
+    backend->dma_mappings = mapping;
+    return KB_OK;
 }
 
 static kb_status_t errno_status(void)
@@ -361,7 +360,7 @@ static void vfio_destroy(kb_backend_t *backend)
 
 static kb_status_t vfio_device_count(kb_backend_t *backend, size_t *out_count)
 {
-    if (backend == NULL || out_count == NULL) {
+    if (backend == NULL || vfio_low_or_err_pointer(out_count)) {
         return KB_ERR_INVALID;
     }
     *out_count = 1;
@@ -370,7 +369,7 @@ static kb_status_t vfio_device_count(kb_backend_t *backend, size_t *out_count)
 
 static kb_status_t vfio_device_at(kb_backend_t *backend, size_t index, kb_device_t **out_device)
 {
-    if (backend == NULL || out_device == NULL) {
+    if (backend == NULL || vfio_low_or_err_pointer(out_device)) {
         return KB_ERR_INVALID;
     }
     if (index != 0) {
@@ -382,7 +381,7 @@ static kb_status_t vfio_device_at(kb_backend_t *backend, size_t index, kb_device
 
 static kb_status_t vfio_device_pci_id(kb_device_t *device, kb_pci_id_t *out_id)
 {
-    if (device == NULL || out_id == NULL) {
+    if (device == NULL || vfio_low_or_err_pointer(out_id)) {
         return KB_ERR_INVALID;
     }
     *out_id = device->pci_id;
@@ -391,7 +390,7 @@ static kb_status_t vfio_device_pci_id(kb_device_t *device, kb_pci_id_t *out_id)
 
 static kb_status_t vfio_device_pci_location(kb_device_t *device, kb_pci_location_t *out_location)
 {
-    if (device == NULL || out_location == NULL) {
+    if (device == NULL || vfio_low_or_err_pointer(out_location)) {
         return KB_ERR_INVALID;
     }
     *out_location = device->location;
@@ -711,7 +710,17 @@ static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size
         return;
     }
 
-    kb_vfio_dma_mapping_t *mapping = find_dma_mapping(device->backend, dma_addr);
+    kb_vfio_dma_mapping_t **cursor = &device->backend->dma_mappings;
+    kb_vfio_dma_mapping_t *mapping = NULL;
+    while (*cursor != NULL) {
+        kb_vfio_dma_mapping_t *candidate = *cursor;
+        if (candidate->size != 0 && dma_addr >= candidate->iova && dma_addr < candidate->iova + candidate->size) {
+            mapping = candidate;
+            *cursor = candidate->next;
+            break;
+        }
+        cursor = &candidate->next;
+    }
     if (mapping == NULL) {
         return;
     }
@@ -722,7 +731,7 @@ static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size
     unmap.iova = mapping->iova;
     unmap.size = mapping->size;
     (void)ioctl(device->backend->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
-    memset(mapping, 0, sizeof(*mapping));
+    free(mapping);
 }
 
 static void vfio_unmap_all_dma(kb_linux_vfio_backend_t *vfio)
@@ -731,11 +740,9 @@ static void vfio_unmap_all_dma(kb_linux_vfio_backend_t *vfio)
         return;
     }
 
-    for (size_t i = 0; i < KB_VFIO_DMA_MAPPING_MAX; i++) {
-        kb_vfio_dma_mapping_t *mapping = &vfio->dma_mappings[i];
-        if (mapping->size == 0) {
-            continue;
-        }
+    while (vfio->dma_mappings != NULL) {
+        kb_vfio_dma_mapping_t *mapping = vfio->dma_mappings;
+        vfio->dma_mappings = mapping->next;
 
         struct vfio_iommu_type1_dma_unmap unmap;
         memset(&unmap, 0, sizeof(unmap));
@@ -743,7 +750,7 @@ static void vfio_unmap_all_dma(kb_linux_vfio_backend_t *vfio)
         unmap.iova = mapping->iova;
         unmap.size = mapping->size;
         (void)ioctl(vfio->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
-        memset(mapping, 0, sizeof(*mapping));
+        free(mapping);
     }
 }
 

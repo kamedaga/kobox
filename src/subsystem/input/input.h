@@ -38,6 +38,8 @@ typedef struct kb_input_device_snapshot {
     kb_input_id_t input_id;
     unsigned long event_count;
     unsigned long dropped_events;
+    int opened;
+    int open_result;
     unsigned int mt_slots;
     unsigned int mt_flags;
     kb_input_abs_params_t abs[KB_INPUT_ABS_MAX];
@@ -70,7 +72,10 @@ size_t kb_input_subsystem_device_count(void);
 int kb_input_subsystem_for_each_device(
     int (*callback)(const kb_input_device_snapshot_t *device, void *ctx),
     void *ctx);
+int kb_input_subsystem_open_registered_devices(void);
+void kb_input_subsystem_close_registered_devices(void);
 size_t kb_input_subsystem_pop_events(kb_input_event_t *events, size_t max_events);
 size_t kb_input_subsystem_event_count(void);
 void kb_input_subsystem_print_summary(FILE *out);
+int kb_input_subsystem_run_mouse_smoke(FILE *out);
 void kb_input_subsystem_reset(void);
