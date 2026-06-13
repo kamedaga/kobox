@@ -20,6 +20,8 @@ add_library(kobox_runtime STATIC
     src/device/pachaos_capsule/device_pachaos_capsule.c
     src/device/linux_sysfs/device_linux_sysfs.c
     src/device/linux_vfio/device_linux_vfio.c
+    src/device/linux_vfio/nvme.c
+    src/device/linux_vfio/virtio_blk.c
     src/loader/elf_reader.c
     src/loader/module_loader.c
     src/loader/symbol_registry.c
@@ -282,6 +284,24 @@ target_compile_options(kobox-fs-subsystem-smoke PRIVATE
 
 add_test(NAME kobox-fs-subsystem-smoke COMMAND kobox-fs-subsystem-smoke)
 
+add_executable(kobox-fs-block-disk-smoke
+    tests/fs_block_disk_smoke.c
+)
+
+target_link_libraries(kobox-fs-block-disk-smoke PRIVATE kobox_runtime)
+target_include_directories(kobox-fs-block-disk-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(kobox-fs-block-disk-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
+add_test(NAME kobox-fs-block-disk-smoke COMMAND kobox-fs-block-disk-smoke)
+
 add_test(
     NAME kobox-ext4-real-ops
     COMMAND ${CMAKE_COMMAND} -E env
@@ -289,6 +309,17 @@ add_test(
         sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ext4_real_ops_probe.sh
 )
 set_tests_properties(kobox-ext4-real-ops PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    SKIP_RETURN_CODE 77
+)
+
+add_test(
+    NAME kobox-ext4-feature-matrix
+    COMMAND ${CMAKE_COMMAND} -E env
+        KOBOX_EXT4_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-ext4-real-ops>
+        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ext4_feature_matrix_probe.sh
+)
+set_tests_properties(kobox-ext4-feature-matrix PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     SKIP_RETURN_CODE 77
 )

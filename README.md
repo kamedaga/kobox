@@ -1,27 +1,30 @@
 # kobox
 
-> Run Linux `.ko` kernel modules in userspace — portable, libc-based, no kernel patches required.
+> Linux `.ko` kernel modules, running in userspace. No kernel patches. No custom kernel. Just libc.
 
 ![Language: C11](https://img.shields.io/badge/language-C11-blue?style=flat-square&logo=c)
 ![Build: CMake](https://img.shields.io/badge/build-CMake-064F8C?style=flat-square&logo=cmake)
 ![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)
 ![Status](https://img.shields.io/badge/status-active-brightgreen?style=flat-square)
 
-kobox loads precompiled Linux kernel modules (`.ko`) into a userspace process.
-Linux kernel symbols are resolved by a compatibility layer, while OS-specific capabilities are delegated to platform facets and host interfaces.
-
-The current implementation is strongest for device drivers, especially PCI-backed storage and USB stacks.  The architecture is being generalized so the same runtime can also host major Linux module families such as filesystems, security modules, sound, networking, and KVM-style virtualization modules.
+kobox loads a precompiled `.ko` binary into a normal userspace process and hooks up its Linux kernel symbol calls. The compatibility layer is pure libc — `malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics — not a kernel reimplementation. OS-specific stuff (devices, memory, events) is pushed behind platform facets so the Linux compat layer stays portable.
 
 ---
 
-## Design Goals
+## Why
 
-- Run existing `.ko` binaries without recompilation.
-- Keep the Linux compatibility layer portable and libc-based.
-- Keep OS-specific access behind platform facets and host interfaces.
-- Treat device access as one platform facet, not the whole runtime boundary.
-- Make Linux, PachaOS, and OpenBSD support a matter of platform/interface work, not Linux compatibility rewrites.
-- Measure overhead against native Linux drivers before claiming portability wins.
+Most approaches to running kernel modules outside the kernel require either a patched kernel, a VM, or a custom OS build. kobox does none of that.
+
+The bet: a faithful-enough Linux personality built on libc can run real `.ko` binaries without touching the kernel.
+
+Design constraints:
+
+- Run existing `.ko` binaries as-is, no recompile.
+- Linux compat layer stays libc-only and portable.
+- OS-specific surfaces (device access, IPC, sockets) live in platform facets and host interfaces — not baked into the compat layer.
+- Device access is one facet. Not the whole runtime.
+- Adding Linux / PachaOS / OpenBSD support means writing platform/interface code, not touching Linux compat.
+- Benchmark overhead against native Linux drivers before claiming portability wins.
 
 ## Architecture
 
@@ -45,38 +48,87 @@ kobox runtime core
                socket, IPC, FUSE, sound, VM, ...
 ```
 
-The Linux personality intentionally uses libc and standard userspace primitives — `malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics — rather than reimplementing a kernel internally.
+The Linux personality is intentionally not a kernel — it's libc + pthread + C atomics + standard POSIX primitives. No internal kernel emulation, no special memory models. Just enough to make the module's symbol calls land somewhere sensible.
 
-The existing device backend API is the current device platform facet. It handles:
+The current device backend is the device platform facet. It covers:
 
 - Device enumeration
-- PCI config access
+- PCI config space access
 - BAR / MMIO mapping
-- DMA allocation and mapping
+- DMA allocation + mapping
 - IRQ delivery
-- Time, logging, and event integration
+- Time, logging, event loop integration
 
-Host interfaces are separate from device backends. They are the OS-specific surfaces that expose a loaded module to the outside world, such as Linux sockets, IPC, FUSE, ALSA/PipeWire bridges, or a PachaOS service endpoint.
+Host interfaces are separate from device backends — they're how a loaded module exposes itself to the outside world. Linux sockets, IPC, FUSE, ALSA/PipeWire bridges, PachaOS service endpoints, etc.
 
 ---
 
-## Current Status
+## Platform Facets & Host Interfaces
 
-NVMe and USB are working end-to-end on both the Linux VFIO backend and the PachaOS Capsule backend.
+### Platform Facets
 
-| Driver | Linux VFIO | PachaOS Capsule |
+A platform bundles a device backend with OS-level abstractions. Four facets are defined:
+
+| Facet | What it provides | Default |
+|---|---|---|
+| memory | alloc/free for runtime-owned resources | `malloc`/`free` (or device backend if available) |
+| time | `monotonic_ns`, `sleep_ns` | `clock_gettime(CLOCK_MONOTONIC)` + `nanosleep` |
+| log | host logging | delegates to device backend |
+| event | `poll_once(timeout_ns)` | sleeps for timeout (event loop placeholder) |
+
+Platform composition for Linux, PachaOS, and OpenBSD lives under `src/platform/` — each selects a device backend and wires up the right interfaces for that OS.
+
+### Host Interfaces
+
+Host interfaces are how a loaded module exposes itself outward. They're independent from device backends and wired into the platform at creation time via `kb_platform_desc_t`.
+
+Each interface has a `subsystem` field that identifies which module family it serves — `"fs"`, `"sound"`, `"security"`, etc. The interface vtable covers:
+
+| Op | What it does |
+|---|---|
+| `bind(platform)` | connect to platform at load time |
+| `unbind()` | disconnect |
+| `poll(timeout_ns)` | check for incoming events |
+| `dispatch(msg, size)` | send a message through the interface |
+
+Currently one kind is implemented: **IPC** (`KB_INTERFACE_IPC`) via `kb_linux_ipc_interface_create()`. A PachaOS IPC interface is next.
+
+**Key constraint:** a filesystem module needs a host interface but no device backend. A PCI driver needs a device backend but no host interface. Only modules that do both (USB, NVMe) need both.
+
+---
+
+## Status
+
+NVMe, USB, and ext4 are working end-to-end on the Linux VFIO backend.
+
+| Driver / Module | Linux VFIO | PachaOS Capsule |
 |---|---|---|
 | NVMe | Working | Working |
 | USB Storage (xHCI / BOT / SCSI) | Working | Working |
+| ext4 (over virtio-blk) | Working | — |
 | Network (e1000e / r8169) | In progress | — |
 | SATA (AHCI) | Planned | — |
 | NVIDIA GPU | `init_module` passes | — |
+
+### ext4 over virtio-blk
+
+`ext4.ko` running in userspace, wired through the kobox block subsystem to a QEMU virtio-blk device, with file operations confirmed working end-to-end. The entire stack runs in userspace.
+
+```text
+ext4.ko
+  -> kobox FS/VFS shim
+  -> kobox block subsystem
+  -> kobox VFIO virtio-blk provider
+  -> Linux VFIO
+  -> QEMU virtio-blk PCI device
+  -> ext4 image backing file
+```
 
 ---
 
 ## Build
 
-kobox is written in C11 and requires CMake with clang.
+C11, CMake, clang.
 
 ```sh
 cmake -S . -B .artifacts/build -DCMAKE_C_COMPILER=clang
@@ -88,14 +140,14 @@ ctest --test-dir .artifacts/build
 
 ## PachaOS Capsule Backend
 
-`pachaos_capsule` creates a kobox backend from a PachaOS `DeviceCapsule` token and uses PachaOS native syscalls for Capsule operations.
+`pachaos_capsule` wraps a PachaOS `DeviceCapsule` token into a kobox backend and routes Capsule ops through PachaOS native syscalls.
 
 ```sh
 KOBOX_PACHAOS_DEVICE_CAPSULE=0xca12000000000001 kobox-ls-devices pachaos
 kobox-run --device=pachaos --capsule=0xca12000000000001 run driver.ko
 ```
 
-PCI identity and BAR sizes can be supplied via environment variables until the PachaOS Capsule ABI grows config/BAR info calls:
+The PachaOS Capsule ABI doesn't expose config/BAR info yet, so pass them via env vars in the meantime:
 
 ```sh
 KOBOX_PACHAOS_PCI_ID=8086:10d3:02:00:00
@@ -106,13 +158,14 @@ KOBOX_PACHAOS_BAR0_SIZE=0x1000
 
 ## Roadmap
 
-1. NVMe — complete
-2. USB (xHCI) — complete: HID + Mass Storage (BOT / SCSI / block I/O), multi-device
-3. Network (e1000e / r8169) — reusing PCI + DMA shim
-4. SATA (AHCI) — storage shim shared with NVMe
-5. NVIDIA GPU — `init_module` confirmed passing
-6. Runtime generalization — platform facets, host interfaces, and subsystem-owned symbol registration
-7. Non-driver module families — filesystems first, then security, sound, and KVM
+1. NVMe — done
+2. USB (xHCI) — done: HID + Mass Storage (BOT / SCSI / block I/O), multi-device
+3. ext4 (over virtio-blk) — done: full file I/O in userspace
+4. Network (e1000e / r8169) — PCI + DMA shim reuse
+5. SATA (AHCI) — storage shim shared with NVMe
+6. NVIDIA GPU — `init_module` confirmed passing; rest TBD
+7. Runtime generalization — platform facets, host interfaces, subsystem-owned symbol registration
+8. Non-driver modules — filesystems done, next: security, sound, KVM
 
 ---
 

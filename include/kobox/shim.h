@@ -320,6 +320,13 @@ void kb_memcpy_and_pad(void *dest, size_t dest_len, const void *src, size_t coun
 int64_t kb_vfs_setpos(void *file, int64_t offset, int64_t maxsize);
 int kb_list_add_valid_or_report(void *new_entry, void *prev, void *next);
 int kb_list_del_entry_valid_or_report(void *entry);
+void kb_rb_insert_color(void *node, void *root);
+void kb_rb_erase(void *node, void *root);
+void *kb_rb_first(void *root);
+void *kb_rb_next(void *node);
+void *kb_rb_prev(void *node);
+void *kb_kthread_create_on_node(int (*threadfn)(void *data), void *data, int node, const char *namefmt, ...);
+int kb_wake_up_process(void *task);
 int kb_ida_alloc_range(void *ida, unsigned int min, unsigned int max, unsigned int flags);
 void kb_ida_free(void *ida, unsigned int id);
 void kb_ida_destroy(void *ida);

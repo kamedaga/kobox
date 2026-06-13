@@ -1,5 +1,6 @@
 #include "kobox/shim.h"
 
+#include <stdarg.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,7 +14,18 @@ typedef struct kb_ida_record {
     struct kb_ida_record *next;
 } kb_ida_record_t;
 
+typedef struct kb_kthread_record {
+    void *task;
+    int (*threadfn)(void *data);
+    void *data;
+    int node;
+    int activated;
+    char name[64];
+    struct kb_kthread_record *next;
+} kb_kthread_record_t;
+
 static kb_ida_record_t *ida_records;
+static kb_kthread_record_t *kthread_records;
 
 static int crypto_trace_enabled(void);
 
@@ -219,6 +231,218 @@ int kb_list_del_entry_valid_or_report(void *entry)
 
 out:
     return result;
+}
+
+void *kb_kthread_create_on_node(int (*threadfn)(void *data), void *data, int node, const char *namefmt, ...)
+{
+    kb_kthread_record_t *record = calloc(1, sizeof(*record));
+    void *task = calloc(1, 64);
+    if (record == NULL || task == NULL) {
+        free(record);
+        free(task);
+        return NULL;
+    }
+    record->task = task;
+    record->threadfn = threadfn;
+    record->data = data;
+    record->node = node;
+    if (namefmt != NULL) {
+        va_list ap;
+        va_start(ap, namefmt);
+        vsnprintf(record->name, sizeof(record->name), namefmt, ap);
+        va_end(ap);
+    }
+    record->next = kthread_records;
+    kthread_records = record;
+    return task;
+}
+
+int kb_wake_up_process(void *task)
+{
+    for (kb_kthread_record_t *record = kthread_records; record != NULL; record = record->next) {
+        if (record->task != task) {
+            continue;
+        }
+        record->activated = 1;
+        /*
+         * jbd2's thread function records current in journal->j_task before
+         * entering its scheduler loop. The runtime does not yet host a real
+         * kernel thread, so expose the same started state without running the
+         * endless journal daemon body.
+         */
+        if (record->data != NULL && strncmp(record->name, "jbd2/", 5) == 0) {
+            void *current = task;
+            memcpy((unsigned char *)record->data + 0x440, &current, sizeof(current));
+        }
+        return 1;
+    }
+    return task != NULL ? 1 : 0;
+}
+
+#define KB_RB_PARENT_MASK (~(uintptr_t)3u)
+
+enum {
+    KB_RB_PARENT_COLOR_OFFSET = 0x0,
+    KB_RB_RIGHT_OFFSET = 0x8,
+    KB_RB_LEFT_OFFSET = 0x10,
+};
+
+static void *rb_parent(const void *node)
+{
+    if (low_or_error_ptr(node)) {
+        return NULL;
+    }
+    uintptr_t parent_color = 0;
+    memcpy(&parent_color, node, sizeof(parent_color));
+    return (void *)(parent_color & KB_RB_PARENT_MASK);
+}
+
+static void rb_set_parent_keep_color(void *node, void *parent)
+{
+    if (low_or_error_ptr(node)) {
+        return;
+    }
+    uintptr_t parent_color = 0;
+    memcpy(&parent_color, node, sizeof(parent_color));
+    parent_color = ((uintptr_t)parent & KB_RB_PARENT_MASK) | (parent_color & 3u);
+    memcpy(node, &parent_color, sizeof(parent_color));
+}
+
+static void *rb_child(const void *node, size_t offset)
+{
+    if (low_or_error_ptr(node)) {
+        return NULL;
+    }
+    void *child = NULL;
+    memcpy(&child, (const unsigned char *)node + offset, sizeof(child));
+    return low_or_error_ptr(child) ? NULL : child;
+}
+
+static void rb_set_child(void *node, size_t offset, void *child)
+{
+    if (!low_or_error_ptr(node)) {
+        memcpy((unsigned char *)node + offset, &child, sizeof(child));
+    }
+}
+
+void kb_rb_insert_color(void *node, void *root)
+{
+    (void)node;
+    (void)root;
+}
+
+void *kb_rb_first(void *root)
+{
+    if (low_or_error_ptr(root)) {
+        return NULL;
+    }
+    void *node = NULL;
+    memcpy(&node, root, sizeof(node));
+    if (low_or_error_ptr(node)) {
+        return NULL;
+    }
+    for (;;) {
+        void *left = rb_child(node, KB_RB_LEFT_OFFSET);
+        if (left == NULL) {
+            return node;
+        }
+        node = left;
+    }
+}
+
+void *kb_rb_next(void *node)
+{
+    if (low_or_error_ptr(node)) {
+        return NULL;
+    }
+    void *right = rb_child(node, KB_RB_RIGHT_OFFSET);
+    if (right != NULL) {
+        node = right;
+        for (;;) {
+            void *left = rb_child(node, KB_RB_LEFT_OFFSET);
+            if (left == NULL) {
+                return node;
+            }
+            node = left;
+        }
+    }
+    void *parent = rb_parent(node);
+    while (parent != NULL && node == rb_child(parent, KB_RB_RIGHT_OFFSET)) {
+        node = parent;
+        parent = rb_parent(parent);
+    }
+    return parent;
+}
+
+void *kb_rb_prev(void *node)
+{
+    if (low_or_error_ptr(node)) {
+        return NULL;
+    }
+    void *left = rb_child(node, KB_RB_LEFT_OFFSET);
+    if (left != NULL) {
+        node = left;
+        for (;;) {
+            void *right = rb_child(node, KB_RB_RIGHT_OFFSET);
+            if (right == NULL) {
+                return node;
+            }
+            node = right;
+        }
+    }
+    void *parent = rb_parent(node);
+    while (parent != NULL && node == rb_child(parent, KB_RB_LEFT_OFFSET)) {
+        node = parent;
+        parent = rb_parent(parent);
+    }
+    return parent;
+}
+
+void kb_rb_erase(void *node, void *root)
+{
+    if (low_or_error_ptr(node) || low_or_error_ptr(root)) {
+        return;
+    }
+
+    void *left = rb_child(node, KB_RB_LEFT_OFFSET);
+    void *right = rb_child(node, KB_RB_RIGHT_OFFSET);
+    void *replacement = NULL;
+    if (left == NULL) {
+        replacement = right;
+    } else if (right == NULL) {
+        replacement = left;
+    } else {
+        replacement = right;
+        while (rb_child(replacement, KB_RB_LEFT_OFFSET) != NULL) {
+            replacement = rb_child(replacement, KB_RB_LEFT_OFFSET);
+        }
+        kb_rb_erase(replacement, root);
+        left = rb_child(node, KB_RB_LEFT_OFFSET);
+        right = rb_child(node, KB_RB_RIGHT_OFFSET);
+        rb_set_child(replacement, KB_RB_LEFT_OFFSET, left);
+        rb_set_child(replacement, KB_RB_RIGHT_OFFSET, right);
+        if (left != NULL) {
+            rb_set_parent_keep_color(left, replacement);
+        }
+        if (right != NULL) {
+            rb_set_parent_keep_color(right, replacement);
+        }
+    }
+
+    void *parent = rb_parent(node);
+    if (parent == NULL) {
+        memcpy(root, &replacement, sizeof(replacement));
+    } else if (node == rb_child(parent, KB_RB_LEFT_OFFSET)) {
+        rb_set_child(parent, KB_RB_LEFT_OFFSET, replacement);
+    } else {
+        rb_set_child(parent, KB_RB_RIGHT_OFFSET, replacement);
+    }
+    if (replacement != NULL) {
+        rb_set_parent_keep_color(replacement, parent);
+    }
+    rb_set_child(node, KB_RB_LEFT_OFFSET, NULL);
+    rb_set_child(node, KB_RB_RIGHT_OFFSET, NULL);
+    rb_set_parent_keep_color(node, NULL);
 }
 
 static kb_ida_record_t *ida_record_for(void *ida, int create)

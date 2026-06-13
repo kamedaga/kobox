@@ -1694,7 +1694,7 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
         return module->shim_percpu_counter_batch;
     }
     if (strcmp(name, "const_pcpu_hot") == 0) {
-        return module->shim_const_pcpu_hot;
+        return (void *)(uintptr_t)KB_LOCAL_GS_PCPU_HOT_OFFSET;
     }
     if (strcmp(name, "this_cpu_off") == 0) {
         return module->shim_this_cpu_off;
@@ -2907,7 +2907,20 @@ kb_status_t kb_module_call_cleanup(kb_module_t *module)
     return KB_OK;
 }
 
-
+kb_status_t kb_module_find_symbol(kb_module_t *module, const char *name, void **out_address)
+{
+    if (module == NULL || name == NULL || out_address == NULL) {
+        return KB_ERR_INVALID;
+    }
+    *out_address = NULL;
+    uint64_t address = 0;
+    kb_status_t status = find_symbol_address(module, name, &address);
+    if (status != KB_OK) {
+        return status;
+    }
+    *out_address = (void *)(uintptr_t)address;
+    return KB_OK;
+}
 
 void kb_module_close(kb_module_t *module)
 {

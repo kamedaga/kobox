@@ -25,4 +25,52 @@ for dep in "$crc16_ko" "$mbcache_ko" "$jbd2_ko"; do
     fi
 done
 
-KOBOX_TRACE_FS="${KOBOX_TRACE_FS:-0}" "$runner" $args "$ext4_ko"
+run_fixture() {
+    name="$1"
+    features="$2"
+    work_dir=".artifacts/ext4-real-ops-$name"
+    image="$work_dir/probe.img"
+    echo "kobox-ext4-real-ops: fixture=$name features=$features"
+    KOBOX_TRACE_FS="${KOBOX_TRACE_FS:-0}" "$runner" $args \
+        --work-dir="$work_dir" \
+        --image="$image" \
+        --mkfs-features="$features" \
+        "$ext4_ko"
+}
+
+fixtures="${KOBOX_EXT4_FIXTURES:-minimal extents dir_index extra_isize 64bit metadata_csum journal}"
+for fixture in $fixtures; do
+    case "$fixture" in
+        minimal)
+            run_fixture "$fixture" "^has_journal,^extent,^64bit,^metadata_csum,^extra_isize,^dir_index"
+            ;;
+        dir_index)
+            run_fixture "$fixture" "^has_journal,^extent,^64bit,^metadata_csum,^extra_isize,dir_index"
+            ;;
+        extents)
+            run_fixture "$fixture" "^has_journal,extent,^64bit,^metadata_csum,^extra_isize,^dir_index"
+            ;;
+        extra_isize)
+            run_fixture "$fixture" "^has_journal,^extent,^64bit,^metadata_csum,extra_isize,^dir_index"
+            ;;
+        metadata_csum)
+            run_fixture "$fixture" "^has_journal,^extent,^64bit,metadata_csum,^extra_isize,^dir_index"
+            ;;
+        metadata_csum_extra_isize)
+            run_fixture "$fixture" "^has_journal,^extent,^64bit,metadata_csum,extra_isize,^dir_index"
+            ;;
+        64bit)
+            run_fixture "$fixture" "^has_journal,extent,64bit,^metadata_csum,^extra_isize,^dir_index"
+            ;;
+        journal)
+            run_fixture "$fixture" "has_journal,^extent,^64bit,^metadata_csum,^extra_isize,^dir_index"
+            ;;
+        dir_index_extra_isize)
+            run_fixture "$fixture" "^has_journal,^extent,^64bit,^metadata_csum,extra_isize,dir_index"
+            ;;
+        *)
+            echo "unknown KOBOX_EXT4_FIXTURES entry: $fixture" >&2
+            exit 2
+            ;;
+    esac
+done

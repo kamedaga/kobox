@@ -65,6 +65,12 @@ typedef struct kb_fs_mount_path_probe {
     void *get_tree;
     void *get_tree_bdev_fc;
     void *get_tree_bdev_fill_super;
+    void *super_block;
+    void *block_device;
+    void *root_inode;
+    void *root_dentry;
+    void *lookup_inode;
+    void *lookup_dentry;
     int fill_super_result;
     uint64_t bdev_getblk_calls;
     uint64_t last_block_number;
@@ -93,6 +99,26 @@ typedef struct kb_fs_block_device_desc {
     kb_fs_block_write_fn write;
     kb_fs_block_destroy_fn destroy;
 } kb_fs_block_device_desc_t;
+
+typedef enum kb_fs_bio_operation {
+    KB_FS_BIO_OP_READ = 0,
+    KB_FS_BIO_OP_WRITE = 1,
+    KB_FS_BIO_OP_FLUSH = 2,
+    KB_FS_BIO_OP_DISCARD = 3,
+} kb_fs_bio_operation_t;
+
+typedef struct kb_fs_bio_snapshot {
+    void *bio;
+    void *block_device;
+    uint32_t operation;
+    uint64_t sector;
+    size_t length;
+    size_t offset;
+    int result;
+    uint32_t submitted;
+    uint32_t queued;
+    uint32_t completed;
+} kb_fs_bio_snapshot_t;
 
 typedef struct kb_fs_read_desc {
     uint64_t handle;
@@ -130,12 +156,39 @@ int kb_fs_subsystem_register_filesystem(void *fs_type);
 int kb_fs_subsystem_unregister_filesystem(void *fs_type);
 int kb_fs_block_device_create(const kb_fs_block_device_desc_t *desc, kb_fs_block_device_t **out_device);
 int kb_fs_block_device_create_image(const char *name, const char *image_path, kb_fs_block_device_t **out_device);
+int kb_fs_block_device_create_from_disk(const char *name, void *disk, kb_fs_block_device_t **out_device);
+int kb_fs_block_device_read(kb_fs_block_device_t *device, uint64_t offset, void *buffer, size_t size);
+int kb_fs_block_device_write(kb_fs_block_device_t *device, uint64_t offset, const void *buffer, size_t size);
 void kb_fs_block_device_destroy(kb_fs_block_device_t *device);
 int kb_fs_subsystem_set_mount_probe_block_device(kb_fs_block_device_t *device);
 int kb_fs_subsystem_get_tree_bdev(void *fs_context, int (*fill_super)(void *super_block, void *fs_context));
 void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned int block_size, unsigned int gfp);
+void *kb_fs_subsystem_bio_alloc_bioset(void *bdev, unsigned short nr_vecs, unsigned int opf, unsigned int gfp, void *bioset);
+int kb_fs_subsystem_bio_add_folio(void *bio, void *folio, size_t len, size_t offset);
+int kb_fs_subsystem_bio_add_page(void *bio, void *page, unsigned int len, unsigned int offset);
+void kb_fs_subsystem_submit_bio(void *bio);
+void kb_fs_subsystem_submit_bio_noacct(void *bio);
+void kb_fs_subsystem_bio_endio(void *bio);
+void kb_fs_subsystem_bio_put(void *bio);
+void kb_fs_subsystem_bio_set_auto_drain(int enabled);
+size_t kb_fs_subsystem_bio_drain(void);
+size_t kb_fs_subsystem_bio_queue_depth(void);
+void kb_fs_subsystem_bio_set_sector(void *bio, uint64_t sector);
+void kb_fs_subsystem_bio_set_end_io(void *bio, void (*end_io)(void *));
+int kb_fs_subsystem_bio_result(void *bio);
+int kb_fs_subsystem_bio_snapshot(void *bio, kb_fs_bio_snapshot_t *out_snapshot);
 void *kb_fs_subsystem_iget_locked(void *super_block, unsigned long inode_number);
 void *kb_fs_subsystem_new_inode(void *super_block);
+void *kb_fs_subsystem_d_make_root(void *inode);
+void *kb_fs_subsystem_d_splice_alias(void *inode, void *dentry);
+void kb_fs_subsystem_iget_failed(void *inode);
+void kb_fs_subsystem_unlock_new_inode(void *inode);
+void kb_fs_subsystem_set_nlink(void *inode, unsigned int nlink);
+int kb_fs_subsystem_fscrypt_match_name(const void *fname, const void *de_name, unsigned int de_name_len);
+long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter);
+long kb_fs_subsystem_generic_write_checks(void *kiocb, void *iter);
+long kb_fs_subsystem_generic_perform_write(void *kiocb, void *iter);
+int kb_fs_subsystem_bmap(void *inode, uint64_t *block);
 int kb_fs_subsystem_sb_min_blocksize(void *super_block, int size);
 int kb_fs_subsystem_sb_set_blocksize(void *super_block, int size);
 int kb_fs_subsystem_probe_registered_mount_path(const char *name, kb_fs_mount_path_probe_t *out_probe);
