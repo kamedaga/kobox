@@ -2,15 +2,15 @@
 #define _GNU_SOURCE
 #endif
 
-#include "kobox/backend.h"
-#include "kobox/backend_linux_mock.h"
-#include "kobox/backend_linux_vfio.h"
-#include "kobox/backend_pachaos_capsule.h"
+#include "kobox/device.h"
+#include "kobox/device_linux_mock.h"
+#include "kobox/device_linux_vfio.h"
+#include "kobox/device_pachaos_capsule.h"
 #include "kobox/module.h"
 #include "kobox/shim.h"
-#include "subsystem/input/input.h"
-#include "subsystem/usb/storage.h"
-#include "subsystem/usb/usb.h"
+#include "linux_subsystem/input/input.h"
+#include "linux_subsystem/usb/storage.h"
+#include "linux_subsystem/usb/usb.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -143,14 +143,14 @@ static kb_status_t read_file(const char *path, void **out_data, size_t *out_size
     return KB_OK;
 }
 
-static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
+static void drain_after_init(kb_device_backend_t *backend, unsigned long drain_ms)
 {
     if (drain_ms == 0) {
         return;
     }
 
-    kb_shim_set_backend(backend);
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    kb_shim_set_device_backend(backend);
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     uint64_t start_ns = 0;
     if (ops != NULL && ops->monotonic_ns != NULL) {
         start_ns = ops->monotonic_ns(backend);
@@ -174,7 +174,7 @@ static void drain_after_init(kb_backend_t *backend, unsigned long drain_ms)
         (void)kb_usb_poll_root_hubs();
     }
     (void)kb_handle_any_irq(0);
-    kb_shim_set_backend(NULL);
+    kb_shim_set_device_backend(NULL);
 }
 
 static int mouse_live_enabled(void)
@@ -196,7 +196,7 @@ static int mouse_live_xhci_only_enabled(void)
         return strcmp(value, "0") != 0;
     }
     const char *real = getenv("KOBOX_USB_REAL_DEVICE");
-    const char *backend = getenv("KOBOX_BACKEND");
+    const char *backend = getenv("KOBOX_DEVICE_BACKEND");
     return real != NULL && real[0] != '\0' && strcmp(real, "0") != 0 &&
         backend != NULL && (strcmp(backend, "pachaos") == 0 || strcmp(backend, "pachaos_capsule") == 0);
 }
@@ -360,8 +360,8 @@ static void mouse_live_open_inputs(int *input_active)
 }
 
 static int mouse_live_deadline_reached(
-    const kb_backend_ops_t *ops,
-    kb_backend_t *backend,
+    const kb_device_backend_ops_t *ops,
+    kb_device_backend_t *backend,
     uint64_t live_start_ns,
     unsigned long live_ms,
     unsigned long loops,
@@ -380,15 +380,15 @@ static int mouse_live_deadline_reached(
     return loops >= max_loops;
 }
 
-static void run_mouse_live(kb_backend_t *backend, unsigned long live_ms)
+static void run_mouse_live(kb_device_backend_t *backend, unsigned long live_ms)
 {
     if (live_ms == 0) {
         return;
     }
 
-    kb_shim_set_backend(backend);
+    kb_shim_set_device_backend(backend);
     kb_usb_reset_root_hub_poll_live_state();
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     int x = 0;
     int y = 0;
     int left = 0;
@@ -484,29 +484,29 @@ static void run_mouse_live(kb_backend_t *backend, unsigned long live_ms)
         y,
         left,
         printed != 0 ? "ok" : "no-events");
-    kb_shim_set_backend(NULL);
+    kb_shim_set_device_backend(NULL);
 }
 
-static void cleanup_all_irqs_for_backend(kb_backend_t *backend)
+static void cleanup_all_irqs_for_backend(kb_device_backend_t *backend)
 {
     if (backend == NULL) {
         return;
     }
-    kb_shim_set_backend(backend);
+    kb_shim_set_device_backend(backend);
     kb_usb_cleanup_tracked_urb_dma();
     kb_free_all_irqs();
     kb_pci_release_all_mmio_mappings();
-    kb_shim_set_backend(NULL);
+    kb_shim_set_device_backend(NULL);
 }
 
-static int destroy_backend_after_cleanup(kb_backend_t *backend)
+static int destroy_backend_after_cleanup(kb_device_backend_t *backend)
 {
     cleanup_all_irqs_for_backend(backend);
     size_t residuals = 0;
     if (backend != NULL) {
         residuals = kb_pachaos_capsule_report_residuals(backend, stderr, "pre-destroy");
     }
-    kb_backend_destroy(backend);
+    kb_device_backend_destroy(backend);
     return residuals == 0 ? 0 : 11;
 }
 
@@ -545,7 +545,7 @@ int main(int argc, char **argv)
     kb_usb_set_event_injection_runtime_allowed(0);
 
     const char *path = NULL;
-    const char *backend_name = "mock";
+    const char *device_backend_name = "mock";
     const char *pci_bdf = NULL;
     const char *capsule_text = NULL;
     const char *dep_paths[KB_RUN_DEPS_MAX];
@@ -553,8 +553,8 @@ int main(int argc, char **argv)
     unsigned long drain_ms = 0;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-') {
-        if (strncmp(argv[argi], "--backend=", 10) == 0) {
-            backend_name = argv[argi] + 10;
+        if (strncmp(argv[argi], "--device=", 10) == 0) {
+            device_backend_name = argv[argi] + 10;
             argi++;
             continue;
         }
@@ -582,7 +582,7 @@ int main(int argc, char **argv)
             argi++;
             continue;
         }
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio|pachaos --pci=<BDF> --capsule=<DeviceCapsule> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
+        fprintf(stderr, "usage: kobox-run [--device=mock|vfio|pachaos --pci=<BDF> --capsule=<DeviceCapsule> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
         return 1;
     }
 
@@ -591,7 +591,7 @@ int main(int argc, char **argv)
     } else if (argi + 2 == argc && strcmp(argv[argi], "run") == 0) {
         path = argv[argi + 1];
     } else {
-        fprintf(stderr, "usage: kobox-run [--backend=mock|vfio|pachaos --pci=<BDF> --capsule=<DeviceCapsule> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
+        fprintf(stderr, "usage: kobox-run [--device=mock|vfio|pachaos --pci=<BDF> --capsule=<DeviceCapsule> --dep=<module.ko> --drain-ms=<ms>] run <module.ko>\n");
         return 1;
     }
 
@@ -603,36 +603,36 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    kb_backend_t *backend = NULL;
-    if (strcmp(backend_name, "mock") == 0) {
-        status = kb_linux_mock_create(&backend);
-    } else if (strcmp(backend_name, "vfio") == 0) {
+    kb_device_backend_t *backend = NULL;
+    if (strcmp(device_backend_name, "mock") == 0) {
+        status = kb_linux_mock_device_create(&backend);
+    } else if (strcmp(device_backend_name, "vfio") == 0) {
         if (pci_bdf == NULL) {
             free(data);
-            fprintf(stderr, "vfio backend requires --pci=<BDF>\n");
+            fprintf(stderr, "vfio device backend requires --pci=<BDF>\n");
             return 3;
         }
-        status = kb_linux_vfio_create(pci_bdf, &backend);
-    } else if (strcmp(backend_name, "pachaos") == 0 || strcmp(backend_name, "pachaos_capsule") == 0) {
-        (void)setenv("KOBOX_BACKEND", "pachaos", 1);
+        status = kb_linux_vfio_device_create(pci_bdf, &backend);
+    } else if (strcmp(device_backend_name, "pachaos") == 0 || strcmp(device_backend_name, "pachaos_capsule") == 0) {
+        (void)setenv("KOBOX_DEVICE_BACKEND", "pachaos", 1);
         configure_pachaos_driver_preference(path);
         if (capsule_text != NULL) {
             uint64_t capsule = 0;
             status = kb_pachaos_capsule_parse_token(capsule_text, &capsule);
             if (status == KB_OK) {
-                status = kb_pachaos_capsule_create(capsule, &backend);
+                status = kb_pachaos_capsule_device_create(capsule, &backend);
             }
         } else {
-            status = kb_pachaos_capsule_create_from_env(&backend);
+            status = kb_pachaos_capsule_device_create_from_env(&backend);
         }
     } else {
         free(data);
-        fprintf(stderr, "unknown backend: %s\n", backend_name);
+        fprintf(stderr, "unknown device backend: %s\n", device_backend_name);
         return 3;
     }
     if (status != KB_OK) {
         free(data);
-        fprintf(stderr, "%s backend failed: %s (%d)\n", backend_name, status_name(status), status);
+        fprintf(stderr, "%s device backend failed: %s (%d)\n", device_backend_name, status_name(status), status);
         return 3;
     }
 
@@ -732,9 +732,9 @@ int main(int argc, char **argv)
     }
     kb_usb_set_event_injection_runtime_allowed(1);
     if (getenv("KOBOX_NVME_IO_SMOKE") != NULL) {
-        kb_shim_set_backend(backend);
+        kb_shim_set_device_backend(backend);
         int io_result = kb_nvme_io_smoke();
-        kb_shim_set_backend(NULL);
+        kb_shim_set_device_backend(NULL);
         if (io_result != 0) {
             (void)kb_module_call_cleanup(module);
             kb_module_close(module);

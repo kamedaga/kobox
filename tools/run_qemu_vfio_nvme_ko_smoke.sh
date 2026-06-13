@@ -174,7 +174,7 @@ echo "kobox-qemu-vfio-nvme-ko: group=$group"
 
 set +e
 /usr/bin/kobox-run \
-    --backend=vfio \
+    --device=vfio \
     --pci="$nvme_bdf" \
     --dep=/usr/lib/kobox/nvme-auth.ko \
     --dep=/usr/lib/kobox/nvme-core.ko \

@@ -1,5 +1,5 @@
-#include "kobox/backend.h"
-#include "kobox/backend_linux_vfio.h"
+#include "kobox/device.h"
+#include "kobox/device_linux_vfio.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -157,7 +157,7 @@ static void trim_ascii(char *dst, size_t dst_size, const unsigned char *src, siz
     dst[end] = '\0';
 }
 
-static int enable_pci_memory_and_bus_master(const kb_backend_ops_t *ops, kb_device_t *device)
+static int enable_pci_memory_and_bus_master(const kb_device_backend_ops_t *ops, kb_device_t *device)
 {
     uint16_t command = 0;
     kb_status_t status = ops->pci_config_read(device, 0x04, &command, sizeof(command));
@@ -189,9 +189,9 @@ static void nvme_queue_init(nvme_queue_t *queue, uint16_t qid, uint16_t depth, u
 }
 
 static int nvme_submit_and_wait(
-    const kb_backend_ops_t *ops,
+    const kb_device_backend_ops_t *ops,
     kb_device_t *device,
-    kb_irq_t *irq,
+    kb_device_irq_t *irq,
     void *bar,
     nvme_queue_t *queue,
     nvme_command_t *command,
@@ -308,9 +308,9 @@ static int nvme_create_io_sq(
 }
 
 static int nvme_rw_blocks(
-    const kb_backend_ops_t *ops,
+    const kb_device_backend_ops_t *ops,
     kb_device_t *device,
-    kb_irq_t *irq,
+    kb_device_irq_t *irq,
     void *bar,
     nvme_queue_t *io_queue,
     uint8_t opcode,
@@ -415,7 +415,7 @@ static int create_io_queue_pair(
 static int run_nvme_smoke(const char *bdf)
 {
     int exit_code = 1;
-    kb_backend_t *backend = NULL;
+    kb_device_backend_t *backend = NULL;
     kb_mmio_region_t bar;
     kb_dma_buffer_t admin_sq;
     kb_dma_buffer_t admin_cq;
@@ -424,7 +424,7 @@ static int run_nvme_smoke(const char *bdf)
     kb_dma_buffer_t io_cq;
     kb_dma_buffer_t write_buffer;
     kb_dma_buffer_t read_buffer;
-    kb_irq_t *io_irq = NULL;
+    kb_device_irq_t *io_irq = NULL;
     irq_state_t irq_state;
     memset(&bar, 0, sizeof(bar));
     memset(&admin_sq, 0, sizeof(admin_sq));
@@ -436,13 +436,13 @@ static int run_nvme_smoke(const char *bdf)
     memset(&read_buffer, 0, sizeof(read_buffer));
     memset(&irq_state, 0, sizeof(irq_state));
 
-    kb_status_t status = kb_linux_vfio_create(bdf, &backend);
+    kb_status_t status = kb_linux_vfio_device_create(bdf, &backend);
     if (status != KB_OK) {
         fprintf(stderr, "vfio create failed: %d\n", status);
         return 1;
     }
 
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     kb_device_t *device = NULL;
     status = ops->device_at(backend, 0, &device);
     if (status != KB_OK) {
@@ -772,7 +772,7 @@ cleanup:
     if (bar.addr != NULL) {
         ops->unmap_bar(device, &bar);
     }
-    kb_backend_destroy(backend);
+    kb_device_backend_destroy(backend);
     return exit_code;
 }
 

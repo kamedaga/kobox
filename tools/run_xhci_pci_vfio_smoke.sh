@@ -54,7 +54,7 @@ KOBOX_TRACE_PCI="${KOBOX_TRACE_PCI:-1}" \
 KOBOX_TRACE_USB="${KOBOX_TRACE_USB:-1}" \
 KOBOX_TRACE_MODULES="${KOBOX_TRACE_MODULES:-1}" \
     "$build_dir/kobox-run" \
-        --backend=vfio \
+        --device=vfio \
         --pci="$KOBOX_VFIO_XHCI_BDF" \
         run "$work_dir/xhci-pci.ko" >"$log" 2>&1
 

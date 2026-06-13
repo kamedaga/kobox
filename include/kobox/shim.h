@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdarg.h>
-#include "kobox/backend.h"
+#include "kobox/device.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,7 +13,9 @@ extern "C" {
 void *kb_kmalloc(size_t size, unsigned int flags);
 void *kb_kzalloc(size_t size, unsigned int flags);
 void *kb_kmalloc_trace(void *cache, unsigned int flags, size_t size);
+void *kb_kmalloc_cache_noprof(void *cache, unsigned int flags, size_t size);
 void *kb_kmem_cache_create(const char *name, size_t size, size_t align, unsigned long flags, void *ctor);
+void *kb_kmem_cache_create_args(const char *name, unsigned int object_size, void *args, unsigned int flags);
 void kb_kmem_cache_destroy(void *cache);
 void *kb_kmem_cache_alloc(void *cache, unsigned int flags);
 void kb_kmem_cache_free(void *cache, void *ptr);
@@ -25,9 +27,11 @@ int kb_vprintk_safe(const char *fmt, va_list args);
 int kb_vsnprintf_safe(char *buf, size_t size, const char *fmt, va_list args);
 int kb_snprintf_safe(char *buf, size_t size, const char *fmt, ...);
 int kb_sprintf_safe(char *buf, const char *fmt, ...);
+char *kb_strreplace(char *s, char old_char, char new_char);
+size_t kb_memweight(const void *ptr, size_t bytes);
 int kb_tracef(const char *fmt, ...);
 
-void kb_shim_set_backend(kb_backend_t *backend);
+void kb_shim_set_device_backend(kb_device_backend_t *backend);
 unsigned long kb_shim_current_kernel_gs(void);
 int kb_shim_enter_kernel_gs(unsigned long kernel_gs, unsigned long *out_old_gs);
 void kb_shim_leave_kernel_gs(unsigned long old_gs);
@@ -116,6 +120,7 @@ int kb_deferred_work_is_draining(void);
 void kb_register_jiffies_storage(void *storage);
 unsigned long kb_msecs_to_jiffies(unsigned int msecs);
 unsigned long kb_usecs_to_jiffies(unsigned int usecs);
+unsigned long kb_round_jiffies_up(unsigned long jiffies);
 unsigned int kb_jiffies_to_msecs(unsigned long jiffies);
 unsigned int kb_jiffies_to_usecs(unsigned long jiffies);
 void kb_jiffies_to_timespec64(unsigned long jiffies, void *timespec64);
@@ -300,14 +305,30 @@ void kb_init_waitqueue_head(void *wq_head);
 void kb_init_swait_queue_head(void *wq_head);
 unsigned long kb_wait_for_completion(void *completion);
 unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long timeout);
+void kb_noop_stub(void);
+void kb_stackleak_track_stack_stub(void);
 int kb_return_zero(void);
 int kb_return_one(void);
+uint32_t kb_get_random_u32_below(uint32_t ceil);
+uint16_t kb_get_random_u16(void);
+void kb_generate_random_uuid(unsigned char *uuid);
+char *kb_d_path(void *path, char *buffer, int buffer_length);
+void *kb_kmemdup_nul(const void *src, size_t len, unsigned int flags);
+long kb_sized_strscpy(char *dst, const char *src, size_t size);
+char *kb_skip_spaces(const char *str);
+void kb_memcpy_and_pad(void *dest, size_t dest_len, const void *src, size_t count, int pad);
+int64_t kb_vfs_setpos(void *file, int64_t offset, int64_t maxsize);
 int kb_list_add_valid_or_report(void *new_entry, void *prev, void *next);
 int kb_list_del_entry_valid_or_report(void *entry);
 int kb_ida_alloc_range(void *ida, unsigned int min, unsigned int max, unsigned int flags);
 void kb_ida_free(void *ida, unsigned int id);
 void kb_ida_destroy(void *ida);
 void *kb_alloc_stub(void);
+int kb_percpu_counter_init_many_stub(void *counters, long amount, unsigned int batch, unsigned int count, void *key);
+void *kb_crypto_alloc_shash_stub(const char *alg_name, unsigned int type, unsigned int mask);
+int kb_crypto_shash_final_stub(void *desc, void *out);
+int kb_crypto_shash_tfm_digest_stub(void *tfm, const void *data, unsigned int len, void *out);
+int kb_crypto_shash_update_stub(void *desc, const void *data, unsigned int len);
 void *kb_identity_ptr(void *ptr);
 const char *kb_empty_string(void);
 int kb_dev_set_name(void *dev, const char *fmt, ...);

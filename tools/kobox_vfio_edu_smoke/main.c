@@ -1,5 +1,5 @@
-#include "kobox/backend.h"
-#include "kobox/backend_linux_vfio.h"
+#include "kobox/device.h"
+#include "kobox/device_linux_vfio.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -60,19 +60,19 @@ static int wait_dma_idle(void *bar)
 
 static int run_edu_smoke(const char *bdf)
 {
-    kb_backend_t *backend = NULL;
-    kb_status_t status = kb_linux_vfio_create(bdf, &backend);
+    kb_device_backend_t *backend = NULL;
+    kb_status_t status = kb_linux_vfio_device_create(bdf, &backend);
     if (status != KB_OK) {
         fprintf(stderr, "vfio create failed: %d\n", status);
         return 1;
     }
 
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     kb_device_t *device = NULL;
     status = ops->device_at(backend, 0, &device);
     if (status != KB_OK) {
         fprintf(stderr, "device_at failed: %d\n", status);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
 
@@ -80,14 +80,14 @@ static int run_edu_smoke(const char *bdf)
     status = ops->pci_config_read(device, 0x04, &command, sizeof(command));
     if (status != KB_OK) {
         fprintf(stderr, "pci command read failed: %d\n", status);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
     command |= 0x0006u;
     status = ops->pci_config_write(device, 0x04, &command, sizeof(command));
     if (status != KB_OK) {
         fprintf(stderr, "pci command write failed: %d\n", status);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
 
@@ -96,7 +96,7 @@ static int run_edu_smoke(const char *bdf)
     status = ops->map_bar(device, 0, &bar);
     if (status != KB_OK) {
         fprintf(stderr, "map_bar failed: %d\n", status);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
 
@@ -107,18 +107,18 @@ static int run_edu_smoke(const char *bdf)
     if (liveness != ~0x5a5aa5a5u) {
         fprintf(stderr, "liveness failed: 0x%08x\n", liveness);
         ops->unmap_bar(device, &bar);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
 
     irq_state_t irq_state;
     memset(&irq_state, 0, sizeof(irq_state));
-    kb_irq_t *irq = NULL;
+    kb_device_irq_t *irq = NULL;
     status = ops->irq_register(device, 0, irq_handler, &irq_state, &irq);
     if (status != KB_OK) {
         fprintf(stderr, "irq_register failed: %d\n", status);
         ops->unmap_bar(device, &bar);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
     mmio_write32(bar.addr, EDU_REG_IRQ_RAISE, 0x55u);
@@ -127,7 +127,7 @@ static int run_edu_smoke(const char *bdf)
         fprintf(stderr, "irq_wait failed: %d fired=%d\n", status, irq_state.fired);
         ops->irq_unregister(device, irq);
         ops->unmap_bar(device, &bar);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
     uint32_t irq_status = mmio_read32(bar.addr, EDU_REG_IRQ_STATUS);
@@ -141,7 +141,7 @@ static int run_edu_smoke(const char *bdf)
     if (status != KB_OK) {
         fprintf(stderr, "dma_alloc failed: %d\n", status);
         ops->unmap_bar(device, &bar);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
     unsigned char *bytes = dma.cpu_addr;
@@ -158,7 +158,7 @@ static int run_edu_smoke(const char *bdf)
         fprintf(stderr, "dma ram-to-device timeout\n");
         ops->dma_free(device, &dma);
         ops->unmap_bar(device, &bar);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
 
@@ -170,7 +170,7 @@ static int run_edu_smoke(const char *bdf)
         fprintf(stderr, "dma device-to-ram timeout\n");
         ops->dma_free(device, &dma);
         ops->unmap_bar(device, &bar);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
 
@@ -178,14 +178,14 @@ static int run_edu_smoke(const char *bdf)
         fprintf(stderr, "dma compare failed\n");
         ops->dma_free(device, &dma);
         ops->unmap_bar(device, &bar);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 1;
     }
     printf("edu dma bytes=%u\n", (unsigned)EDU_DMA_SIZE);
 
     ops->dma_free(device, &dma);
     ops->unmap_bar(device, &bar);
-    kb_backend_destroy(backend);
+    kb_device_backend_destroy(backend);
     return 0;
 }
 

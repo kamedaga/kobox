@@ -1,7 +1,7 @@
-#include "kobox/backend.h"
-#include "kobox/backend_linux_sysfs.h"
-#include "kobox/backend_linux_vfio.h"
-#include "kobox/backend_pachaos_capsule.h"
+#include "kobox/device.h"
+#include "kobox/device_linux_sysfs.h"
+#include "kobox/device_linux_vfio.h"
+#include "kobox/device_pachaos_capsule.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -32,21 +32,21 @@ static const char *status_name(kb_status_t status)
 
 int main(int argc, char **argv)
 {
-    const char *backend_name = "sysfs";
+    const char *device_backend_name = "sysfs";
     const char *pci_bdf = NULL;
     const char *capsule_text = NULL;
     int dump_pachaos_catalog = 0;
     if (argc == 3 && strcmp(argv[1], "vfio") == 0) {
-        backend_name = "vfio";
+        device_backend_name = "vfio";
         pci_bdf = argv[2];
     } else if (argc == 3 && strcmp(argv[1], "pachaos") == 0 && strcmp(argv[2], "--catalog") == 0) {
-        backend_name = "pachaos";
+        device_backend_name = "pachaos";
         dump_pachaos_catalog = 1;
     } else if (argc == 3 && strcmp(argv[1], "pachaos") == 0) {
-        backend_name = "pachaos";
+        device_backend_name = "pachaos";
         capsule_text = argv[2];
     } else if (argc == 2 && strcmp(argv[1], "pachaos") == 0) {
-        backend_name = "pachaos";
+        device_backend_name = "pachaos";
     } else if (argc != 1) {
         fprintf(stderr, "usage: kobox-ls-devices [vfio <BDF>|pachaos [DeviceCapsule|--catalog]]\n");
         return 1;
@@ -61,31 +61,31 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    kb_backend_t *backend = NULL;
+    kb_device_backend_t *backend = NULL;
     kb_status_t status = KB_OK;
-    if (strcmp(backend_name, "vfio") == 0) {
-        status = kb_linux_vfio_create(pci_bdf, &backend);
-    } else if (strcmp(backend_name, "pachaos") == 0) {
+    if (strcmp(device_backend_name, "vfio") == 0) {
+        status = kb_linux_vfio_device_create(pci_bdf, &backend);
+    } else if (strcmp(device_backend_name, "pachaos") == 0) {
         if (capsule_text != NULL) {
             uint64_t capsule = 0;
             status = kb_pachaos_capsule_parse_token(capsule_text, &capsule);
             if (status == KB_OK) {
-                status = kb_pachaos_capsule_create(capsule, &backend);
+                status = kb_pachaos_capsule_device_create(capsule, &backend);
             }
         } else {
-            status = kb_pachaos_capsule_create_from_env(&backend);
+            status = kb_pachaos_capsule_device_create_from_env(&backend);
         }
     } else {
-        status = kb_linux_sysfs_create(&backend);
+        status = kb_linux_sysfs_device_create(&backend);
     }
     if (status != KB_OK) {
-        fprintf(stderr, "%s backend failed: %s (%d)\n", backend_name, status_name(status), status);
+        fprintf(stderr, "%s device backend failed: %s (%d)\n", device_backend_name, status_name(status), status);
         return 1;
     }
 
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     if (ops == NULL) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 2;
     }
 
@@ -93,7 +93,7 @@ int main(int argc, char **argv)
     status = ops->device_count(backend, &count);
     if (status != KB_OK) {
         fprintf(stderr, "device_count failed: %s (%d)\n", status_name(status), status);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 3;
     }
 
@@ -106,19 +106,19 @@ int main(int argc, char **argv)
         status = ops->device_at(backend, i, &device);
         if (status != KB_OK) {
             fprintf(stderr, "device_at(%zu) failed: %s (%d)\n", i, status_name(status), status);
-            kb_backend_destroy(backend);
+            kb_device_backend_destroy(backend);
             return 4;
         }
         status = ops->device_pci_id(device, &id);
         if (status != KB_OK) {
             fprintf(stderr, "device_pci_id(%zu) failed: %s (%d)\n", i, status_name(status), status);
-            kb_backend_destroy(backend);
+            kb_device_backend_destroy(backend);
             return 5;
         }
         status = ops->device_pci_location(device, &location);
         if (status != KB_OK) {
             fprintf(stderr, "device_pci_location(%zu) failed: %s (%d)\n", i, status_name(status), status);
-            kb_backend_destroy(backend);
+            kb_device_backend_destroy(backend);
             return 6;
         }
 
@@ -155,7 +155,7 @@ int main(int argc, char **argv)
                 }
                 if (status != KB_OK) {
                     fprintf(stderr, "pci_bar_info(%zu, %u) failed: %s (%d)\n", i, bar, status_name(status), status);
-                    kb_backend_destroy(backend);
+                    kb_device_backend_destroy(backend);
                     return 7;
                 }
                 printf(
@@ -177,6 +177,6 @@ int main(int argc, char **argv)
         }
     }
 
-    kb_backend_destroy(backend);
+    kb_device_backend_destroy(backend);
     return 0;
 }

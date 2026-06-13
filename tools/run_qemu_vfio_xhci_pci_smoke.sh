@@ -169,7 +169,7 @@ echo "kobox-qemu-vfio-xhci-pci: group=$group"
 
 set +e
 KOBOX_TRACE_PCI=1 KOBOX_TRACE_USB=1 KOBOX_TRACE_MODULES=1 \
-    /usr/bin/kobox-run --backend=vfio --pci="$xhci_bdf" run /usr/lib/kobox/xhci-pci.ko
+    /usr/bin/kobox-run --device=vfio --pci="$xhci_bdf" run /usr/lib/kobox/xhci-pci.ko
 status=$?
 set -e
 

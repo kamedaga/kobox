@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stddef.h>
-#include "kobox/backend.h"
+#include "kobox/device.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,7 +19,7 @@ const char *kb_module_loader_version(void);
 
 kb_status_t kb_module_open_image(
     const kb_module_image_t *image,
-    kb_backend_t *backend,
+    kb_device_backend_t *backend,
     kb_module_t **out_module);
 
 kb_status_t kb_module_call_init(kb_module_t *module, int *out_result);

@@ -289,7 +289,7 @@ KOBOX_TRACE_USB_HUB="@RUN_TRACE_USB_HUB@" \
 KOBOX_TRACE_WORK="@RUN_TRACE_WORK@" \
 KOBOX_TRACE_DMA="@RUN_TRACE_DMA@" \
     timeout 45 /usr/bin/kobox-run \
-        --backend=vfio \
+        --device=vfio \
         --pci="$xhci_bdf" \
         --drain-ms="@RUN_DRAIN_MS@" \
         --dep=/usr/lib/kobox/usbcore.ko \

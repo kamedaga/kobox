@@ -7,38 +7,47 @@
 ![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)
 ![Status](https://img.shields.io/badge/status-active-brightgreen?style=flat-square)
 
-kobox loads precompiled Linux kernel modules (`.ko`) into a userspace process.  
-Linux kernel symbols are resolved by a compatibility shim, while device access is delegated to an OS-specific backend such as Linux VFIO or PachaOS Capsule.
+kobox loads precompiled Linux kernel modules (`.ko`) into a userspace process.
+Linux kernel symbols are resolved by a compatibility layer, while OS-specific capabilities are delegated to platform facets and host interfaces.
+
+The current implementation is strongest for device drivers, especially PCI-backed storage and USB stacks.  The architecture is being generalized so the same runtime can also host major Linux module families such as filesystems, security modules, sound, networking, and KVM-style virtualization modules.
 
 ---
 
 ## Design Goals
 
 - Run existing `.ko` binaries without recompilation.
-- Keep the Linux compatibility shim portable and libc-based.
-- Confine OS-specific device access behind a backend API.
-- Make Linux, PachaOS, and OpenBSD support a matter of backend work, not shim rewrites.
+- Keep the Linux compatibility layer portable and libc-based.
+- Keep OS-specific access behind platform facets and host interfaces.
+- Treat device access as one platform facet, not the whole runtime boundary.
+- Make Linux, PachaOS, and OpenBSD support a matter of platform/interface work, not Linux compatibility rewrites.
 - Measure overhead against native Linux drivers before claiming portability wins.
 
 ## Architecture
 
 ```text
-Linux Driver (.ko binary)
+Linux Module (.ko binary)
         |
         | Linux kernel symbols
         v
-libc-based Linux shim layer
-  kmalloc, mutex, workqueue, pci_*, dma_*, request_irq, ...
+Linux personality
+  kmalloc, mutex, workqueue, VFS, driver model, LSM, ALSA, KVM, ...
         |
-        | kobox backend API only
+        | kobox runtime API only
         v
-OS backend
-  linux_vfio / pachaos_capsule / linux_mock / ...
+kobox runtime core
+  lifecycle, object registry, event loop, timers, resources
+        |
+        +--> platform facets
+        |      device, memory, event, time, log
+        |
+        +--> host interfaces
+               socket, IPC, FUSE, sound, VM, ...
 ```
 
-The shim intentionally uses libc and standard userspace primitives — `malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics — rather than reimplementing a kernel internally.
+The Linux personality intentionally uses libc and standard userspace primitives — `malloc`, `pthread`, `mmap`, `clock_gettime`, C atomics — rather than reimplementing a kernel internally.
 
-Backends handle all OS-specific device access:
+The existing device backend API is the current device platform facet. It handles:
 
 - Device enumeration
 - PCI config access
@@ -46,6 +55,8 @@ Backends handle all OS-specific device access:
 - DMA allocation and mapping
 - IRQ delivery
 - Time, logging, and event integration
+
+Host interfaces are separate from device backends. They are the OS-specific surfaces that expose a loaded module to the outside world, such as Linux sockets, IPC, FUSE, ALSA/PipeWire bridges, or a PachaOS service endpoint.
 
 ---
 
@@ -81,7 +92,7 @@ ctest --test-dir .artifacts/build
 
 ```sh
 KOBOX_PACHAOS_DEVICE_CAPSULE=0xca12000000000001 kobox-ls-devices pachaos
-kobox-run --backend=pachaos --capsule=0xca12000000000001 run driver.ko
+kobox-run --device=pachaos --capsule=0xca12000000000001 run driver.ko
 ```
 
 PCI identity and BAR sizes can be supplied via environment variables until the PachaOS Capsule ABI grows config/BAR info calls:
@@ -99,7 +110,9 @@ KOBOX_PACHAOS_BAR0_SIZE=0x1000
 2. USB (xHCI) — complete: HID + Mass Storage (BOT / SCSI / block I/O), multi-device
 3. Network (e1000e / r8169) — reusing PCI + DMA shim
 4. SATA (AHCI) — storage shim shared with NVMe
-5. NVIDIA GPU — the final boss (`init_module` confirmed passing)
+5. NVIDIA GPU — `init_module` confirmed passing
+6. Runtime generalization — platform facets, host interfaces, and subsystem-owned symbol registration
+7. Non-driver module families — filesystems first, then security, sound, and KVM
 
 ---
 

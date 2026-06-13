@@ -198,7 +198,7 @@ fi
 
 echo "kobox-qemu-vfio: group=$group"
 /usr/bin/kobox-ls-devices vfio "$pvpanic_bdf"
-/usr/bin/kobox-run --backend=vfio --pci="$pvpanic_bdf" --dep=/usr/lib/kobox/pvpanic.ko run /usr/lib/kobox/pvpanic-pci.ko
+/usr/bin/kobox-run --device=vfio --pci="$pvpanic_bdf" --dep=/usr/lib/kobox/pvpanic.ko run /usr/lib/kobox/pvpanic-pci.ko
 status=$?
 echo "kobox-qemu-vfio: status=$status"
 poweroff -f

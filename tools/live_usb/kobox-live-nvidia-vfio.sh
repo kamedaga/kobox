@@ -174,7 +174,7 @@ run_kobox() {
 
     kobox-ls-devices vfio "$bdf"
     KOBOX_TRACE_PCI="${KOBOX_TRACE_PCI:-1}" \
-        kobox-run --backend=vfio --pci="$bdf" run "$module"
+        kobox-run --device=vfio --pci="$bdf" run "$module"
 }
 
 case "${1:-status}" in

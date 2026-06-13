@@ -1,7 +1,9 @@
-#include "kobox/backend.h"
-#include "kobox/backend_linux_mock.h"
+#include "kobox/device.h"
+#include "kobox/device_linux_mock.h"
 #include "kobox/elf.h"
+#include "kobox/interface_linux.h"
 #include "kobox/module.h"
+#include "kobox/platform.h"
 #include "kobox/shim.h"
 
 #include <stdint.h>
@@ -56,7 +58,7 @@ static void write_elf_rela(unsigned char *p, uint64_t offset, uint32_t symbol_in
     write_u64le(p + 16, (uint64_t)addend);
 }
 
-static int test_executable_module(kb_backend_t *backend)
+static int test_executable_module(kb_device_backend_t *backend)
 {
     unsigned char elf[768];
     memset(elf, 0, sizeof(elf));
@@ -140,71 +142,170 @@ static int test_executable_module(kb_backend_t *backend)
     return 0;
 }
 
-int main(void)
+static int test_platform_facets(void)
 {
-    kb_backend_t *backend = 0;
-    if (kb_linux_mock_create(&backend) != KB_OK || backend == 0) {
+    kb_device_backend_t *backend = NULL;
+    if (kb_linux_mock_device_create(&backend) != KB_OK || backend == NULL) {
         return 1;
     }
 
-    const kb_backend_ops_t *ops = kb_backend_get_ops(backend);
+    kb_platform_t *platform = NULL;
+    kb_platform_desc_t desc = {
+        "mock-platform",
+        backend,
+        NULL,
+        0,
+    };
+    if (kb_platform_create(&desc, &platform) != KB_OK || platform == NULL) {
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+
+    int failed = 0;
+    failed += strcmp(kb_platform_name(platform), "mock-platform") != 0;
+    failed += kb_platform_device_backend(platform) != backend;
+
+    const kb_platform_memory_ops_t *memory = kb_platform_memory(platform);
+    void *mem = memory == NULL || memory->alloc == NULL ? NULL : memory->alloc(platform, 32, 16);
+    failed += mem == NULL;
+    if (memory != NULL && memory->free != NULL) {
+        memory->free(platform, mem, 32);
+    }
+
+    const kb_platform_time_ops_t *time_ops = kb_platform_time(platform);
+    failed += time_ops == NULL || time_ops->monotonic_ns == NULL || time_ops->monotonic_ns(platform) == 0;
+
+    const kb_platform_log_ops_t *log_ops = kb_platform_log(platform);
+    if (log_ops != NULL && log_ops->log != NULL) {
+        log_ops->log(platform, 0, "platform facet smoke");
+    } else {
+        failed++;
+    }
+
+    size_t interface_count = 99;
+    failed += kb_platform_interface_count(platform, &interface_count) != KB_OK || interface_count != 0;
+
+    kb_platform_destroy(platform);
+    return failed != 0;
+}
+
+static int test_linux_host_interfaces(void)
+{
+    kb_device_backend_t *backend = NULL;
+    if (kb_linux_mock_device_create(&backend) != KB_OK || backend == NULL) {
+        return 1;
+    }
+
+    kb_interface_t *ipc = NULL;
+    kb_linux_interface_desc_t ipc_desc = {
+        .name = "linux-ipc-fs",
+        .subsystem = "fs",
+        .endpoint = "kobox.fs",
+    };
+    if (kb_linux_ipc_interface_create(&ipc_desc, &ipc) != KB_OK || ipc == NULL) {
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+
+    kb_interface_t *interfaces[] = {
+        ipc,
+    };
+    kb_platform_t *platform = NULL;
+    kb_platform_desc_t platform_desc = {
+        "linux-interface-platform",
+        backend,
+        interfaces,
+        1,
+    };
+    if (kb_platform_create(&platform_desc, &platform) != KB_OK || platform == NULL) {
+        kb_interface_destroy(ipc);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+
+    int failed = 0;
+    size_t interface_count = 0;
+    failed += kb_platform_interface_count(platform, &interface_count) != KB_OK || interface_count != 1;
+
+    kb_interface_t *first = NULL;
+    failed += kb_platform_interface_at(platform, 0, &first) != KB_OK || first != ipc;
+    failed += kb_interface_kind(first) != KB_INTERFACE_IPC;
+    failed += strcmp(kb_interface_name(first), "linux-ipc-fs") != 0;
+    failed += strcmp(kb_interface_subsystem(first), "fs") != 0;
+    failed += kb_interface_bind(first, platform) != KB_OK;
+    failed += kb_interface_poll(first, 0) != KB_OK;
+    failed += kb_interface_dispatch(first, "mount", 5) != KB_OK;
+    kb_interface_unbind(first);
+
+    kb_platform_destroy(platform);
+    return failed != 0;
+}
+
+int main(void)
+{
+    kb_device_backend_t *backend = 0;
+    if (kb_linux_mock_device_create(&backend) != KB_OK || backend == 0) {
+        return 1;
+    }
+
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     if (ops == 0) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 2;
     }
 
     size_t count = 0;
     if (ops->device_count(backend, &count) != KB_OK || count != 1) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 3;
     }
 
     kb_device_t *device = 0;
     if (ops->device_at(backend, 0, &device) != KB_OK || device == 0) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 4;
     }
 
     kb_pci_bar_info_t bar_info;
     memset(&bar_info, 0, sizeof(bar_info));
     if (ops->pci_bar_info == 0 || ops->pci_bar_info(device, 0, &bar_info) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 30;
     }
     if (!bar_info.present || bar_info.size != 4096) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 31;
     }
 
     kb_dma_buffer_t dma;
     memset(&dma, 0, sizeof(dma));
     if (ops->dma_alloc(device, 4096, 4096, KB_DMA_BIDIRECTIONAL, &dma) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 5;
     }
     if (dma.cpu_addr == 0 || dma.dma_addr == 0 || dma.size != 4096) {
         ops->dma_free(device, &dma);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 6;
     }
     ops->dma_free(device, &dma);
 
     int called = 0;
-    kb_irq_t *irq = 0;
+    kb_device_irq_t *irq = 0;
     if (ops->irq_register(device, 0, irq_callback, &called, &irq) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 7;
     }
     if (ops->irq_wait(device, irq, 0) != KB_OK || called != 1) {
         ops->irq_unregister(device, irq);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 8;
     }
     ops->irq_unregister(device, irq);
 
     void *mem = kb_kzalloc(16, 0);
     if (mem == 0) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 9;
     }
     kb_kfree(mem);
@@ -218,11 +319,11 @@ int main(void)
     kb_module_t *module = 0;
     if (kb_module_open_image(&image, backend, &module) != KB_ERR_INVALID) {
         kb_module_close(module);
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 10;
     }
     if (module != 0) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 11;
     }
 
@@ -301,30 +402,30 @@ int main(void)
 
     kb_elf_file_t parsed_elf;
     if (kb_elf_open(elf, sizeof(elf), &parsed_elf) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 12;
     }
     if (kb_elf_section_count(&parsed_elf) != 7) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 13;
     }
     kb_elf_section_t section;
     if (kb_elf_section(&parsed_elf, 1, &section) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 14;
     }
     if (strcmp(section.name, ".text") != 0 || section.type != KB_ELF_SHT_PROGBITS || section.size != 0x20) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 15;
     }
     size_t symbol_count = 0;
     if (kb_elf_symbol_count(&parsed_elf, 2, &symbol_count) != KB_OK || symbol_count != 3) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 16;
     }
     kb_elf_symbol_t symbol;
     if (kb_elf_symbol(&parsed_elf, 2, 1, &symbol) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 17;
     }
     if (strcmp(symbol.name, "init_module") != 0 ||
@@ -332,25 +433,25 @@ int main(void)
         symbol.type != KB_ELF_STT_FUNC ||
         symbol.section_index != 1)
     {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 18;
     }
     if (kb_elf_symbol(&parsed_elf, 2, 2, &symbol) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 19;
     }
     if (strcmp(symbol.name, "printk") != 0 || symbol.section_index != KB_ELF_SHN_UNDEF) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 20;
     }
     size_t relocation_count = 0;
     if (kb_elf_relocation_count(&parsed_elf, 4, &relocation_count) != KB_OK || relocation_count != 1) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 21;
     }
     kb_elf_relocation_t relocation;
     if (kb_elf_relocation(&parsed_elf, 4, 0, &relocation) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 22;
     }
     if (relocation.offset != 4 ||
@@ -360,22 +461,22 @@ int main(void)
         relocation.target_section_index != 1 ||
         relocation.symbol_table_section_index != 2)
     {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 23;
     }
     size_t modinfo_section = 0;
     if (kb_elf_modinfo_section(&parsed_elf, &modinfo_section) != KB_OK || modinfo_section != 5) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 24;
     }
     size_t modinfo_count = 0;
     if (kb_elf_modinfo_entry_count(&parsed_elf, modinfo_section, &modinfo_count) != KB_OK || modinfo_count != 2) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 25;
     }
     kb_elf_modinfo_entry_t modinfo_entry;
     if (kb_elf_modinfo_entry(&parsed_elf, modinfo_section, 0, &modinfo_entry) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 26;
     }
     if (modinfo_entry.key_size != 8 ||
@@ -383,11 +484,11 @@ int main(void)
         modinfo_entry.value_size != 10 ||
         strncmp(modinfo_entry.value, "6.6.0-test", modinfo_entry.value_size) != 0)
     {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 27;
     }
     if (kb_elf_modinfo_entry(&parsed_elf, modinfo_section, 1, &modinfo_entry) != KB_OK) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 28;
     }
     if (modinfo_entry.key_size != 7 ||
@@ -395,16 +496,26 @@ int main(void)
         modinfo_entry.value_size != 7 ||
         strncmp(modinfo_entry.value, "foo,bar", modinfo_entry.value_size) != 0)
     {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 29;
     }
 
     int executable_status = test_executable_module(backend);
     if (executable_status != 0) {
-        kb_backend_destroy(backend);
+        kb_device_backend_destroy(backend);
         return 30 + executable_status;
     }
 
-    kb_backend_destroy(backend);
+    if (test_platform_facets() != 0) {
+        kb_device_backend_destroy(backend);
+        return 40;
+    }
+
+    if (test_linux_host_interfaces() != 0) {
+        kb_device_backend_destroy(backend);
+        return 41;
+    }
+
+    kb_device_backend_destroy(backend);
     return 0;
 }

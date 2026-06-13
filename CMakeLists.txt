@@ -12,45 +12,65 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(kobox_runtime STATIC
-    src/backend/backend.c
-    src/backend/linux_mock/backend_linux_mock.c
-    src/backend/pachaos_capsule/backend_pachaos_capsule.c
-    src/backend/linux_sysfs/backend_linux_sysfs.c
-    src/backend/linux_vfio/backend_linux_vfio.c
+    src/device/device_backend.c
+    src/host_interface/interface.c
+    src/host_interface/linux_interface_common.c
+    src/host_interface/linux_ipc/interface_linux_ipc.c
+    src/device/linux_mock/device_linux_mock.c
+    src/device/pachaos_capsule/device_pachaos_capsule.c
+    src/device/linux_sysfs/device_linux_sysfs.c
+    src/device/linux_vfio/device_linux_vfio.c
     src/loader/elf_reader.c
     src/loader/module_loader.c
-    src/subsystem/block/block.c
-    src/subsystem/dma/dma.c
-    src/subsystem/input/input.c
-    src/subsystem/nvme/nvme.c
-    src/subsystem/pci/pci.c
-    src/subsystem/scsi/scsi.c
-    src/subsystem/usb/config.c
-    src/subsystem/usb/port_state.c
-    src/subsystem/usb/storage.c
-    src/subsystem/usb/synthetic.c
-    src/subsystem/usb/usb.c
-    src/shim/linux_context.c
-    src/shim/linux_call.c
-    src/shim/linux_block.c
-    src/shim/linux_device.c
-    src/shim/linux_dma.c
-    src/shim/linux_dma_pool.c
-    src/shim/linux_hwmon.c
-    src/shim/linux_irq.c
-    src/shim/linux_memory.c
-    src/shim/linux_mmio.c
-    src/shim/linux_netdev.c
-    src/shim/linux_nvme.c
-    src/shim/linux_pci.c
-    src/shim/linux_platform.c
-    src/shim/linux_printk.c
-    src/shim/linux_scsi.c
-    src/shim/linux_stubs.c
-    src/shim/linux_sync.c
-    src/shim/linux_usb.c
-    src/shim/linux_virtio_input.c
-    src/shim/linux_work.c
+    src/loader/symbol_registry.c
+    src/platform/platform.c
+    src/linux_subsystem/block/block.c
+    src/linux_subsystem/block/block_symbols.c
+    src/linux_subsystem/dma/dma.c
+    src/linux_subsystem/dma/dma_symbols.c
+    src/linux_subsystem/fs/fs.c
+    src/linux_subsystem/fs/fs_symbols.c
+    src/linux_subsystem/fs/fops_smoke.c
+    src/linux_subsystem/fs/kernel_object_registry.c
+    src/linux_subsystem/input/input.c
+    src/linux_subsystem/input/input_symbols.c
+    src/linux_subsystem/kvm/kvm_symbols.c
+    src/linux_subsystem/net/net_symbols.c
+    src/linux_subsystem/nvme/nvme.c
+    src/linux_subsystem/pci/pci.c
+    src/linux_subsystem/pci/pci_symbols.c
+    src/linux_subsystem/scsi/scsi.c
+    src/linux_subsystem/security/security_symbols.c
+    src/linux_subsystem/sound/sound_symbols.c
+    src/linux_subsystem/usb/config.c
+    src/linux_subsystem/usb/port_state.c
+    src/linux_subsystem/usb/storage.c
+    src/linux_subsystem/usb/synthetic.c
+    src/linux_subsystem/usb/usb.c
+    src/linux_subsystem/usb/usb_symbols.c
+    src/linux_personality/linux_context.c
+    src/linux_personality/linux_call.c
+    src/linux_personality/linux_block.c
+    src/linux_personality/linux_core_symbols.c
+    src/linux_personality/linux_device.c
+    src/linux_personality/linux_dma.c
+    src/linux_personality/linux_dma_pool.c
+    src/linux_personality/linux_hwmon.c
+    src/linux_personality/linux_irq.c
+    src/linux_personality/linux_memory.c
+    src/linux_personality/linux_mmio.c
+    src/linux_personality/linux_netdev.c
+    src/linux_personality/linux_nvme.c
+    src/linux_personality/linux_pci.c
+    src/linux_personality/linux_platform.c
+    src/linux_personality/linux_printk.c
+    src/linux_personality/linux_scsi.c
+    src/linux_personality/linux_stubs.c
+    src/linux_personality/linux_stub_symbols.c
+    src/linux_personality/linux_sync.c
+    src/linux_personality/linux_usb.c
+    src/linux_personality/linux_virtio_input.c
+    src/linux_personality/linux_work.c
 )
 
 target_include_directories(kobox_runtime
@@ -151,6 +171,21 @@ target_compile_options(kobox-vfio-nvme-smoke PRIVATE
     -Werror
 )
 
+add_executable(kobox-ext4-real-ops
+    tools/kobox_ext4_real_ops_probe/main.c
+)
+
+target_link_libraries(kobox-ext4-real-ops PRIVATE kobox_runtime)
+target_include_directories(kobox-ext4-real-ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(kobox-ext4-real-ops PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
 enable_testing()
 
 add_executable(kobox-smoke
@@ -169,12 +204,14 @@ add_test(NAME kobox-smoke COMMAND kobox-smoke)
 
 add_executable(kobox-usb-subsystem-smoke
     tests/usb_subsystem_smoke.c
-    src/subsystem/block/block.c
-    src/subsystem/usb/storage.c
-    src/subsystem/usb/usb.c
+    src/linux_personality/linux_memory.c
+    src/linux_subsystem/block/block.c
+    src/linux_subsystem/usb/storage.c
+    src/linux_subsystem/usb/usb.c
 )
 
 target_include_directories(kobox-usb-subsystem-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_options(kobox-usb-subsystem-smoke PRIVATE
@@ -202,11 +239,17 @@ target_compile_options(kobox-input-subsystem-smoke PRIVATE
     -Werror
 )
 
-add_test(NAME kobox-input-subsystem-smoke COMMAND kobox-input-subsystem-smoke)
+add_test(
+    NAME kobox-input-subsystem-smoke
+    COMMAND kobox-input-subsystem-smoke
+)
+set_tests_properties(kobox-input-subsystem-smoke PROPERTIES
+    ENVIRONMENT KOBOX_INPUT_TRUST_DEVICE_STRINGS=1
+)
 
 add_executable(kobox-block-subsystem-smoke
     tests/block_subsystem_smoke.c
-    src/subsystem/block/block.c
+    src/linux_subsystem/block/block.c
 )
 
 target_include_directories(kobox-block-subsystem-smoke PRIVATE
@@ -220,6 +263,35 @@ target_compile_options(kobox-block-subsystem-smoke PRIVATE
 )
 
 add_test(NAME kobox-block-subsystem-smoke COMMAND kobox-block-subsystem-smoke)
+
+add_executable(kobox-fs-subsystem-smoke
+    tests/fs_subsystem_smoke.c
+)
+
+target_link_libraries(kobox-fs-subsystem-smoke PRIVATE kobox_runtime)
+target_include_directories(kobox-fs-subsystem-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(kobox-fs-subsystem-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
+add_test(NAME kobox-fs-subsystem-smoke COMMAND kobox-fs-subsystem-smoke)
+
+add_test(
+    NAME kobox-ext4-real-ops
+    COMMAND ${CMAKE_COMMAND} -E env
+        KOBOX_EXT4_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-ext4-real-ops>
+        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ext4_real_ops_probe.sh
+)
+set_tests_properties(kobox-ext4-real-ops PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    SKIP_RETURN_CODE 77
+)
 
 add_test(
     NAME kobox-live-script-args

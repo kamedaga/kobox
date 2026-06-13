@@ -1,6 +1,6 @@
-#include "subsystem/block/block.h"
-#include "subsystem/usb/usb.h"
-#include "subsystem/usb/storage.h"
+#include "linux_subsystem/block/block.h"
+#include "linux_subsystem/usb/usb.h"
+#include "linux_subsystem/usb/storage.h"
 
 #include <stdio.h>
 #include <string.h>

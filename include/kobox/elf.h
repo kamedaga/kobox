@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "kobox/backend.h"
+#include "kobox/device.h"
 
 #ifdef __cplusplus
 extern "C" {
