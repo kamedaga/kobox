@@ -10,6 +10,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+option(KOBOX_ENABLE_QEMU_TESTS "Enable QEMU-backed live smoke tests" OFF)
+option(KOBOX_ENABLE_LINUX_BOOT_TESTS "Enable KVM-backed Linux boot smoke tests" OFF)
 
 add_library(kobox_runtime STATIC
     src/device/device_backend.c
@@ -188,6 +190,21 @@ target_compile_options(kobox-ext4-real-ops PRIVATE
     -Werror
 )
 
+add_executable(kobox-kvm-real-ops
+    tools/kobox_kvm_real_ops_probe/main.c
+)
+
+target_link_libraries(kobox-kvm-real-ops PRIVATE kobox_runtime)
+target_include_directories(kobox-kvm-real-ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_options(kobox-kvm-real-ops PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+)
+
 enable_testing()
 
 add_executable(kobox-smoke
@@ -323,6 +340,41 @@ set_tests_properties(kobox-ext4-feature-matrix PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     SKIP_RETURN_CODE 77
 )
+
+add_test(
+    NAME kobox-kvm-real-ops
+    COMMAND ${CMAKE_COMMAND} -E env
+        KOBOX_KVM_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-kvm-real-ops>
+        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_kvm_real_ops_probe.sh
+)
+set_tests_properties(kobox-kvm-real-ops PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    SKIP_RETURN_CODE 77
+)
+
+if(KOBOX_ENABLE_QEMU_TESTS)
+    add_test(
+        NAME kobox-qemu-nested-kvm-smoke
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_qemu_nested_kvm_smoke.sh
+    )
+    set_tests_properties(kobox-qemu-nested-kvm-smoke PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        SKIP_RETURN_CODE 77
+    )
+endif()
+
+if(KOBOX_ENABLE_LINUX_BOOT_TESTS)
+    add_test(
+        NAME kobox-kvm-linux-rootfs-smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            KOBOX_KVM_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-kvm-real-ops>
+            sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_kvm_linux_rootfs_smoke.sh
+    )
+    set_tests_properties(kobox-kvm-linux-rootfs-smoke PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        SKIP_RETURN_CODE 77
+    )
+endif()
 
 add_test(
     NAME kobox-live-script-args

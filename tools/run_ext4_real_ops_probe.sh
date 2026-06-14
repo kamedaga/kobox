@@ -38,7 +38,7 @@ run_fixture() {
         "$ext4_ko"
 }
 
-fixtures="${KOBOX_EXT4_FIXTURES:-minimal extents dir_index extra_isize 64bit metadata_csum journal}"
+fixtures="${KOBOX_EXT4_FIXTURES:-minimal extents dir_index extra_isize 64bit metadata_csum journal all_features}"
 for fixture in $fixtures; do
     case "$fixture" in
         minimal)
@@ -49,6 +49,21 @@ for fixture in $fixtures; do
             ;;
         extents)
             run_fixture "$fixture" "^has_journal,extent,^64bit,^metadata_csum,^extra_isize,^dir_index"
+            ;;
+        extents_metadata_csum)
+            run_fixture "$fixture" "^has_journal,extent,^64bit,metadata_csum,^extra_isize,^dir_index"
+            ;;
+        extents_extra_isize)
+            run_fixture "$fixture" "^has_journal,extent,^64bit,^metadata_csum,extra_isize,^dir_index"
+            ;;
+        extents_dir_index)
+            run_fixture "$fixture" "^has_journal,extent,^64bit,^metadata_csum,^extra_isize,dir_index"
+            ;;
+        extents_metadata_csum_extra_isize)
+            run_fixture "$fixture" "^has_journal,extent,^64bit,metadata_csum,extra_isize,^dir_index"
+            ;;
+        extents_dir_index_extra_isize)
+            run_fixture "$fixture" "^has_journal,extent,^64bit,^metadata_csum,extra_isize,dir_index"
             ;;
         extra_isize)
             run_fixture "$fixture" "^has_journal,^extent,^64bit,^metadata_csum,extra_isize,^dir_index"
@@ -62,8 +77,17 @@ for fixture in $fixtures; do
         64bit)
             run_fixture "$fixture" "^has_journal,extent,64bit,^metadata_csum,^extra_isize,^dir_index"
             ;;
+        64bit_metadata_csum)
+            run_fixture "$fixture" "^has_journal,extent,64bit,metadata_csum,^extra_isize,^dir_index"
+            ;;
         journal)
             run_fixture "$fixture" "has_journal,^extent,^64bit,^metadata_csum,^extra_isize,^dir_index"
+            ;;
+        journal_extents)
+            run_fixture "$fixture" "has_journal,extent,^64bit,^metadata_csum,^extra_isize,^dir_index"
+            ;;
+        all_features)
+            run_fixture "$fixture" "has_journal,extent,64bit,metadata_csum,extra_isize,dir_index"
             ;;
         dir_index_extra_isize)
             run_fixture "$fixture" "^has_journal,^extent,^64bit,^metadata_csum,extra_isize,dir_index"

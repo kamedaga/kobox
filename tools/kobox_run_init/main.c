@@ -20,7 +20,12 @@
 #if defined(_WIN32)
 #include <io.h>
 #else
+#include <signal.h>
+#include <dlfcn.h>
 #include <unistd.h>
+#if defined(__x86_64__)
+#include <ucontext.h>
+#endif
 #endif
 
 enum {
@@ -33,6 +38,70 @@ typedef struct loaded_input_module {
     size_t size;
     kb_module_t *module;
 } loaded_input_module_t;
+
+#if !defined(_WIN32) && defined(__x86_64__)
+static void signal_diagnostics_handler(int signal_number, siginfo_t *info, void *uctx)
+{
+    ucontext_t *context = (ucontext_t *)uctx;
+    void *rip = (void *)context->uc_mcontext.gregs[REG_RIP];
+    void *rsp = (void *)context->uc_mcontext.gregs[REG_RSP];
+    void *rdi = (void *)context->uc_mcontext.gregs[REG_RDI];
+    void *rsi = (void *)context->uc_mcontext.gregs[REG_RSI];
+    void *rdx = (void *)context->uc_mcontext.gregs[REG_RDX];
+    void *rcx = (void *)context->uc_mcontext.gregs[REG_RCX];
+    const uint8_t *insn = (const uint8_t *)rip;
+    fprintf(stderr,
+        "kobox-run: signal=%d rip=%p rsp=%p fault=%p external_target=%p caller_gs=0x%lx callee_gs=0x%lx rdi=%p rsi=%p rdx=%p rcx=%p\n",
+        signal_number,
+        rip,
+        rsp,
+        info == NULL ? NULL : info->si_addr,
+        kb_module_current_external_call_target(),
+        kb_module_current_external_call_caller_gs(),
+        kb_module_current_external_call_callee_gs(),
+        rdi,
+        rsi,
+        rdx,
+        rcx);
+    if (insn != NULL && insn[0] == 0xff && insn[1] == 0x15) {
+        int32_t displacement = 0;
+        uintptr_t slot = 0;
+        uintptr_t target = 0;
+        memcpy(&displacement, insn + 2, sizeof(displacement));
+        slot = (uintptr_t)(insn + 6) + (intptr_t)displacement;
+        memcpy(&target, (const void *)slot, sizeof(target));
+        fprintf(stderr, "kobox-run: indirect_call slot=%p target=%p displacement=%d\n", (void *)slot, (void *)target, displacement);
+    }
+    {
+        Dl_info rip_info;
+        Dl_info target_info;
+        void *external_target = kb_module_current_external_call_target();
+        if (dladdr(rip, &rip_info) != 0) {
+            fprintf(stderr, "kobox-run: rip_symbol=%s object=%s base=%p\n", rip_info.dli_sname == NULL ? "(unknown)" : rip_info.dli_sname, rip_info.dli_fname == NULL ? "(unknown)" : rip_info.dli_fname, rip_info.dli_fbase);
+        }
+        if (external_target != NULL && dladdr(external_target, &target_info) != 0) {
+            fprintf(stderr, "kobox-run: external_symbol=%s object=%s base=%p offset=0x%lx\n", target_info.dli_sname == NULL ? "(unknown)" : target_info.dli_sname, target_info.dli_fname == NULL ? "(unknown)" : target_info.dli_fname, target_info.dli_fbase, (unsigned long)((uintptr_t)external_target - (uintptr_t)target_info.dli_fbase));
+        }
+    }
+    _Exit(128 + signal_number);
+}
+
+static void install_signal_diagnostics(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = signal_diagnostics_handler;
+    action.sa_flags = SA_SIGINFO;
+    (void)sigaction(SIGSEGV, &action, NULL);
+    (void)sigaction(SIGILL, &action, NULL);
+    (void)sigaction(SIGBUS, &action, NULL);
+    (void)sigaction(SIGABRT, &action, NULL);
+}
+#else
+static void install_signal_diagnostics(void)
+{
+}
+#endif
 
 static void stdout_write_all(const char *text, size_t length)
 {
@@ -542,6 +611,7 @@ static void configure_pachaos_driver_preference(const char *path)
 
 int main(int argc, char **argv)
 {
+    install_signal_diagnostics();
     kb_usb_set_event_injection_runtime_allowed(0);
 
     const char *path = NULL;

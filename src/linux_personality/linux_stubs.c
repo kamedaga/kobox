@@ -24,10 +24,23 @@ typedef struct kb_kthread_record {
     struct kb_kthread_record *next;
 } kb_kthread_record_t;
 
+typedef struct kb_jbd2_journal_record {
+    void *journal;
+    struct kb_jbd2_journal_record *next;
+} kb_jbd2_journal_record_t;
+
 static kb_ida_record_t *ida_records;
 static kb_kthread_record_t *kthread_records;
+static kb_jbd2_journal_record_t *jbd2_journal_records;
 
 static int crypto_trace_enabled(void);
+
+enum {
+    KB_JBD2_JOURNAL_SUPERBLOCK_OFFSET = 0x3b0,
+    KB_JBD2_JOURNAL_COMMIT_SEQUENCE_OFFSET = 0x428,
+    KB_JBD2_JOURNAL_COMMIT_REQUEST_OFFSET = 0x42c,
+    KB_JBD2_JOURNAL_TASK_OFFSET = 0x440,
+};
 
 void kb_noop_stub(void)
 {
@@ -185,6 +198,125 @@ static int low_or_error_ptr(const void *ptr)
     return value < 4096u || value >= UINTPTR_MAX - 4095u;
 }
 
+static int jbd2_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *value = getenv("KOBOX_TRACE_JBD2");
+    cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    return cached;
+}
+
+static void register_jbd2_journal(void *journal)
+{
+    if (low_or_error_ptr(journal)) {
+        return;
+    }
+    for (kb_jbd2_journal_record_t *record = jbd2_journal_records; record != NULL; record = record->next) {
+        if (record->journal == journal) {
+            return;
+        }
+    }
+    kb_jbd2_journal_record_t *record = calloc(1, sizeof(*record));
+    if (record == NULL) {
+        return;
+    }
+    record->journal = journal;
+    record->next = jbd2_journal_records;
+    jbd2_journal_records = record;
+    if (jbd2_trace_enabled()) {
+        fprintf(stderr, "kobox jbd2: register journal=%p\n", journal);
+    }
+}
+
+void kb_jbd2_progress_registered_journals(void)
+{
+    for (kb_jbd2_journal_record_t *record = jbd2_journal_records; record != NULL; record = record->next) {
+        unsigned char *journal = record->journal;
+        if (low_or_error_ptr(journal)) {
+            continue;
+        }
+        uint32_t commit_sequence = 0;
+        uint32_t commit_request = 0;
+        memcpy(&commit_sequence, journal + KB_JBD2_JOURNAL_COMMIT_SEQUENCE_OFFSET, sizeof(commit_sequence));
+        memcpy(&commit_request, journal + KB_JBD2_JOURNAL_COMMIT_REQUEST_OFFSET, sizeof(commit_request));
+        if ((int32_t)(commit_request - commit_sequence) <= 0) {
+            continue;
+        }
+        memcpy(journal + KB_JBD2_JOURNAL_COMMIT_SEQUENCE_OFFSET, &commit_request, sizeof(commit_request));
+        if (jbd2_trace_enabled()) {
+            fprintf(stderr,
+                "kobox jbd2: progress journal=%p commit_sequence=%u commit_request=%u\n",
+                (void *)journal,
+                commit_sequence,
+                commit_request);
+        }
+    }
+}
+
+void *kb_jbd2_journal_init_stub(void)
+{
+    void *journal = kb_kzalloc(2048, 0);
+    void *superblock = kb_kzalloc(1024, 0);
+    if (journal != NULL && superblock != NULL) {
+        uint32_t compatible_features = 0x100u;
+        ((unsigned char *)journal)[0] = 0x20u;
+        memcpy((unsigned char *)superblock + 0x30, &compatible_features, sizeof(compatible_features));
+        memcpy((unsigned char *)journal + KB_JBD2_JOURNAL_SUPERBLOCK_OFFSET, &superblock, sizeof(superblock));
+    } else {
+        kb_kfree(journal);
+        kb_kfree(superblock);
+        journal = NULL;
+    }
+    register_jbd2_journal(journal);
+    if (jbd2_trace_enabled()) {
+        fprintf(stderr, "kobox jbd2: init journal=%p superblock=%p\n", journal, superblock);
+    }
+    return journal;
+}
+
+void *kb_jbd2_journal_start_stub(void)
+{
+    void *handle = kb_kzalloc(256, 0);
+    if (jbd2_trace_enabled()) {
+        fprintf(stderr, "kobox jbd2: start handle=%p\n", handle);
+    }
+    return handle;
+}
+
+int kb_jbd2_journal_stop_stub(void *handle)
+{
+    if (!low_or_error_ptr(handle)) {
+        kb_kfree(handle);
+    }
+    if (jbd2_trace_enabled()) {
+        fprintf(stderr, "kobox jbd2: stop handle=%p\n", handle);
+    }
+    return 0;
+}
+
+int kb_jbd2_journal_blocks_per_page_stub(void)
+{
+    return 1;
+}
+
+void kb_jbd2_journal_destroy_stub(void *journal)
+{
+    if (!low_or_error_ptr(journal)) {
+        void *superblock = NULL;
+        memcpy(&superblock, (unsigned char *)journal + KB_JBD2_JOURNAL_SUPERBLOCK_OFFSET, sizeof(superblock));
+        if (!low_or_error_ptr(superblock)) {
+            kb_kfree(superblock);
+        }
+        kb_kfree(journal);
+    }
+    if (jbd2_trace_enabled()) {
+        fprintf(stderr, "kobox jbd2: destroy journal=%p\n", journal);
+    }
+}
+
 int kb_list_add_valid_or_report(void *new_entry, void *prev, void *next)
 {
     int result = 0;
@@ -272,7 +404,8 @@ int kb_wake_up_process(void *task)
          */
         if (record->data != NULL && strncmp(record->name, "jbd2/", 5) == 0) {
             void *current = task;
-            memcpy((unsigned char *)record->data + 0x440, &current, sizeof(current));
+            memcpy((unsigned char *)record->data + KB_JBD2_JOURNAL_TASK_OFFSET, &current, sizeof(current));
+            register_jbd2_journal(record->data);
         }
         return 1;
     }

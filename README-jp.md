@@ -50,14 +50,6 @@ kobox runtime core
 
 Linux パーソナリティは意図的にカーネルではない — libc + pthread + C atomics + POSIX プリミティブの集合体。内部でカーネルをエミュレートするわけでも、特殊なメモリモデルを用意するわけでもない。モジュールのシンボル呼び出しが「どこかまともなところに着地する」だけの必要最低限。
 
-現在のデバイスバックエンドがデバイスプラットフォームファセットにあたる。担当範囲：
-
-- デバイス列挙
-- PCI コンフィグ空間アクセス
-- BAR / MMIO マッピング
-- DMA アロケーション + マッピング
-- IRQ 配送
-- 時刻・ログ・イベントループの統合
 
 ホストインターフェースはデバイスバックエンドとは別物。読み込んだモジュールを外の世界に見せる側 — Linux ソケット・IPC・FUSE・ALSA/PipeWire ブリッジ・PachaOS サービスエンドポイントなど。
 
@@ -93,7 +85,7 @@ Linux・PachaOS・OpenBSD それぞれのプラットフォーム実装は `src/
 
 現在実装済みの種類は IPC ひとつ（`KB_INTERFACE_IPC`、`kb_linux_ipc_interface_create()` で作る）。PachaOS IPC インターフェースが次。
 
-**重要な制約：** ファイルシステムモジュールはホストインターフェースが必要だがデバイスバックエンドは不要。PCI ドライバーはデバイスバックエンドが必要だがホストインターフェースは不要。USB・NVMe のように両方やるモジュールだけが両方必要になる。
+
 
 ---
 
@@ -106,9 +98,18 @@ NVMe・USB・ext4 は Linux VFIO バックエンドでエンドツーエンド�
 | NVMe | 動作 | 動作 |
 | USB Storage (xHCI / BOT / SCSI) | 動作 | 動作 |
 | ext4 (over virtio-blk) | 動作 | — |
+| KVM (Linux ゲスト、`/sbin/init`) | 動作 | — |
 | Network (e1000e / r8169) | 進行中 | — |
 | SATA (AHCI) | 予定 | — |
 | NVIDIA GPU | `init_module` 通過 | — |
+
+### KVM — kobox 上で Linux ゲストを動かす
+
+実物の `kvm.ko` + `kvm-amd.ko` を kobox に読み込み、Linux `bzImage` ゲストを `/sbin/init` まで起動することに成功した。
+
+- [x] `kvm.ko` + `kvm-amd.ko` を kobox 上でロード・動作
+- [x] ゲスト Linux `bzImage` が virtio-mmio 経由で ext4 rootfs までブート
+- [x] ゲスト内で `/sbin/init` が実行される
 
 ### ext4 over virtio-blk
 
@@ -165,7 +166,7 @@ KOBOX_PACHAOS_BAR0_SIZE=0x1000
 5. SATA (AHCI) — NVMe と storage shim を共有
 6. NVIDIA GPU — `init_module` 通過確認済み、残りは未着手
 7. ランタイム汎化 — プラットフォームファセット・ホストインターフェース・サブシステム所有のシンボル登録
-8. ドライバー以外のモジュール対応 — ファイルシステム (ext4) 完了、次いでセキュリティ・サウンド・KVM
+8. ドライバー以外のモジュール対応 — ファイルシステム (ext4) 完了、KVM 完了 (Linux ゲストが `/sbin/init` まで起動)、次いでセキュリティ・サウンド
 
 ---
 

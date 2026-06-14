@@ -117,6 +117,12 @@ unsigned long kb_schedule_timeout(unsigned long timeout);
 void kb_run_deferred_work(void);
 void kb_run_deferred_bottom_halves(void);
 int kb_deferred_work_is_draining(void);
+void kb_jbd2_progress_registered_journals(void);
+void *kb_jbd2_journal_init_stub(void);
+void *kb_jbd2_journal_start_stub(void);
+int kb_jbd2_journal_stop_stub(void *handle);
+int kb_jbd2_journal_blocks_per_page_stub(void);
+void kb_jbd2_journal_destroy_stub(void *journal);
 void kb_register_jiffies_storage(void *storage);
 unsigned long kb_msecs_to_jiffies(unsigned int msecs);
 unsigned long kb_usecs_to_jiffies(unsigned int usecs);
@@ -188,6 +194,13 @@ int kb_pci_set_mwi(void *dev);
 const void *kb_pci_match_id(const void *id_table, void *dev);
 
 void kb_stack_chk_fail(void);
+extern uintptr_t kb_ref_stack_chk_guard;
+extern uint32_t kb_preempt_count;
+extern uint32_t kb_num_online_cpus;
+extern uint64_t kb_cpu_possible_mask;
+extern uint64_t kb_cpu_present_mask;
+extern uint64_t kb_user_ptr_max;
+extern uint32_t kb_cpu_number;
 
 int kb_platform_driver_register(void *driver, void *owner, const char *mod_name);
 void kb_platform_driver_unregister(void *driver);

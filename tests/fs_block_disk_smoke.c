@@ -34,17 +34,6 @@ static int smoke_disk_write(void *ctx, uint64_t sector, const void *buffer, size
     return 0;
 }
 
-static void free_bh(void *buffer_head)
-{
-    if (buffer_head == NULL) {
-        return;
-    }
-    void *data = NULL;
-    memcpy(&data, (const unsigned char *)buffer_head + SMOKE_BUFFER_HEAD_DATA_OFFSET, sizeof(data));
-    free(data);
-    free(buffer_head);
-}
-
 int main(void)
 {
     unsigned char backing[SMOKE_SECTOR_SIZE * SMOKE_SECTOR_COUNT];
@@ -108,11 +97,11 @@ int main(void)
     void *b_data = NULL;
     memcpy(&b_data, (const unsigned char *)buffer_head + SMOKE_BUFFER_HEAD_DATA_OFFSET, sizeof(b_data));
     if (b_data == NULL || memcmp(write_buffer, b_data, sizeof(write_buffer)) != 0) {
-        free_bh(buffer_head);
+        kb_fs_subsystem_buffer_head_put(buffer_head);
         kb_fs_block_device_destroy(fs_device);
         return 9;
     }
-    free_bh(buffer_head);
+    kb_fs_subsystem_buffer_head_put(buffer_head);
 
     unsigned char bio_read_buffer[SMOKE_SECTOR_SIZE];
     memset(bio_read_buffer, 0, sizeof(bio_read_buffer));

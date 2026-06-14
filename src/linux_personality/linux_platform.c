@@ -167,24 +167,30 @@ void kb_irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set
 
 void kb_raw_spin_lock(void *lock)
 {
-    (void)lock;
+    if (lock != NULL) {
+        uint32_t locked = 1;
+        memcpy(lock, &locked, sizeof(locked));
+    }
 }
 
 int kb_raw_spin_trylock(void *lock)
 {
-    (void)lock;
+    kb_raw_spin_lock(lock);
     return 1;
 }
 
 unsigned long kb_raw_spin_lock_irqsave(void *lock)
 {
-    (void)lock;
+    kb_raw_spin_lock(lock);
     return 0;
 }
 
 void kb_raw_spin_unlock(void *lock)
 {
-    (void)lock;
+    if (lock != NULL) {
+        uint32_t unlocked = 0;
+        memcpy(lock, &unlocked, sizeof(unlocked));
+    }
 }
 
 void kb_raw_spin_unlock_irqrestore(void *lock, unsigned long flags)

@@ -93,7 +93,6 @@ Each interface has a `subsystem` field that identifies which module family it se
 
 Currently one kind is implemented: **IPC** (`KB_INTERFACE_IPC`) via `kb_linux_ipc_interface_create()`. A PachaOS IPC interface is next.
 
-**Key constraint:** a filesystem module needs a host interface but no device backend. A PCI driver needs a device backend but no host interface. Only modules that do both (USB, NVMe) need both.
 
 ---
 
@@ -106,9 +105,18 @@ NVMe, USB, and ext4 are working end-to-end on the Linux VFIO backend.
 | NVMe | Working | Working |
 | USB Storage (xHCI / BOT / SCSI) | Working | Working |
 | ext4 (over virtio-blk) | Working | — |
+| KVM (Linux guest, `/sbin/init`) | Working | — |
 | Network (e1000e / r8169) | In progress | — |
 | SATA (AHCI) | Planned | — |
 | NVIDIA GPU | `init_module` passes | — |
+
+### KVM — Linux guest on kobox
+
+Real `kvm.ko` + `kvm-amd.ko` loaded into kobox, booting a Linux `bzImage` guest to `/sbin/init`.
+
+- [x] `kvm.ko` + `kvm-amd.ko` loaded and running in kobox
+- [x] Guest Linux `bzImage` boots through virtio-mmio to ext4 rootfs
+- [x] `/sbin/init` executes inside the guest
 
 ### ext4 over virtio-blk
 
@@ -165,7 +173,7 @@ KOBOX_PACHAOS_BAR0_SIZE=0x1000
 5. SATA (AHCI) — storage shim shared with NVMe
 6. NVIDIA GPU — `init_module` confirmed passing; rest TBD
 7. Runtime generalization — platform facets, host interfaces, subsystem-owned symbol registration
-8. Non-driver modules — filesystems done, next: security, sound, KVM
+8. Non-driver modules — filesystems done, KVM done (Linux guest to `/sbin/init`), next: security, sound
 
 ---
 

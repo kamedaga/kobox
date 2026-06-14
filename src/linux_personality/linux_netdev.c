@@ -1,6 +1,7 @@
 #include "kobox/shim.h"
 
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,12 @@ unsigned int nr_cpu_ids = 1;
 unsigned long this_cpu_off = 0;
 char pernet_ops_rwsem[64];
 static kb_netdev_record_t netdev_records[KB_NETDEV_TRACKED_MAX];
+typedef struct kb_percpu_alloc_record {
+    void *base;
+    void *relative;
+} kb_percpu_alloc_record_t;
+
+static kb_percpu_alloc_record_t percpu_alloc_records[256];
 static atomic_flag rwsem_records_lock = ATOMIC_FLAG_INIT;
 static kb_rwsem_record_t *rwsem_records;
 
@@ -121,12 +128,52 @@ void *kb_alloc_percpu_gfp(size_t size, size_t align, unsigned int flags)
 {
     (void)align;
     (void)flags;
-    return calloc(1, size);
+    void *base = calloc(1, size);
+    if (base == NULL) {
+        return NULL;
+    }
+    void *relative = base;
+    unsigned long kernel_gs = kb_shim_current_kernel_gs();
+    if (kernel_gs != 0) {
+        relative = (void *)((uintptr_t)base - (uintptr_t)kernel_gs);
+    }
+    const char *trace_fs = getenv("KOBOX_TRACE_FS");
+    if (trace_fs != NULL && trace_fs[0] != '\0' && strcmp(trace_fs, "0") != 0) {
+        fprintf(stderr,
+            "kobox-core: alloc_percpu size=%zu align=%zu base=%p relative=%p kernel_gs=0x%lx\n",
+            size,
+            align,
+            base,
+            relative,
+            kernel_gs);
+    }
+    for (size_t i = 0; i < sizeof(percpu_alloc_records) / sizeof(percpu_alloc_records[0]); i++) {
+        if (percpu_alloc_records[i].base == NULL) {
+            percpu_alloc_records[i].base = base;
+            percpu_alloc_records[i].relative = relative;
+            break;
+        }
+    }
+    return relative;
 }
 
 void kb_free_percpu(void *ptr)
 {
-    free(ptr);
+    if (ptr == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(percpu_alloc_records) / sizeof(percpu_alloc_records[0]); i++) {
+        if (percpu_alloc_records[i].base == ptr || percpu_alloc_records[i].relative == ptr) {
+            void *base = percpu_alloc_records[i].base;
+            const char *trace_fs = getenv("KOBOX_TRACE_FS");
+            if (trace_fs != NULL && trace_fs[0] != '\0' && strcmp(trace_fs, "0") != 0) {
+                fprintf(stderr, "kobox-core: free_percpu ptr=%p base=%p\n", ptr, base);
+            }
+            memset(&percpu_alloc_records[i], 0, sizeof(percpu_alloc_records[i]));
+            free(base);
+            return;
+        }
+    }
 }
 
 int kb_rtnl_link_register(void *ops)

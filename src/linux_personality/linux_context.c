@@ -16,6 +16,14 @@
 
 static kb_device_backend_t *current_backend;
 
+uintptr_t kb_ref_stack_chk_guard = 0x6b6f626f785f7370ull;
+uint32_t kb_preempt_count;
+uint32_t kb_num_online_cpus = 1;
+uint64_t kb_cpu_possible_mask = 1;
+uint64_t kb_cpu_present_mask = 1;
+uint64_t kb_user_ptr_max = UINTPTR_MAX;
+uint32_t kb_cpu_number;
+
 void kb_shim_set_device_backend(kb_device_backend_t *backend)
 {
     current_backend = backend;

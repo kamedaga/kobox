@@ -25,6 +25,7 @@ kb_status_t kb_module_open_image(
 kb_status_t kb_module_call_init(kb_module_t *module, int *out_result);
 kb_status_t kb_module_call_cleanup(kb_module_t *module);
 kb_status_t kb_module_find_symbol(kb_module_t *module, const char *name, void **out_address);
+void kb_module_debug_describe_address(const void *address);
 int kb_module_run_registered_ops_smoke(void);
 void kb_module_close(kb_module_t *module);
 

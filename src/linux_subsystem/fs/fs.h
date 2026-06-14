@@ -84,6 +84,8 @@ typedef struct kb_fs_mount_path_probe {
     uint64_t get_tree_bdev_calls;
 } kb_fs_mount_path_probe_t;
 
+extern unsigned char kb_fs_subsystem_blockdev_superblock[];
+
 typedef struct kb_fs_block_device kb_fs_block_device_t;
 
 typedef int (*kb_fs_block_read_fn)(void *ctx, uint64_t offset, void *buffer, size_t size);
@@ -163,6 +165,9 @@ void kb_fs_block_device_destroy(kb_fs_block_device_t *device);
 int kb_fs_subsystem_set_mount_probe_block_device(kb_fs_block_device_t *device);
 int kb_fs_subsystem_get_tree_bdev(void *fs_context, int (*fill_super)(void *super_block, void *fs_context));
 void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned int block_size, unsigned int gfp);
+void kb_fs_subsystem_buffer_head_put(void *buffer_head);
+void kb_fs_subsystem_mark_buffer_dirty(void *buffer_head);
+int kb_fs_subsystem_sync_dirty_buffer(void *buffer_head);
 void *kb_fs_subsystem_bio_alloc_bioset(void *bdev, unsigned short nr_vecs, unsigned int opf, unsigned int gfp, void *bioset);
 int kb_fs_subsystem_bio_add_folio(void *bio, void *folio, size_t len, size_t offset);
 int kb_fs_subsystem_bio_add_page(void *bio, void *page, unsigned int len, unsigned int offset);
@@ -179,12 +184,16 @@ int kb_fs_subsystem_bio_result(void *bio);
 int kb_fs_subsystem_bio_snapshot(void *bio, kb_fs_bio_snapshot_t *out_snapshot);
 void *kb_fs_subsystem_iget_locked(void *super_block, unsigned long inode_number);
 void *kb_fs_subsystem_new_inode(void *super_block);
+int kb_fs_subsystem_inode_init_owner(void *idmap, void *inode, void *dir, unsigned short mode);
 void *kb_fs_subsystem_d_make_root(void *inode);
 void *kb_fs_subsystem_d_splice_alias(void *inode, void *dentry);
+void kb_fs_subsystem_d_instantiate(void *dentry, void *inode);
+void kb_fs_subsystem_d_instantiate_new(void *dentry, void *inode);
 void kb_fs_subsystem_iget_failed(void *inode);
 void kb_fs_subsystem_unlock_new_inode(void *inode);
 void kb_fs_subsystem_set_nlink(void *inode, unsigned int nlink);
 int kb_fs_subsystem_fscrypt_match_name(const void *fname, const void *de_name, unsigned int de_name_len);
+int kb_fs_subsystem_fscrypt_setup_filename(void *dir, const void *qstr, int lookup, void *fname);
 long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter);
 long kb_fs_subsystem_generic_write_checks(void *kiocb, void *iter);
 long kb_fs_subsystem_generic_perform_write(void *kiocb, void *iter);

@@ -18,7 +18,7 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"_raw_write_unlock", (void *)(uintptr_t)&kb_noop_stub},
     {"__SCT__preempt_schedule", (void *)(uintptr_t)&kb_noop_stub},
     {"__SCT__preempt_schedule_notrace", (void *)(uintptr_t)&kb_noop_stub},
-    {"___ratelimit", (void *)(uintptr_t)&kb_return_zero},
+    {"___ratelimit", (void *)(uintptr_t)&kb_return_one},
     {"__do_once_done", (void *)(uintptr_t)&kb_noop_stub},
     {"__do_once_start", (void *)(uintptr_t)&kb_return_zero},
     {"__dynamic_pr_debug", (void *)(uintptr_t)&kb_noop_stub},

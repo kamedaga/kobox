@@ -14,12 +14,14 @@
 #include "linux_subsystem/block/block.h"
 
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #if !defined(_WIN32)
 #include <signal.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #if defined(__x86_64__)
 #include <ucontext.h>
 #endif
@@ -32,6 +34,13 @@ enum {
     KB_EXT4_MULTI_PAYLOAD_SIZE = 3072,
     KB_EXT4_BOUNDARY_OFFSET = 900,
     KB_EXT4_BOUNDARY_SIZE = 512,
+    KB_EXT4_EXTEND_INITIAL_SIZE = 2048,
+    KB_EXT4_EXTEND_WRITE_OFFSET = 2048,
+    KB_EXT4_EXTEND_WRITE_SIZE = 512,
+    KB_EXT4_LARGE_BLOCK_SIZE = 4096,
+    KB_EXT4_LARGE_LOGICAL_BLOCK = 50,
+    KB_EXT4_LARGE_OFFSET = KB_EXT4_LARGE_BLOCK_SIZE * KB_EXT4_LARGE_LOGICAL_BLOCK,
+    KB_EXT4_LARGE_WRITE_SIZE = 512,
     KB_EXT4_FAKE_FILE_BYTES = 512,
     KB_EXT4_FAKE_KIOCB_BYTES = 128,
     KB_EXT4_FAKE_IOV_ITER_BYTES = 128,
@@ -39,10 +48,12 @@ enum {
     KB_EXT4_FAKE_DENTRY_BYTES = 512,
     KB_EXT4_READDIR_OUTPUT_MAX = 1024,
     KB_EXT4_DENTRY_FLAGS_OFFSET = 0x0,
+    KB_EXT4_DENTRY_PARENT_OFFSET = 0x18,
     KB_EXT4_DENTRY_NAME_HASH_OFFSET = 0x20,
     KB_EXT4_DENTRY_NAME_LEN_OFFSET = 0x24,
     KB_EXT4_DENTRY_NAME_PTR_OFFSET = 0x28,
     KB_EXT4_DENTRY_INODE_OFFSET = 0x38,
+    KB_EXT4_FILE_PATH_DENTRY_OFFSET = 0x18,
     KB_EXT4_FILE_MAPPING_OFFSET = 0x20,
     KB_EXT4_FILE_INODE_OFFSET = 0x28,
     KB_EXT4_KIOCB_FILE_OFFSET = 0x0,
@@ -50,6 +61,9 @@ enum {
     KB_EXT4_KIOCB_FLAGS_OFFSET = 0x20,
     KB_EXT4_IOV_ITER_COUNT_OFFSET = 0x18,
     KB_EXT4_IOV_ITER_BUFFER_OFFSET = 0x20,
+    KB_EXT4_INODE_SIZE_OFFSET = 0x50,
+    KB_EXT4_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET = 0x128,
+    KB_EXT4_EXTENT_HEADER_MAGIC = 0xf30a,
 };
 
 typedef struct loaded_module {
@@ -73,11 +87,21 @@ typedef struct ext4_operation_probe {
     void *readdir;
     void *file_read_iter;
     void *file_write_iter;
+    void *file_fsync;
     void *lookup;
+    void *create;
+    void *unlink;
+    void *rename2;
+    void *setattr;
     int dir_operations_has_readdir;
     int file_operations_has_read_iter;
     int file_operations_has_write_iter;
+    int file_operations_has_fsync;
     int dir_inode_operations_has_lookup;
+    int dir_inode_operations_has_create;
+    int dir_inode_operations_has_unlink;
+    int dir_inode_operations_has_rename2;
+    int file_inode_operations_has_setattr;
 } ext4_operation_probe_t;
 
 typedef struct ext4_dir_context {
@@ -109,20 +133,48 @@ static void fill_boundary_payload(uint8_t *buffer, size_t size)
     }
 }
 
+static void fill_extend_payload(uint8_t *buffer, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)('A' + ((i * 7u) % 26u));
+    }
+}
+
+static void fill_large_payload(uint8_t *buffer, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)('0' + ((i * 3u) % 10u));
+    }
+}
+
 #if !defined(_WIN32) && defined(__x86_64__)
 static void segv_handler(int signal_number, siginfo_t *info, void *uctx)
 {
     ucontext_t *context = (ucontext_t *)uctx;
     void *rip = (void *)context->uc_mcontext.gregs[REG_RIP];
+    uintptr_t rsp = (uintptr_t)context->uc_mcontext.gregs[REG_RSP];
     void *rdi = (void *)context->uc_mcontext.gregs[REG_RDI];
     void *rsi = (void *)context->uc_mcontext.gregs[REG_RSI];
     void *rbp = (void *)context->uc_mcontext.gregs[REG_RBP];
     void *r12 = (void *)context->uc_mcontext.gregs[REG_R12];
-    char buffer[256];
+    void *external_target = kb_module_current_external_call_target();
+    void *stack_external_target = NULL;
+    if (rsp != 0) {
+        memcpy(&stack_external_target, (const void *)(rsp + 0x208u), sizeof(stack_external_target));
+    }
+    Dl_info dl_info;
+    memset(&dl_info, 0, sizeof(dl_info));
+    (void)dladdr(rip, &dl_info);
+    char buffer[512];
     int length = snprintf(buffer, sizeof(buffer),
-        "kobox-ext4-real-ops: signal=%d rip=%p fault=%p rdi=%p rsi=%p rbp=%p r12=%p\n",
+        "kobox-ext4-real-ops: signal=%d rip=%p symbol=%s base=%p offset=0x%llx external_target=%p stack_external_target=%p fault=%p rdi=%p rsi=%p rbp=%p r12=%p\n",
         signal_number,
         rip,
+        dl_info.dli_sname == NULL ? "" : dl_info.dli_sname,
+        dl_info.dli_fbase,
+        dl_info.dli_fbase == NULL ? 0ull : (unsigned long long)((uintptr_t)rip - (uintptr_t)dl_info.dli_fbase),
+        external_target,
+        stack_external_target,
         info == NULL ? NULL : info->si_addr,
         rdi,
         rsi,
@@ -144,6 +196,7 @@ static void install_signal_diagnostics(void)
     (void)sigaction(SIGILL, &action, NULL);
     (void)sigaction(SIGBUS, &action, NULL);
     (void)sigaction(SIGABRT, &action, NULL);
+    (void)sigaction(SIGALRM, &action, NULL);
 }
 #else
 static void install_signal_diagnostics(void)
@@ -199,6 +252,34 @@ static int write_file_bytes(const char *path, const void *data, size_t size)
     return ok;
 }
 
+static int write_sparse_large_file(const char *path)
+{
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) {
+        return 0;
+    }
+    static const long blocks[] = {0, 10, 20, 30, 40, 50};
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
+        long offset = blocks[i] * KB_EXT4_LARGE_BLOCK_SIZE;
+        if (fseek(file, offset, SEEK_SET) != 0 || fputc('X', file) == EOF) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        uint8_t tail[KB_EXT4_LARGE_WRITE_SIZE];
+        memset(tail, 'X', sizeof(tail));
+        if (fseek(file, KB_EXT4_LARGE_OFFSET, SEEK_SET) != 0 ||
+            fwrite(tail, 1, sizeof(tail), file) != sizeof(tail))
+        {
+            ok = 0;
+        }
+    }
+    fclose(file);
+    return ok;
+}
+
 static size_t read_file_bytes(const char *path, void *buffer, size_t capacity)
 {
     FILE *file = fopen(path, "rb");
@@ -208,6 +289,26 @@ static size_t read_file_bytes(const char *path, void *buffer, size_t capacity)
     size_t size = fread(buffer, 1, capacity, file);
     fclose(file);
     return size;
+}
+
+static int file_range_matches(const char *path, uint64_t offset, const void *expected, size_t expected_size)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+    int ok = 0;
+    uint8_t *buffer = malloc(expected_size);
+    if (buffer != NULL &&
+        offset <= (uint64_t)LONG_MAX &&
+        fseek(file, (long)offset, SEEK_SET) == 0 &&
+        fread(buffer, 1, expected_size, file) == expected_size)
+    {
+        ok = memcmp(buffer, expected, expected_size) == 0;
+    }
+    free(buffer);
+    fclose(file);
+    return ok;
 }
 
 static int run_command(const char *command)
@@ -262,7 +363,31 @@ static int prepare_ext4_image(const char *work_dir, const char *image_path, cons
     {
         return 0;
     }
-    return run_commandf("debugfs -w -R 'write %s /multi.txt' '%s' >/dev/null 2>&1", multi_path, image_path, "");
+    if (!run_commandf("debugfs -w -R 'write %s /multi.txt' '%s' >/dev/null 2>&1", multi_path, image_path, "")) {
+        return 0;
+    }
+
+    uint8_t extend_payload[KB_EXT4_EXTEND_INITIAL_SIZE];
+    memset(extend_payload, 'E', sizeof(extend_payload));
+    char extend_path[KB_EXT4_COMMAND_MAX];
+    length = snprintf(extend_path, sizeof(extend_path), "%s/seed-extend.bin", work_dir);
+    if (length <= 0 ||
+        (size_t)length >= sizeof(extend_path) ||
+        !write_file_bytes(extend_path, extend_payload, sizeof(extend_payload)) ||
+        !run_commandf("debugfs -w -R 'write %s /extend.bin' '%s' >/dev/null 2>&1", extend_path, image_path, ""))
+    {
+        return 0;
+    }
+
+    char large_path[KB_EXT4_COMMAND_MAX];
+    length = snprintf(large_path, sizeof(large_path), "%s/seed-large.bin", work_dir);
+    if (length <= 0 ||
+        (size_t)length >= sizeof(large_path) ||
+        !write_sparse_large_file(large_path))
+    {
+        return 0;
+    }
+    return run_commandf("debugfs -w -R 'write %s /large.bin' '%s' >/dev/null 2>&1", large_path, image_path, "");
 }
 
 static kb_status_t load_module(
@@ -346,6 +471,67 @@ static void write_u32_field(void *base, size_t offset, uint32_t value)
 static void write_u64_field(void *base, size_t offset, uint64_t value)
 {
     memcpy((uint8_t *)base + offset, &value, sizeof(value));
+}
+
+static int ext4_inode_extent_depth(const void *inode)
+{
+    if (inode == NULL) {
+        return -1;
+    }
+    const uint8_t *i_block = (const uint8_t *)inode - KB_EXT4_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET;
+    uint16_t magic = 0;
+    uint16_t depth = 0;
+    memcpy(&magic, i_block, sizeof(magic));
+    if (magic != KB_EXT4_EXTENT_HEADER_MAGIC) {
+        return -1;
+    }
+    memcpy(&depth, i_block + 0x6, sizeof(depth));
+    return depth;
+}
+
+static uint64_t ext4_inode_size(const void *inode)
+{
+    uint64_t size = 0;
+    if (inode != NULL) {
+        memcpy(&size, (const uint8_t *)inode + KB_EXT4_INODE_SIZE_OFFSET, sizeof(size));
+    }
+    return size;
+}
+
+static int verify_image_file_range(
+    const char *image_path,
+    const char *work_dir,
+    const char *fs_path,
+    uint64_t offset,
+    const void *expected,
+    size_t expected_size,
+    const char *label)
+{
+    char dump_path[KB_EXT4_COMMAND_MAX];
+    int length = snprintf(dump_path, sizeof(dump_path), "%s/verify-%s.bin", work_dir, label);
+    if (length <= 0 || (size_t)length >= sizeof(dump_path)) {
+        return -22;
+    }
+    (void)run_commandf("rm -f '%s'", dump_path, "", "");
+    char command[KB_EXT4_COMMAND_MAX];
+    length = snprintf(command,
+        sizeof(command),
+        "debugfs -R 'dump %s %s' '%s' >/dev/null 2>&1",
+        fs_path,
+        dump_path,
+        image_path);
+    if (length <= 0 || (size_t)length >= sizeof(command) || !run_command(command)) {
+        return -5;
+    }
+    if (!file_range_matches(dump_path, offset, expected, expected_size)) {
+        return -5;
+    }
+    printf("module-vfs: image-verify label=%s path=%s offset=%llu bytes=%zu\n",
+        label,
+        fs_path,
+        (unsigned long long)offset,
+        expected_size);
+    return 0;
 }
 
 static int ext4_capture_dirent(
@@ -448,6 +634,7 @@ static int probe_ext4_lookup_name(
     }
 
     write_u32_field(dentry, KB_EXT4_DENTRY_FLAGS_OFFSET, 0);
+    write_pointer_field(dentry, KB_EXT4_DENTRY_PARENT_OFFSET, mount_probe->root_dentry);
     write_u32_field(dentry, KB_EXT4_DENTRY_NAME_HASH_OFFSET, 0);
     write_u32_field(dentry, KB_EXT4_DENTRY_NAME_LEN_OFFSET, (uint32_t)strlen(lookup_name));
     write_pointer_field(dentry, KB_EXT4_DENTRY_NAME_PTR_OFFSET, (void *)(uintptr_t)lookup_name);
@@ -475,6 +662,162 @@ static int probe_ext4_lookup_name(
     }
     free(dentry);
     return ok ? 0 : -5;
+}
+
+static int probe_ext4_create_name(
+    kb_module_t *module,
+    const ext4_operation_probe_t *operation_probe,
+    const kb_fs_mount_path_probe_t *mount_probe,
+    const char *create_name,
+    void **out_inode,
+    void **out_dentry)
+{
+    if (module == NULL ||
+        operation_probe == NULL ||
+        mount_probe == NULL ||
+        operation_probe->create == NULL ||
+        mount_probe->root_inode == NULL ||
+        create_name == NULL)
+    {
+        return -22;
+    }
+    if (out_inode != NULL) {
+        *out_inode = NULL;
+    }
+    if (out_dentry != NULL) {
+        *out_dentry = NULL;
+    }
+
+    void *dentry = calloc(1, KB_EXT4_FAKE_DENTRY_BYTES);
+    if (dentry == NULL) {
+        return -12;
+    }
+
+    write_u32_field(dentry, KB_EXT4_DENTRY_FLAGS_OFFSET, 0);
+    write_pointer_field(dentry, KB_EXT4_DENTRY_PARENT_OFFSET, mount_probe->root_dentry);
+    write_u32_field(dentry, KB_EXT4_DENTRY_NAME_HASH_OFFSET, (uint32_t)strlen(create_name));
+    write_u32_field(dentry, KB_EXT4_DENTRY_NAME_LEN_OFFSET, (uint32_t)strlen(create_name));
+    write_pointer_field(dentry, KB_EXT4_DENTRY_NAME_PTR_OFFSET, (void *)(uintptr_t)create_name);
+
+    unsigned long old_gs = 0;
+    unsigned long kernel_gs = kb_module_kernel_gs_for_address(operation_probe->create);
+    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
+    int (*create_fn)(void *, void *, void *, unsigned short, int) = NULL;
+    memcpy(&create_fn, &operation_probe->create, sizeof(create_fn));
+    int result = create_fn(NULL, mount_probe->root_inode, dentry, 0100644, 0);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+
+    void *inode = read_pointer_field(dentry, KB_EXT4_DENTRY_INODE_OFFSET);
+    printf("module-vfs: create name=%s result=%d dentry=%p inode=%p\n",
+        create_name,
+        result,
+        dentry,
+        inode);
+
+    int ok = result == 0 && inode != NULL;
+    if (ok && out_inode != NULL) {
+        *out_inode = inode;
+    }
+    if (ok && out_dentry != NULL) {
+        *out_dentry = dentry;
+    } else {
+        free(dentry);
+    }
+    return ok ? 0 : result;
+}
+
+static int probe_ext4_unlink_dentry(
+    kb_module_t *module,
+    const ext4_operation_probe_t *operation_probe,
+    const kb_fs_mount_path_probe_t *mount_probe,
+    const char *name,
+    void *dentry)
+{
+    if (module == NULL ||
+        operation_probe == NULL ||
+        operation_probe->unlink == NULL ||
+        mount_probe == NULL ||
+        mount_probe->root_inode == NULL ||
+        name == NULL ||
+        dentry == NULL)
+    {
+        return -22;
+    }
+
+    unsigned long old_gs = 0;
+    unsigned long kernel_gs = kb_module_kernel_gs_for_address(operation_probe->unlink);
+    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
+    int (*unlink_fn)(void *, void *) = NULL;
+    memcpy(&unlink_fn, &operation_probe->unlink, sizeof(unlink_fn));
+    int result = unlink_fn(mount_probe->root_inode, dentry);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+
+    printf("module-vfs: unlink name=%s result=%d dentry=%p inode=%p\n",
+        name,
+        result,
+        dentry,
+        read_pointer_field(dentry, KB_EXT4_DENTRY_INODE_OFFSET));
+    return result;
+}
+
+static int probe_ext4_rename_dentry(
+    kb_module_t *module,
+    const ext4_operation_probe_t *operation_probe,
+    const kb_fs_mount_path_probe_t *mount_probe,
+    const char *old_name,
+    void *old_dentry,
+    const char *new_name)
+{
+    if (module == NULL ||
+        operation_probe == NULL ||
+        operation_probe->rename2 == NULL ||
+        mount_probe == NULL ||
+        mount_probe->root_inode == NULL ||
+        old_name == NULL ||
+        old_dentry == NULL ||
+        new_name == NULL)
+    {
+        return -22;
+    }
+
+    void *new_dentry = calloc(1, KB_EXT4_FAKE_DENTRY_BYTES);
+    if (new_dentry == NULL) {
+        return -12;
+    }
+    write_u32_field(new_dentry, KB_EXT4_DENTRY_FLAGS_OFFSET, 0);
+    write_pointer_field(new_dentry, KB_EXT4_DENTRY_PARENT_OFFSET, mount_probe->root_dentry);
+    write_u32_field(new_dentry, KB_EXT4_DENTRY_NAME_HASH_OFFSET, (uint32_t)strlen(new_name));
+    write_u32_field(new_dentry, KB_EXT4_DENTRY_NAME_LEN_OFFSET, (uint32_t)strlen(new_name));
+    write_pointer_field(new_dentry, KB_EXT4_DENTRY_NAME_PTR_OFFSET, (void *)(uintptr_t)new_name);
+
+    unsigned long old_gs = 0;
+    unsigned long kernel_gs = kb_module_kernel_gs_for_address(operation_probe->rename2);
+    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
+    int (*rename2_fn)(void *, void *, void *, void *, void *, unsigned int) = NULL;
+    memcpy(&rename2_fn, &operation_probe->rename2, sizeof(rename2_fn));
+    int result = rename2_fn(NULL,
+        mount_probe->root_inode,
+        old_dentry,
+        mount_probe->root_inode,
+        new_dentry,
+        0);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+
+    printf("module-vfs: rename old=%s new=%s result=%d old_dentry=%p new_dentry=%p new_inode=%p\n",
+        old_name,
+        new_name,
+        result,
+        old_dentry,
+        new_dentry,
+        read_pointer_field(new_dentry, KB_EXT4_DENTRY_INODE_OFFSET));
+    free(new_dentry);
+    return result;
 }
 
 static int probe_ext4_file_read_iter(
@@ -608,6 +951,62 @@ static int probe_ext4_file_write_iter(
     return result == (long)write_size ? 0 : -5;
 }
 
+static int probe_ext4_file_fsync(
+    kb_module_t *module,
+    const ext4_operation_probe_t *operation_probe,
+    void *file_inode,
+    int64_t start,
+    int64_t end,
+    int datasync,
+    const char *label)
+{
+    if (module == NULL ||
+        operation_probe == NULL ||
+        operation_probe->file_fsync == NULL ||
+        file_inode == NULL ||
+        label == NULL)
+    {
+        return -22;
+    }
+
+    void *file = calloc(1, KB_EXT4_FAKE_FILE_BYTES);
+    void *mapping = calloc(1, KB_EXT4_FAKE_MAPPING_BYTES);
+    void *dentry = calloc(1, KB_EXT4_FAKE_DENTRY_BYTES);
+    if (file == NULL || mapping == NULL || dentry == NULL) {
+        free(file);
+        free(mapping);
+        free(dentry);
+        return -12;
+    }
+
+    write_pointer_field(dentry, 0, file_inode);
+    write_pointer_field(file, KB_EXT4_FILE_PATH_DENTRY_OFFSET, dentry);
+    write_pointer_field(file, KB_EXT4_FILE_MAPPING_OFFSET, mapping);
+    write_pointer_field(file, KB_EXT4_FILE_INODE_OFFSET, file_inode);
+
+    unsigned long old_gs = 0;
+    unsigned long kernel_gs = kb_module_kernel_gs_for_address(operation_probe->file_fsync);
+    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
+    int (*fsync_fn)(void *, int64_t, int64_t, int) = NULL;
+    memcpy(&fsync_fn, &operation_probe->file_fsync, sizeof(fsync_fn));
+    int result = fsync_fn(file, start, end, datasync);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+
+    printf("module-vfs: fsync label=%s start=%lld end=%lld datasync=%d result=%d\n",
+        label,
+        (long long)start,
+        (long long)end,
+        datasync,
+        result);
+
+    free(mapping);
+    free(dentry);
+    free(file);
+    return result == 0 ? 0 : -5;
+}
+
 static int probe_ext4_operation_tables(kb_module_t *module, ext4_operation_probe_t *out_probe)
 {
     if (module == NULL || out_probe == NULL) {
@@ -621,7 +1020,12 @@ static int probe_ext4_operation_tables(kb_module_t *module, ext4_operation_probe
         !module_symbol(module, "ext4_readdir", &out_probe->readdir) ||
         !module_symbol(module, "ext4_file_read_iter", &out_probe->file_read_iter) ||
         !module_symbol(module, "ext4_file_write_iter", &out_probe->file_write_iter) ||
-        !module_symbol(module, "ext4_lookup", &out_probe->lookup))
+        !module_symbol(module, "ext4_sync_file", &out_probe->file_fsync) ||
+        !module_symbol(module, "ext4_lookup", &out_probe->lookup) ||
+        !module_symbol(module, "ext4_create", &out_probe->create) ||
+        !module_symbol(module, "ext4_unlink", &out_probe->unlink) ||
+        !module_symbol(module, "ext4_rename2", &out_probe->rename2) ||
+        !module_symbol(module, "ext4_setattr", &out_probe->setattr))
     {
         return 0;
     }
@@ -632,13 +1036,28 @@ static int probe_ext4_operation_tables(kb_module_t *module, ext4_operation_probe
         table_contains_pointer(out_probe->file_operations, 256u, out_probe->file_read_iter);
     out_probe->file_operations_has_write_iter =
         table_contains_pointer(out_probe->file_operations, 256u, out_probe->file_write_iter);
+    out_probe->file_operations_has_fsync =
+        table_contains_pointer(out_probe->file_operations, 256u, out_probe->file_fsync);
     out_probe->dir_inode_operations_has_lookup =
         table_contains_pointer(out_probe->dir_inode_operations, 256u, out_probe->lookup);
+    out_probe->dir_inode_operations_has_create =
+        table_contains_pointer(out_probe->dir_inode_operations, 256u, out_probe->create);
+    out_probe->dir_inode_operations_has_unlink =
+        table_contains_pointer(out_probe->dir_inode_operations, 256u, out_probe->unlink);
+    out_probe->dir_inode_operations_has_rename2 =
+        table_contains_pointer(out_probe->dir_inode_operations, 256u, out_probe->rename2);
+    out_probe->file_inode_operations_has_setattr =
+        table_contains_pointer(out_probe->file_inode_operations, 256u, out_probe->setattr);
 
     return out_probe->dir_operations_has_readdir &&
         out_probe->file_operations_has_read_iter &&
         out_probe->file_operations_has_write_iter &&
-        out_probe->dir_inode_operations_has_lookup;
+        out_probe->file_operations_has_fsync &&
+        out_probe->dir_inode_operations_has_lookup &&
+        out_probe->dir_inode_operations_has_create &&
+        out_probe->dir_inode_operations_has_unlink &&
+        out_probe->dir_inode_operations_has_rename2 &&
+        out_probe->file_inode_operations_has_setattr;
 }
 
 static kb_status_t ext4_mount(ext4_ipc_target_t *target, kb_fs_ipc_request_t *request)
@@ -959,6 +1378,13 @@ static const char *mount_path_stop_reason(const kb_fs_mount_path_probe_t *probe)
 int main(int argc, char **argv)
 {
     install_signal_diagnostics();
+    const char *alarm_seconds_env = getenv("KOBOX_EXT4_ALARM_SECONDS");
+    if (alarm_seconds_env != NULL && alarm_seconds_env[0] != '\0') {
+        unsigned long seconds = strtoul(alarm_seconds_env, NULL, 10);
+        if (seconds > 0 && seconds < 3600) {
+            alarm((unsigned int)seconds);
+        }
+    }
 
     const char *deps[KB_EXT4_DEPS_MAX];
     size_t dep_count = 0;
@@ -1077,17 +1503,27 @@ int main(int argc, char **argv)
         operation_probe.dir_operations,
         operation_probe.readdir,
         operation_probe.dir_operations_has_readdir);
-    printf("module-vfs: file_operations=%p read_iter=%p write_iter=%p linked=%d/%d\n",
+    printf("module-vfs: file_operations=%p read_iter=%p write_iter=%p fsync=%p linked=%d/%d/%d\n",
         operation_probe.file_operations,
         operation_probe.file_read_iter,
         operation_probe.file_write_iter,
+        operation_probe.file_fsync,
         operation_probe.file_operations_has_read_iter,
-        operation_probe.file_operations_has_write_iter);
-    printf("module-vfs: dir_inode_operations=%p lookup=%p linked=%d file_inode_operations=%p\n",
+        operation_probe.file_operations_has_write_iter,
+        operation_probe.file_operations_has_fsync);
+    printf("module-vfs: dir_inode_operations=%p lookup=%p create=%p unlink=%p rename2=%p linked=%d/%d/%d/%d file_inode_operations=%p setattr=%p linked=%d\n",
         operation_probe.dir_inode_operations,
         operation_probe.lookup,
+        operation_probe.create,
+        operation_probe.unlink,
+        operation_probe.rename2,
         operation_probe.dir_inode_operations_has_lookup,
-        operation_probe.file_inode_operations);
+        operation_probe.dir_inode_operations_has_create,
+        operation_probe.dir_inode_operations_has_unlink,
+        operation_probe.dir_inode_operations_has_rename2,
+        operation_probe.file_inode_operations,
+        operation_probe.setattr,
+        operation_probe.file_inode_operations_has_setattr);
 
     kb_fs_type_snapshot_t snapshot;
     if (kb_fs_subsystem_type_snapshot("ext4", &snapshot) != 0 || snapshot.fs_type == NULL) {
@@ -1205,6 +1641,113 @@ int main(int argc, char **argv)
         kb_device_backend_destroy(backend);
         return 1;
     }
+    int journal_enabled = strstr(mkfs_features, "has_journal") != NULL &&
+        strstr(mkfs_features, "^has_journal") == NULL;
+    if (journal_enabled) {
+        printf("module-vfs: metadata-mutation skipped reason=journal-boundary\n");
+    } else {
+        void *created_inode = NULL;
+        void *created_dentry = NULL;
+        int create_probe_result = probe_ext4_create_name(
+            ext4_module.module,
+            &operation_probe,
+            &mount_path_probe,
+            "created.txt",
+            &created_inode,
+            &created_dentry);
+        if (create_probe_result != 0) {
+            fprintf(stderr, "ext4 module create operation probe failed name=created.txt result=%d\n", create_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        void *created_lookup_inode = NULL;
+        lookup_probe_result = probe_ext4_lookup_name(
+            ext4_module.module,
+            &operation_probe,
+            &mount_path_probe,
+            "created.txt",
+            &created_lookup_inode);
+        if (lookup_probe_result != 0) {
+            fprintf(stderr, "ext4 module lookup operation probe failed name=created.txt result=%d\n", lookup_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        int unlink_probe_result = probe_ext4_unlink_dentry(
+            ext4_module.module,
+            &operation_probe,
+            &mount_path_probe,
+            "created.txt",
+            created_dentry);
+        if (unlink_probe_result != 0) {
+            fprintf(stderr, "ext4 module unlink operation probe failed name=created.txt result=%d\n", unlink_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        free(created_dentry);
+        void *rename_inode = NULL;
+        void *rename_dentry = NULL;
+        create_probe_result = probe_ext4_create_name(
+            ext4_module.module,
+            &operation_probe,
+            &mount_path_probe,
+            "rename-src.txt",
+            &rename_inode,
+            &rename_dentry);
+        if (create_probe_result != 0) {
+            fprintf(stderr, "ext4 module create operation probe failed name=rename-src.txt result=%d\n", create_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        int rename_probe_result = probe_ext4_rename_dentry(
+            ext4_module.module,
+            &operation_probe,
+            &mount_path_probe,
+            "rename-src.txt",
+            rename_dentry,
+            "renamed.txt");
+        if (rename_probe_result != 0) {
+            fprintf(stderr, "ext4 module rename operation probe failed result=%d\n", rename_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        void *renamed_lookup_inode = NULL;
+        lookup_probe_result = probe_ext4_lookup_name(
+            ext4_module.module,
+            &operation_probe,
+            &mount_path_probe,
+            "renamed.txt",
+            &renamed_lookup_inode);
+        if (lookup_probe_result != 0) {
+            fprintf(stderr, "ext4 module lookup operation probe failed name=renamed.txt result=%d\n", lookup_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        free(rename_dentry);
+    }
     void *hello_inode = NULL;
     lookup_probe_result = probe_ext4_lookup_name(
         ext4_module.module,
@@ -1266,6 +1809,60 @@ int main(int argc, char **argv)
         "hello-post-write");
     if (read_iter_probe_result != 0) {
         fprintf(stderr, "ext4 module read_iter post-write probe failed result=%d\n", read_iter_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    int fsync_probe_result = probe_ext4_file_fsync(
+        ext4_module.module,
+        &operation_probe,
+        hello_inode,
+        0,
+        (int64_t)(sizeof(kb_ext4_write_payload) - 2u),
+        0,
+        "hello-post-write");
+    if (fsync_probe_result != 0) {
+        fprintf(stderr, "ext4 module fsync operation probe failed result=%d\n", fsync_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    const uint8_t empty_payload = 0;
+    read_iter_probe_result = probe_ext4_file_read_iter(
+        ext4_module.module,
+        &operation_probe,
+        hello_inode,
+        &empty_payload,
+        0,
+        sizeof(kb_ext4_write_payload) - 1u,
+        "hello-eof");
+    if (read_iter_probe_result != 0) {
+        fprintf(stderr, "ext4 module eof read_iter probe failed result=%d\n", read_iter_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    if (vfio_nvme_bdf == NULL &&
+        vfio_virtio_blk_bdf == NULL &&
+        verify_image_file_range(
+            image_path,
+            work_dir,
+            "/hello.txt",
+            0,
+            kb_ext4_write_payload,
+            sizeof(kb_ext4_write_payload) - 1u,
+            "hello-post-write") != 0)
+    {
+        fprintf(stderr, "ext4 image persistence probe failed path=/hello.txt\n");
         kb_fs_subsystem_set_mount_probe_block_device(NULL);
         kb_fs_block_device_destroy(block_device);
         kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
@@ -1344,6 +1941,245 @@ int main(int argc, char **argv)
         kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
         kb_device_backend_destroy(backend);
         return 1;
+    }
+    fsync_probe_result = probe_ext4_file_fsync(
+        ext4_module.module,
+        &operation_probe,
+        multi_inode,
+        KB_EXT4_BOUNDARY_OFFSET,
+        KB_EXT4_BOUNDARY_OFFSET + KB_EXT4_BOUNDARY_SIZE - 1,
+        0,
+        "multi-boundary-post-write");
+    if (fsync_probe_result != 0) {
+        fprintf(stderr, "ext4 module multi-block fsync probe failed result=%d\n", fsync_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    if (vfio_nvme_bdf == NULL &&
+        vfio_virtio_blk_bdf == NULL &&
+        verify_image_file_range(
+            image_path,
+            work_dir,
+            "/multi.txt",
+            KB_EXT4_BOUNDARY_OFFSET,
+            boundary_payload,
+            sizeof(boundary_payload),
+            "multi-boundary-post-write") != 0)
+    {
+        fprintf(stderr, "ext4 image persistence probe failed path=/multi.txt\n");
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+
+    void *extend_inode = NULL;
+    lookup_probe_result = probe_ext4_lookup_name(
+        ext4_module.module,
+        &operation_probe,
+        &mount_path_probe,
+        "extend.bin",
+        &extend_inode);
+    if (lookup_probe_result != 0) {
+        fprintf(stderr, "ext4 module lookup operation probe failed name=extend.bin result=%d\n", lookup_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    printf("module-vfs: inode_size label=extend-before size=%llu\n",
+        (unsigned long long)ext4_inode_size(extend_inode));
+    const uint8_t empty_extend_payload = 0;
+    read_iter_probe_result = probe_ext4_file_read_iter(
+        ext4_module.module,
+        &operation_probe,
+        extend_inode,
+        &empty_extend_payload,
+        0,
+        KB_EXT4_EXTEND_WRITE_OFFSET,
+        "extend-eof-before");
+    if (read_iter_probe_result != 0) {
+        fprintf(stderr, "ext4 module extend eof read_iter probe failed result=%d\n", read_iter_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    uint8_t extend_payload[KB_EXT4_EXTEND_WRITE_SIZE];
+    fill_extend_payload(extend_payload, sizeof(extend_payload));
+    write_iter_probe_result = probe_ext4_file_write_iter(
+        ext4_module.module,
+        &operation_probe,
+        extend_inode,
+        extend_payload,
+        sizeof(extend_payload),
+        KB_EXT4_EXTEND_WRITE_OFFSET,
+        "extend-eof-write");
+    if (write_iter_probe_result != 0) {
+        fprintf(stderr, "ext4 module extend write_iter probe failed result=%d\n", write_iter_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    printf("module-vfs: inode_size label=extend-after size=%llu\n",
+        (unsigned long long)ext4_inode_size(extend_inode));
+    read_iter_probe_result = probe_ext4_file_read_iter(
+        ext4_module.module,
+        &operation_probe,
+        extend_inode,
+        extend_payload,
+        sizeof(extend_payload),
+        KB_EXT4_EXTEND_WRITE_OFFSET,
+        "extend-eof-post-write");
+    if (read_iter_probe_result != 0) {
+        fprintf(stderr, "ext4 module extend read_iter post-write probe failed result=%d\n", read_iter_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    fsync_probe_result = probe_ext4_file_fsync(
+        ext4_module.module,
+        &operation_probe,
+        extend_inode,
+        KB_EXT4_EXTEND_WRITE_OFFSET,
+        KB_EXT4_EXTEND_WRITE_OFFSET + KB_EXT4_EXTEND_WRITE_SIZE - 1,
+        0,
+        "extend-eof-post-write");
+    if (fsync_probe_result != 0) {
+        fprintf(stderr, "ext4 module extend fsync probe failed result=%d\n", fsync_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    void *large_inode = NULL;
+    lookup_probe_result = probe_ext4_lookup_name(
+        ext4_module.module,
+        &operation_probe,
+        &mount_path_probe,
+        "large.bin",
+        &large_inode);
+    if (lookup_probe_result != 0) {
+        fprintf(stderr, "ext4 module lookup operation probe failed name=large.bin result=%d\n", lookup_probe_result);
+        kb_fs_subsystem_set_mount_probe_block_device(NULL);
+        kb_fs_block_device_destroy(block_device);
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+        kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+        kb_device_backend_destroy(backend);
+        return 1;
+    }
+    int large_extent_depth = ext4_inode_extent_depth(large_inode);
+    printf("module-vfs: extent_depth name=large.bin depth=%d\n", large_extent_depth);
+    if (large_extent_depth > 0) {
+        const uint8_t large_initial = 'X';
+        read_iter_probe_result = probe_ext4_file_read_iter(
+            ext4_module.module,
+            &operation_probe,
+            large_inode,
+            &large_initial,
+            sizeof(large_initial),
+            KB_EXT4_LARGE_OFFSET,
+            "large-depth1-initial");
+        if (read_iter_probe_result != 0) {
+            fprintf(stderr, "ext4 module depth1 extent read_iter probe failed result=%d\n", read_iter_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+
+        uint8_t large_payload[KB_EXT4_LARGE_WRITE_SIZE];
+        fill_large_payload(large_payload, sizeof(large_payload));
+        write_iter_probe_result = probe_ext4_file_write_iter(
+            ext4_module.module,
+            &operation_probe,
+            large_inode,
+            large_payload,
+            sizeof(large_payload),
+            KB_EXT4_LARGE_OFFSET,
+            "large-depth1-write");
+        if (write_iter_probe_result != 0) {
+            fprintf(stderr, "ext4 module depth1 extent write_iter probe failed result=%d\n", write_iter_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        read_iter_probe_result = probe_ext4_file_read_iter(
+            ext4_module.module,
+            &operation_probe,
+            large_inode,
+            large_payload,
+            sizeof(large_payload),
+            KB_EXT4_LARGE_OFFSET,
+            "large-depth1-post-write");
+        if (read_iter_probe_result != 0) {
+            fprintf(stderr, "ext4 module depth1 extent read_iter post-write probe failed result=%d\n", read_iter_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        fsync_probe_result = probe_ext4_file_fsync(
+            ext4_module.module,
+            &operation_probe,
+            large_inode,
+            KB_EXT4_LARGE_OFFSET,
+            KB_EXT4_LARGE_OFFSET + KB_EXT4_LARGE_WRITE_SIZE - 1,
+            0,
+            "large-depth1-post-write");
+        if (fsync_probe_result != 0) {
+            fprintf(stderr, "ext4 module depth1 fsync probe failed result=%d\n", fsync_probe_result);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+        if (vfio_nvme_bdf == NULL &&
+            vfio_virtio_blk_bdf == NULL &&
+            verify_image_file_range(
+                image_path,
+                work_dir,
+                "/large.bin",
+                KB_EXT4_LARGE_OFFSET,
+                large_payload,
+                sizeof(large_payload),
+                "large-depth1-post-write") != 0)
+        {
+            fprintf(stderr, "ext4 image persistence probe failed path=/large.bin\n");
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(block_device);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            kb_linux_vfio_virtio_blk_provider_destroy(vfio_virtio_blk);
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
     }
     kb_fs_subsystem_set_mount_probe_block_device(NULL);
     kb_fs_block_device_destroy(block_device);

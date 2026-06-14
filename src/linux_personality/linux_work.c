@@ -854,7 +854,9 @@ static void run_deferred_items(int include_work)
 
 void kb_run_deferred_work(void)
 {
+    kb_jbd2_progress_registered_journals();
     run_deferred_items(1);
+    kb_jbd2_progress_registered_journals();
 }
 
 void kb_run_deferred_bottom_halves(void)
@@ -1085,9 +1087,11 @@ unsigned long kb_schedule_timeout(unsigned long timeout)
     if (trace_work_enabled()) {
         fprintf(stderr, "kobox work: schedule_timeout timeout=%lu\n", timeout);
     }
+    kb_jbd2_progress_registered_journals();
     if (timeout == ULONG_MAX) {
         kb_run_deferred_bottom_halves();
         (void)kb_handle_any_irq_no_work(1000000ull);
+        kb_jbd2_progress_registered_journals();
         return timeout;
     }
     uint64_t ns = jiffies_to_ns(timeout);
@@ -1096,6 +1100,7 @@ unsigned long kb_schedule_timeout(unsigned long timeout)
         ns = max_real_wait_ns;
     }
     sleep_ns(ns);
+    kb_jbd2_progress_registered_journals();
     return 0;
 }
 
