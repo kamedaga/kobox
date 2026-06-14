@@ -119,6 +119,7 @@ typedef struct kvm_block_fixture {
     unsigned char *image;
     size_t image_size;
     const char *image_path;
+    int image_dirty;
     uint8_t last_command;
     uint32_t virtio_status;
     uint32_t virtio_device_features_sel;
@@ -396,6 +397,32 @@ static int kvm_block_fixture_write(void *ctx, uint64_t sector, const void *buffe
         return -34;
     }
     memcpy(fixture->image + (size_t)offset, buffer, byte_count);
+    fixture->image_dirty = 1;
+    return 0;
+}
+
+static int kvm_block_fixture_flush_image(kvm_block_fixture_t *fixture)
+{
+    if (fixture == NULL || !fixture->image_dirty || fixture->image_path == NULL || fixture->image_path[0] == '\0') {
+        return 0;
+    }
+    FILE *file = fopen(fixture->image_path, "wb");
+    if (file == NULL) {
+        fprintf(stderr, "kvm-block-route: failed to open image for writeback path=%s\n", fixture->image_path);
+        return 1;
+    }
+    size_t written = fwrite(fixture->image, 1, fixture->image_size, file);
+    int close_result = fclose(file);
+    if (written != fixture->image_size || close_result != 0) {
+        fprintf(stderr,
+            "kvm-block-route: failed to writeback image path=%s written=%zu expected=%zu\n",
+            fixture->image_path,
+            written,
+            fixture->image_size);
+        return 1;
+    }
+    printf("kvm-block-route: writeback image=%s bytes=%zu\n", fixture->image_path, fixture->image_size);
+    fixture->image_dirty = 0;
     return 0;
 }
 
@@ -477,6 +504,7 @@ static void kvm_block_fixture_destroy(kvm_block_fixture_t *fixture)
     if (fixture == NULL) {
         return;
     }
+    (void)kvm_block_fixture_flush_image(fixture);
     if (fixture->disk != NULL) {
         kb_block_subsystem_disk_unregister(fixture->disk);
         kb_block_subsystem_disk_put(fixture->disk);

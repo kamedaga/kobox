@@ -11,6 +11,7 @@ init_bin="$work_dir/kobox-init"
 log="$work_dir/serial.log"
 decoded_log="$work_dir/serial.decoded.log"
 debugfs_cmds="$work_dir/rootfs.debugfs"
+guest_proof_dump="$work_dir/guest-proof.txt"
 
 mkdir -p "$work_dir"
 
@@ -99,17 +100,110 @@ static long kobox_syscall3(long n, long a, long b, long c)
     return ret;
 }
 
+static long kobox_syscall4(long n, long a, long b, long c, long d)
+{
+    long ret;
+    register long r10 __asm__("r10") = d;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static unsigned long kobox_strlen(const char *text)
+{
+    unsigned long len = 0;
+    while (text[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
+static long kobox_write_all(long fd, const char *data, unsigned long len)
+{
+    unsigned long done = 0;
+    while (done < len) {
+        long n = kobox_syscall3(1, fd, (long)(data + done), (long)(len - done));
+        if (n <= 0) {
+            return n;
+        }
+        done += (unsigned long)n;
+    }
+    return (long)done;
+}
+
+static void kobox_console(const char *message)
+{
+    long fd = kobox_syscall4(257, -100, (long)"/dev/console", 1, 0);
+    if (fd >= 0) {
+        (void)kobox_write_all(fd, message, kobox_strlen(message));
+        (void)kobox_syscall3(3, fd, 0, 0);
+    }
+}
+
+static int kobox_bytes_equal(const char *a, const char *b, unsigned long len)
+{
+    for (unsigned long i = 0; i < len; i++) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void _start(void)
 {
-    static const char message[] = "KOBOX_INIT_REACHED\n";
-    (void)kobox_syscall3(1, 1, (long)message, (long)(sizeof(message) - 1));
-    (void)kobox_syscall3(1, 2, (long)message, (long)(sizeof(message) - 1));
-    (void)kobox_syscall3(60, 42, 0, 0);
+    static const char path[] = "/kobox-init-proof.txt";
+    static const char payload[] = "KOBOX_GUEST_BLOCK_WRITE_READ_OK\n";
+    char readback[sizeof(payload)];
+
+    kobox_console("KOBOX_INIT_REACHED\n");
+
+    long fd = kobox_syscall4(257, -100, (long)path, 2 | 0100 | 01000, 0644);
+    if (fd < 0) {
+        kobox_console("KOBOX_GUEST_OPEN_FAILED\n");
+        (void)kobox_syscall3(60, 50, 0, 0);
+    }
+
+    if (kobox_write_all(fd, payload, sizeof(payload) - 1) != (long)(sizeof(payload) - 1)) {
+        kobox_console("KOBOX_GUEST_WRITE_FAILED\n");
+        (void)kobox_syscall3(60, 51, 0, 0);
+    }
+    kobox_console("KOBOX_GUEST_WRITE_OK\n");
+
+    if (kobox_syscall3(74, fd, 0, 0) < 0) {
+        kobox_console("KOBOX_GUEST_FSYNC_FAILED\n");
+        (void)kobox_syscall3(60, 52, 0, 0);
+    }
+    (void)kobox_syscall3(3, fd, 0, 0);
+
+    fd = kobox_syscall4(257, -100, (long)path, 0, 0);
+    if (fd < 0) {
+        kobox_console("KOBOX_GUEST_REOPEN_FAILED\n");
+        (void)kobox_syscall3(60, 53, 0, 0);
+    }
+
+    long n = kobox_syscall3(0, fd, (long)readback, (long)(sizeof(payload) - 1));
+    (void)kobox_syscall3(3, fd, 0, 0);
+    if (n != (long)(sizeof(payload) - 1)) {
+        kobox_console("KOBOX_GUEST_READ_FAILED\n");
+        (void)kobox_syscall3(60, 54, 0, 0);
+    }
+    if (!kobox_bytes_equal(readback, payload, sizeof(payload) - 1)) {
+        kobox_console("KOBOX_GUEST_VERIFY_FAILED\n");
+        (void)kobox_syscall3(60, 55, 0, 0);
+    }
+
+    kobox_console("KOBOX_GUEST_READ_OK\n");
+    kobox_console("KOBOX_GUEST_FS_OK\n");
+    (void)kobox_syscall3(60, 43, 0, 0);
     for (;;) { }
 }
 INIT_C
 
-gcc -static -nostdlib -Os -s -o "$init_bin" "$init_src"
+gcc -static -nostdlib -fno-builtin -Os -s -o "$init_bin" "$init_src"
 
 rm -f "$disk" "$log"
 truncate -s 32M "$disk"
@@ -134,7 +228,7 @@ set +e
 KOBOX_KVM_RUN_BACKEND=linux-kvm \
 KOBOX_KVM_LINUX_ENTRY_BOOT_LOOP=1 \
 KOBOX_KVM_LINUX_ENTRY_BOOT_STEPS="${KOBOX_KVM_LINUX_ENTRY_BOOT_STEPS:-420000}" \
-KOBOX_KVM_LINUX_ENTRY_SERIAL_UNTIL="${KOBOX_KVM_LINUX_ENTRY_SERIAL_UNTIL:-exitcode=0x00002a00}" \
+KOBOX_KVM_LINUX_ENTRY_SERIAL_UNTIL="${KOBOX_KVM_LINUX_ENTRY_SERIAL_UNTIL:-exitcode=0x00002b00}" \
 "$runner" \
     "--dep=$common_ko" \
     "--bzimage=$bzimage" \
@@ -160,4 +254,9 @@ done >"$decoded_log"
 grep -q "virtio_blk virtio0: \\[vda\\]" "$decoded_log"
 grep -q "VFS: Mounted root (ext4 filesystem) on device 253:0" "$decoded_log"
 grep -q "Run /sbin/init as init process" "$decoded_log"
-grep -q "exitcode=0x00002a00" "$log"
+grep -q "kvm-virtio-blk: request .* type=1 " "$log"
+grep -q "exitcode=0x00002b00" "$log"
+
+rm -f "$guest_proof_dump"
+debugfs -R "dump /kobox-init-proof.txt $guest_proof_dump" "$disk" >/dev/null 2>&1
+grep -q "KOBOX_GUEST_BLOCK_WRITE_READ_OK" "$guest_proof_dump"
