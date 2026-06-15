@@ -3,8 +3,10 @@
 #endif
 
 #include "kobox/device_linux_mock.h"
+#include "kobox/device_linux_vfio_nvme.h"
 #include "kobox/module.h"
 #include "kobox/shim.h"
+#include "linux_subsystem/ata/ata.h"
 #include "linux_subsystem/block/block.h"
 #include "linux_subsystem/kvm/kvm.h"
 
@@ -119,7 +121,11 @@ typedef struct kvm_block_fixture {
     unsigned char *image;
     size_t image_size;
     const char *image_path;
+    const char *backend_name;
     int image_dirty;
+    int writeback_disk_to_image;
+    uint64_t capacity_sectors;
+    int owns_disk_objects;
     uint8_t last_command;
     uint32_t virtio_status;
     uint32_t virtio_device_features_sel;
@@ -403,6 +409,39 @@ static int kvm_block_fixture_write(void *ctx, uint64_t sector, const void *buffe
 
 static int kvm_block_fixture_flush_image(kvm_block_fixture_t *fixture)
 {
+    if (fixture != NULL && fixture->writeback_disk_to_image) {
+        FILE *file = fopen(fixture->image_path, "wb");
+        if (file == NULL) {
+            fprintf(stderr, "kvm-block-route: failed to open disk image for writeback path=%s\n", fixture->image_path);
+            return 1;
+        }
+        unsigned char buffer[512 * 128];
+        size_t remaining = fixture->image_size;
+        uint64_t sector = 0;
+        while (remaining > 0) {
+            size_t chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+            if (kb_block_subsystem_disk_read(fixture->disk, sector, buffer, chunk) != 0 ||
+                fwrite(buffer, 1, chunk, file) != chunk)
+            {
+                fclose(file);
+                fprintf(stderr, "kvm-block-route: failed to writeback kobox ata image path=%s sector=%llu\n",
+                    fixture->image_path,
+                    (unsigned long long)sector);
+                return 1;
+            }
+            remaining -= chunk;
+            sector += chunk / 512u;
+        }
+        int close_result = fclose(file);
+        if (close_result != 0) {
+            fprintf(stderr, "kvm-block-route: failed to close kobox ata image path=%s\n", fixture->image_path);
+            return 1;
+        }
+        printf("kvm-block-route: writeback backend=kobox-ata image=%s bytes=%zu\n",
+            fixture->image_path,
+            fixture->image_size);
+        return 0;
+    }
     if (fixture == NULL || !fixture->image_dirty || fixture->image_path == NULL || fixture->image_path[0] == '\0') {
         return 0;
     }
@@ -424,6 +463,50 @@ static int kvm_block_fixture_flush_image(kvm_block_fixture_t *fixture)
     printf("kvm-block-route: writeback image=%s bytes=%zu\n", fixture->image_path, fixture->image_size);
     fixture->image_dirty = 0;
     return 0;
+}
+
+static void kvm_block_fixture_print_summary(kvm_block_fixture_t *fixture)
+{
+    if (fixture == NULL || fixture->disk == NULL || fixture->backend_name == NULL) {
+        return;
+    }
+    kb_block_disk_snapshot_t block_snapshot;
+    memset(&block_snapshot, 0, sizeof(block_snapshot));
+    if (kb_block_subsystem_disk_snapshot(fixture->disk, &block_snapshot) != 0) {
+        return;
+    }
+    if (strcmp(fixture->backend_name, "kobox-ata-ahci") == 0) {
+        kb_ata_disk_snapshot_t ata_snapshot;
+        memset(&ata_snapshot, 0, sizeof(ata_snapshot));
+        if (kb_ata_subsystem_snapshot_by_disk(fixture->disk, &ata_snapshot) == 0) {
+            printf(
+                "kvm-block-route-summary: backend=%s disk=%p sectors=%llu block_reads=%llu block_writes=%llu bytes_read=%llu bytes_written=%llu ahci_reads=%llu ahci_writes=%llu ahci_block_reads=%llu ahci_block_writes=%llu completions=%llu irq_dispatches=%llu errors=%llu result=0\n",
+                fixture->backend_name,
+                fixture->disk,
+                (unsigned long long)block_snapshot.capacity_sectors,
+                (unsigned long long)block_snapshot.read_count,
+                (unsigned long long)block_snapshot.write_count,
+                (unsigned long long)block_snapshot.bytes_read,
+                (unsigned long long)block_snapshot.bytes_written,
+                (unsigned long long)ata_snapshot.ahci_read_count,
+                (unsigned long long)ata_snapshot.ahci_write_count,
+                (unsigned long long)ata_snapshot.ahci_block_read_count,
+                (unsigned long long)ata_snapshot.ahci_block_write_count,
+                (unsigned long long)ata_snapshot.ahci_completion_count,
+                (unsigned long long)ata_snapshot.ahci_irq_dispatch_count,
+                (unsigned long long)ata_snapshot.ahci_error_count);
+        }
+        return;
+    }
+    printf(
+        "kvm-block-route-summary: backend=%s disk=%p sectors=%llu block_reads=%llu block_writes=%llu bytes_read=%llu bytes_written=%llu result=0\n",
+        fixture->backend_name,
+        fixture->disk,
+        (unsigned long long)block_snapshot.capacity_sectors,
+        (unsigned long long)block_snapshot.read_count,
+        (unsigned long long)block_snapshot.write_count,
+        (unsigned long long)block_snapshot.bytes_read,
+        (unsigned long long)block_snapshot.bytes_written);
 }
 
 static int kvm_block_fixture_load_image(kvm_block_fixture_t *fixture, const char *image_path)
@@ -448,10 +531,12 @@ static int kvm_block_fixture_load_image(kvm_block_fixture_t *fixture, const char
         fixture->image = (unsigned char *)data;
         fixture->image_size = data_size;
         fixture->image_path = image_path;
+        fixture->capacity_sectors = data_size / 512u;
         return 0;
     }
 
     fixture->image_size = 4096;
+    fixture->capacity_sectors = fixture->image_size / 512u;
     fixture->image = (unsigned char *)calloc(1, fixture->image_size);
     if (fixture->image == NULL) {
         return 1;
@@ -469,6 +554,8 @@ static int kvm_block_fixture_init(kvm_block_fixture_t *fixture, const char *imag
     if (kvm_block_fixture_load_image(fixture, image_path) != 0) {
         return 1;
     }
+    fixture->owns_disk_objects = 1;
+    fixture->backend_name = "image";
 
     fixture->queue = kb_block_subsystem_queue_alloc(NULL);
     fixture->disk = kb_block_subsystem_disk_alloc();
@@ -481,7 +568,7 @@ static int kvm_block_fixture_init(kvm_block_fixture_t *fixture, const char *imag
         fprintf(stderr, "kvm-block-route: failed to create kobox block disk\n");
         return 1;
     }
-    kb_block_subsystem_disk_set_capacity(fixture->disk, fixture->image_size / 512u);
+    kb_block_subsystem_disk_set_capacity(fixture->disk, fixture->capacity_sectors);
     kb_block_subsystem_disk_set_io(
         fixture->disk,
         fixture,
@@ -491,11 +578,89 @@ static int kvm_block_fixture_init(kvm_block_fixture_t *fixture, const char *imag
         fprintf(stderr, "kvm-block-route: failed to register kobox block disk\n");
         return 1;
     }
-    printf("kvm-block-route: disk=%p sectors=%zu bytes=%zu image=%s\n",
+    printf("kvm-block-route: backend=image disk=%p sectors=%llu bytes=%zu image=%s\n",
         fixture->disk,
-        fixture->image_size / 512u,
+        (unsigned long long)fixture->capacity_sectors,
         fixture->image_size,
         fixture->image_path == NULL ? "(synthetic)" : fixture->image_path);
+    return 0;
+}
+
+static int kvm_block_fixture_attach_disk(kvm_block_fixture_t *fixture, void *disk, const char *backend_name)
+{
+    if (fixture == NULL || disk == NULL) {
+        return 1;
+    }
+    memset(fixture, 0, sizeof(*fixture));
+    kb_block_disk_snapshot_t snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (kb_block_subsystem_disk_snapshot(disk, &snapshot) != 0 || snapshot.capacity_sectors == 0) {
+        fprintf(stderr, "kvm-block-route: backend disk has no capacity backend=%s disk=%p\n",
+            backend_name == NULL ? "(unknown)" : backend_name,
+            disk);
+        return 1;
+    }
+    fixture->disk = disk;
+    fixture->capacity_sectors = snapshot.capacity_sectors;
+    fixture->owns_disk_objects = 0;
+    fixture->backend_name = backend_name == NULL ? "external" : backend_name;
+    printf("kvm-block-route: backend=%s disk=%p sectors=%llu read_count=%llu write_count=%llu\n",
+        backend_name == NULL ? "(external)" : backend_name,
+        fixture->disk,
+        (unsigned long long)fixture->capacity_sectors,
+        (unsigned long long)snapshot.read_count,
+        (unsigned long long)snapshot.write_count);
+    return 0;
+}
+
+static int kvm_block_fixture_attach_kobox_ata_image(kvm_block_fixture_t *fixture, const char *image_path)
+{
+    if (fixture == NULL || image_path == NULL || image_path[0] == '\0') {
+        return 1;
+    }
+    void *data = NULL;
+    size_t data_size = 0;
+    if (read_file(image_path, &data, &data_size) != KB_OK) {
+        fprintf(stderr, "kvm-block-route: failed to read kobox ata image path=%s\n", image_path);
+        return 1;
+    }
+    if (data_size < 1024 || (data_size % 512u) != 0) {
+        fprintf(stderr, "kvm-block-route: kobox ata image must be 512-byte aligned and at least 1024 bytes path=%s size=%zu\n",
+            image_path,
+            data_size);
+        free(data);
+        return 1;
+    }
+
+    void *disk = kb_ata_subsystem_first_disk();
+    if (disk == NULL) {
+        fprintf(stderr, "kvm-block-route: no kobox ata disk is registered; load libahci/ahci as dependencies first\n");
+        free(data);
+        return 1;
+    }
+    uint64_t sectors = data_size / 512u;
+    if (kb_ata_subsystem_resize_disk(disk, sectors) != 0 ||
+        kb_block_subsystem_disk_write(disk, 0, data, data_size) != 0)
+    {
+        fprintf(stderr, "kvm-block-route: failed to preload kobox ata disk image=%s bytes=%zu\n",
+            image_path,
+            data_size);
+        free(data);
+        return 1;
+    }
+    free(data);
+    if (kvm_block_fixture_attach_disk(fixture, disk, "kobox-ata-ahci") != 0) {
+        return 1;
+    }
+    fixture->image_path = image_path;
+    fixture->image_size = data_size;
+    fixture->capacity_sectors = sectors;
+    fixture->writeback_disk_to_image = 1;
+    fixture->backend_name = "kobox-ata-ahci";
+    printf("kvm-block-route: backend=kobox-ata-ahci image=%s sectors=%llu bytes=%zu\n",
+        image_path,
+        (unsigned long long)sectors,
+        data_size);
     return 0;
 }
 
@@ -505,13 +670,16 @@ static void kvm_block_fixture_destroy(kvm_block_fixture_t *fixture)
         return;
     }
     (void)kvm_block_fixture_flush_image(fixture);
-    if (fixture->disk != NULL) {
+    kvm_block_fixture_print_summary(fixture);
+    if (fixture->owns_disk_objects && fixture->disk != NULL) {
         kb_block_subsystem_disk_unregister(fixture->disk);
         kb_block_subsystem_disk_put(fixture->disk);
     }
-    kb_block_subsystem_object_free(fixture->part0);
-    kb_block_subsystem_object_free(fixture->disk);
-    kb_block_subsystem_object_free(fixture->queue);
+    if (fixture->owns_disk_objects) {
+        kb_block_subsystem_object_free(fixture->part0);
+        kb_block_subsystem_object_free(fixture->disk);
+        kb_block_subsystem_object_free(fixture->queue);
+    }
     free(fixture->image);
     memset(fixture, 0, sizeof(*fixture));
 }
@@ -863,7 +1031,7 @@ static int handle_virtio_mmio_exit(
         return 1;
     }
 
-    uint64_t capacity = block->image_size / 512u;
+    uint64_t capacity = block->capacity_sectors;
     uint32_t value = 0;
     uint64_t device_features = 1ULL << 32;
     switch (offset) {
@@ -1758,8 +1926,19 @@ static int run_linux_protected_entry_boot_loop(
 
     char serial_output[65536];
     size_t serial_output_size = 0;
+    char serial_line[1024];
+    size_t serial_line_size = 0;
     memset(serial_output, 0, sizeof(serial_output));
+    memset(serial_line, 0, sizeof(serial_line));
     const char *serial_until = getenv("KOBOX_KVM_LINUX_ENTRY_SERIAL_UNTIL");
+    const char *trace_serial_bytes_env = getenv("KOBOX_KVM_TRACE_SERIAL_BYTES");
+    const char *trace_serial_lines_env = getenv("KOBOX_KVM_TRACE_SERIAL_LINES");
+    int trace_serial_bytes = trace_serial_bytes_env == NULL || strcmp(trace_serial_bytes_env, "0") != 0;
+    int trace_serial_lines = trace_serial_lines_env != NULL && strcmp(trace_serial_lines_env, "0") != 0;
+    uint16_t pit_channel2_counter = 0xffffu;
+    uint16_t pit_channel2_reload = 0xffffu;
+    int pit_channel2_read_high_next = 0;
+    int pit_channel2_write_high_next = 0;
 
     size_t step_limit = 65536;
     const char *step_limit_env = getenv("KOBOX_KVM_LINUX_ENTRY_BOOT_STEPS");
@@ -1820,7 +1999,7 @@ static int run_linux_protected_entry_boot_loop(
         }
 
         if (run_snapshot.exit_reason == KB_KVM_EXIT_IO) {
-            if (step < 128 || (step % 1024) == 0 || run_snapshot.io_port == 0x3f8) {
+            if (step < 128 || (step % 1024) == 0 || (trace_serial_bytes && run_snapshot.io_port == 0x3f8)) {
                 printf("kvm-linux-boot-loop-io: case=%s step=%zu direction=%u port=0x%x size=%u count=%u data_offset=0x%llx data0=0x%x\n",
                     label,
                     step,
@@ -1833,8 +2012,21 @@ static int run_linux_protected_entry_boot_loop(
             }
             if (run_snapshot.io_direction == 1) {
                 if (run_snapshot.io_port == 0x3f8 && serial_output_size + 1 < sizeof(serial_output)) {
-                    serial_output[serial_output_size++] = (char)run_snapshot.io_data[0];
+                    char serial_char = (char)run_snapshot.io_data[0];
+                    serial_output[serial_output_size++] = serial_char;
                     serial_output[serial_output_size] = '\0';
+                    if (trace_serial_lines) {
+                        if (serial_char == '\r') {
+                        } else if (serial_char == '\n') {
+                            serial_line[serial_line_size] = '\0';
+                            printf("kvm-linux-boot-loop-serial-line: case=%s line=%s\n", label, serial_line);
+                            serial_line_size = 0;
+                            serial_line[0] = '\0';
+                        } else if (serial_line_size + 1 < sizeof(serial_line)) {
+                            serial_line[serial_line_size++] = serial_char;
+                            serial_line[serial_line_size] = '\0';
+                        }
+                    }
                     if (serial_until != NULL &&
                         serial_until[0] != '\0' &&
                         strstr(serial_output, serial_until) != NULL)
@@ -1845,6 +2037,20 @@ static int run_linux_protected_entry_boot_loop(
                             serial_until);
                         return 0;
                     }
+                } else if (run_snapshot.io_port == 0x43 && run_snapshot.io_size == 1) {
+                    if ((run_snapshot.io_data[0] & 0xc0u) == 0x80u) {
+                        pit_channel2_read_high_next = 0;
+                        pit_channel2_write_high_next = 0;
+                    }
+                } else if (run_snapshot.io_port == 0x42 && run_snapshot.io_size == 1) {
+                    if (!pit_channel2_write_high_next) {
+                        pit_channel2_reload = (uint16_t)((pit_channel2_reload & 0xff00u) | run_snapshot.io_data[0]);
+                        pit_channel2_write_high_next = 1;
+                    } else {
+                        pit_channel2_reload = (uint16_t)((pit_channel2_reload & 0x00ffu) | ((uint16_t)run_snapshot.io_data[0] << 8));
+                        pit_channel2_counter = pit_channel2_reload == 0 ? 0xffffu : pit_channel2_reload;
+                        pit_channel2_write_high_next = 0;
+                    }
                 }
             } else if (run_snapshot.io_data_offset < KB_KVM_RUN_STORAGE_BYTES) {
                 size_t response_bytes = (size_t)run_snapshot.io_size * (size_t)run_snapshot.io_count;
@@ -1852,7 +2058,20 @@ static int run_linux_protected_entry_boot_loop(
                 if (response_bytes > max_response_bytes) {
                     response_bytes = max_response_bytes;
                 }
-                memset((unsigned char *)run_snapshot.run + run_snapshot.io_data_offset, 0xff, response_bytes);
+                if (run_snapshot.io_port == 0x42 && run_snapshot.io_size == 1 && run_snapshot.io_count == 1) {
+                    unsigned char value = pit_channel2_read_high_next ?
+                        (unsigned char)((pit_channel2_counter >> 8) & 0xffu) :
+                        (unsigned char)(pit_channel2_counter & 0xffu);
+                    ((unsigned char *)run_snapshot.run)[run_snapshot.io_data_offset] = value;
+                    if (pit_channel2_read_high_next) {
+                        pit_channel2_counter = pit_channel2_counter > 0x0100u ?
+                            (uint16_t)(pit_channel2_counter - 0x0100u) :
+                            pit_channel2_reload;
+                    }
+                    pit_channel2_read_high_next = !pit_channel2_read_high_next;
+                } else {
+                    memset((unsigned char *)run_snapshot.run + run_snapshot.io_data_offset, 0xff, response_bytes);
+                }
             }
             continue;
         }
@@ -2342,6 +2561,8 @@ int main(int argc, char **argv)
     const char *initrd_path = NULL;
     const char *linux_cmdline = "console=ttyS0 earlycon";
     const char *block_image_path = NULL;
+    const char *vfio_nvme_bdf = NULL;
+    const char *kobox_ata_image_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--dep=", 6) == 0) {
@@ -2358,6 +2579,10 @@ int main(int argc, char **argv)
             linux_cmdline = argv[i] + 10;
         } else if (strncmp(argv[i], "--block-image=", 14) == 0) {
             block_image_path = argv[i] + 14;
+        } else if (strncmp(argv[i], "--vfio-nvme=", 12) == 0) {
+            vfio_nvme_bdf = argv[i] + 12;
+        } else if (strncmp(argv[i], "--kobox-ata-image=", 18) == 0) {
+            kobox_ata_image_path = argv[i] + 18;
         } else if (target_path == NULL) {
             target_path = argv[i];
         } else {
@@ -2367,7 +2592,14 @@ int main(int argc, char **argv)
     }
 
     if (target_path == NULL) {
-        fprintf(stderr, "usage: %s [--dep=kvm.ko ...] [--bzimage=vmlinuz] [--initrd=initramfs.cpio] [--cmdline='...'] [--block-image=rootfs.img] kvm-arch.ko\n", argv[0]);
+        fprintf(stderr, "usage: %s [--dep=kvm.ko ...] [--bzimage=vmlinuz] [--initrd=initramfs.cpio] [--cmdline='...'] [--block-image=rootfs.img|--vfio-nvme=BDF|--kobox-ata-image=rootfs.img] kvm-arch.ko\n", argv[0]);
+        return 2;
+    }
+    unsigned block_backend_count = (block_image_path != NULL ? 1u : 0u) +
+        (vfio_nvme_bdf != NULL ? 1u : 0u) +
+        (kobox_ata_image_path != NULL ? 1u : 0u);
+    if (block_backend_count > 1) {
+        fprintf(stderr, "--block-image, --vfio-nvme, and --kobox-ata-image are mutually exclusive\n");
         return 2;
     }
     int linux_boot_irqchip =
@@ -2401,6 +2633,10 @@ int main(int argc, char **argv)
         }
         int dep_init_result = 0;
         status = kb_module_call_init(deps[i].module, &dep_init_result);
+        if (status == (kb_status_t)-2) {
+            printf("dependency loaded without init_module path=%s\n", dep_paths[i]);
+            continue;
+        }
         if (status != KB_OK || dep_init_result != 0) {
             fprintf(stderr, "dependency init failed status=%d result=%d path=%s\n", (int)status, dep_init_result, dep_paths[i]);
             unload_module(&deps[i]);
@@ -2754,7 +2990,49 @@ int main(int argc, char **argv)
 
     kvm_block_fixture_t block_fixture;
     int block_fixture_initialized = 0;
-    if (kvm_block_fixture_init(&block_fixture, block_image_path) != 0) {
+    kb_linux_vfio_nvme_provider_t *vfio_nvme = NULL;
+    if (kobox_ata_image_path != NULL) {
+        if (kvm_block_fixture_attach_kobox_ata_image(&block_fixture, kobox_ata_image_path) != 0) {
+            free(guest_page);
+            free(fake_file);
+            (void)kb_module_call_cleanup(target_module.module);
+            unload_module(&target_module);
+            for (size_t i = dep_count; i > 0; i--) {
+                if (deps[i - 1].initialized) {
+                    (void)kb_module_call_cleanup(deps[i - 1].module);
+                }
+                unload_module(&deps[i - 1]);
+            }
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+    } else if (vfio_nvme_bdf != NULL) {
+        kb_status_t nvme_status = kb_linux_vfio_nvme_provider_create(vfio_nvme_bdf, &vfio_nvme);
+        if (nvme_status != KB_OK ||
+            vfio_nvme == NULL ||
+            kvm_block_fixture_attach_disk(
+                &block_fixture,
+                kb_linux_vfio_nvme_provider_disk(vfio_nvme),
+                "vfio-nvme") != 0)
+        {
+            fprintf(stderr, "kvm-block-route: failed to attach vfio nvme bdf=%s status=%d\n",
+                vfio_nvme_bdf,
+                (int)nvme_status);
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
+            free(guest_page);
+            free(fake_file);
+            (void)kb_module_call_cleanup(target_module.module);
+            unload_module(&target_module);
+            for (size_t i = dep_count; i > 0; i--) {
+                if (deps[i - 1].initialized) {
+                    (void)kb_module_call_cleanup(deps[i - 1].module);
+                }
+                unload_module(&deps[i - 1]);
+            }
+            kb_device_backend_destroy(backend);
+            return 1;
+        }
+    } else if (kvm_block_fixture_init(&block_fixture, block_image_path) != 0) {
         free(guest_page);
         free(fake_file);
         (void)kb_module_call_cleanup(target_module.module);
@@ -2904,6 +3182,7 @@ int main(int argc, char **argv)
         if (block_fixture_initialized) {
             kvm_block_fixture_destroy(&block_fixture);
         }
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
         free(guest_page);
         free(fake_file);
         (void)kb_module_call_cleanup(target_module.module);
@@ -3057,6 +3336,7 @@ int main(int argc, char **argv)
             if (block_fixture_initialized) {
                 kvm_block_fixture_destroy(&block_fixture);
             }
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
             free(guest_page);
             free(fake_file);
             (void)kb_module_call_cleanup(target_module.module);
@@ -3084,6 +3364,7 @@ int main(int argc, char **argv)
                 if (block_fixture_initialized) {
                     kvm_block_fixture_destroy(&block_fixture);
                 }
+                kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
                 free(guest_page);
                 free(fake_file);
                 (void)kb_module_call_cleanup(target_module.module);
@@ -3126,6 +3407,10 @@ int main(int argc, char **argv)
         free_guest_region_backings(bzimage_low_regions, bzimage_low_region_count);
         free(bzimage_data);
         free(boot_page);
+        if (block_fixture_initialized) {
+            kvm_block_fixture_destroy(&block_fixture);
+        }
+        kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
         free(guest_page);
         free(fake_file);
         (void)kb_module_call_cleanup(target_module.module);
@@ -3153,6 +3438,10 @@ int main(int argc, char **argv)
             free_guest_region_backings(bzimage_low_regions, bzimage_low_region_count);
             free(bzimage_data);
             free(boot_page);
+            if (block_fixture_initialized) {
+                kvm_block_fixture_destroy(&block_fixture);
+            }
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
             free(guest_page);
             free(fake_file);
             (void)kb_module_call_cleanup(target_module.module);
@@ -3182,6 +3471,10 @@ int main(int argc, char **argv)
             free_guest_region_backings(bzimage_low_regions, bzimage_low_region_count);
             free(bzimage_data);
             free(boot_page);
+            if (block_fixture_initialized) {
+                kvm_block_fixture_destroy(&block_fixture);
+            }
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
             free(guest_page);
             free(fake_file);
             (void)kb_module_call_cleanup(target_module.module);
@@ -3214,6 +3507,10 @@ int main(int argc, char **argv)
             free_guest_region_backings(bzimage_low_regions, bzimage_low_region_count);
             free(bzimage_data);
             free(boot_page);
+            if (block_fixture_initialized) {
+                kvm_block_fixture_destroy(&block_fixture);
+            }
+            kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
             free(guest_page);
             free(fake_file);
             (void)kb_module_call_cleanup(target_module.module);
@@ -3236,6 +3533,7 @@ int main(int argc, char **argv)
     if (block_fixture_initialized) {
         kvm_block_fixture_destroy(&block_fixture);
     }
+    kb_linux_vfio_nvme_provider_destroy(vfio_nvme);
     free(cmdline_page);
     free(boot_page);
     free(guest_page);

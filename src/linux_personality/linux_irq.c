@@ -217,6 +217,19 @@ int kb_request_threaded_irq(
     return 0;
 }
 
+int kb_devm_request_threaded_irq(
+    void *dev,
+    unsigned int irq,
+    int (*handler)(int, void *),
+    int (*thread_fn)(int, void *),
+    unsigned long flags,
+    const char *name,
+    void *dev_id)
+{
+    (void)dev;
+    return kb_request_threaded_irq(irq, handler, thread_fn, flags, name, dev_id);
+}
+
 void kb_free_irq(unsigned int irq, void *dev_id)
 {
     shim_irq_t **cursor = &irq_list;
@@ -361,6 +374,22 @@ int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
             fprintf(stderr, "kobox irq: handle dev_id=%p status=%d\n", dev_id, status);
         }
         return status == KB_OK ? 0 : -110;
+    }
+    return -19;
+}
+
+int kb_trigger_irq_for_dev_id(void *dev_id)
+{
+    for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
+        if (entry->dev_id != dev_id) {
+            continue;
+        }
+        irq_trampoline(entry);
+        kb_run_deferred_work();
+        if (trace_irq_enabled()) {
+            fprintf(stderr, "kobox irq: trigger dev_id=%p irq=%u\n", dev_id, entry->irq);
+        }
+        return 0;
     }
     return -19;
 }

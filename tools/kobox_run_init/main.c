@@ -8,6 +8,7 @@
 #include "kobox/device_pachaos_capsule.h"
 #include "kobox/module.h"
 #include "kobox/shim.h"
+#include "linux_subsystem/ata/ata.h"
 #include "linux_subsystem/input/input.h"
 #include "linux_subsystem/usb/storage.h"
 #include "linux_subsystem/usb/usb.h"
@@ -872,6 +873,23 @@ int main(int argc, char **argv)
             free(data);
             fprintf(stderr, "usb storage io smoke failed: %d\n", storage_io_result);
             return 10;
+        }
+    }
+    const char *ata_io_smoke = getenv("KOBOX_ATA_IO_SMOKE");
+    if (ata_io_smoke != NULL && ata_io_smoke[0] != '\0' && strcmp(ata_io_smoke, "0") != 0) {
+        int ata_io_result = kb_ata_subsystem_run_io_smoke(stdout);
+        if (ata_io_result != 0) {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            destroy_backend_after_cleanup(backend);
+            free(data);
+            fprintf(stderr, "ata io smoke failed: %d\n", ata_io_result);
+            return 13;
         }
     }
     const char *input_summary = getenv("KOBOX_INPUT_SUMMARY");

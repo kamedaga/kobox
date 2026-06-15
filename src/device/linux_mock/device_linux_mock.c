@@ -52,6 +52,36 @@ static void initialize_mock_gpu_mmio(kb_device_t *device)
     mock_mmio_write32(device->bars[0], device->bar_sizes[0], 0x000a00, 0x17700000u);
 }
 
+static void initialize_mock_ahci_mmio(kb_device_t *device)
+{
+    enum {
+        KB_AHCI_REG_CAP = 0x00,
+        KB_AHCI_REG_PI = 0x0c,
+        KB_AHCI_REG_VS = 0x10,
+        KB_AHCI_PORT0 = 0x100,
+        KB_AHCI_PORT_TFD = KB_AHCI_PORT0 + 0x20,
+        KB_AHCI_PORT_SIG = KB_AHCI_PORT0 + 0x24,
+        KB_AHCI_PORT_SSTS = KB_AHCI_PORT0 + 0x28,
+        KB_AHCI_CAP_ISS_GEN2 = 2u << 20,
+        KB_AHCI_PXTFD_DRDY = 1u << 6,
+        KB_AHCI_PXSIG_ATA = 0x00000101u,
+        KB_AHCI_PXSSTS_PRESENT_GEN2_ACTIVE = 0x00000123u,
+        KB_AHCI_VERSION_1_3 = 0x00010300u,
+    };
+
+    if (device->pci_id.class_code != 0x01 || device->pci_id.subclass != 0x06 ||
+        device->pci_id.prog_if != 0x01 || device->bars[5] == 0)
+    {
+        return;
+    }
+    mock_mmio_write32(device->bars[5], device->bar_sizes[5], KB_AHCI_REG_CAP, KB_AHCI_CAP_ISS_GEN2);
+    mock_mmio_write32(device->bars[5], device->bar_sizes[5], KB_AHCI_REG_PI, 0x00000001u);
+    mock_mmio_write32(device->bars[5], device->bar_sizes[5], KB_AHCI_REG_VS, KB_AHCI_VERSION_1_3);
+    mock_mmio_write32(device->bars[5], device->bar_sizes[5], KB_AHCI_PORT_TFD, KB_AHCI_PXTFD_DRDY);
+    mock_mmio_write32(device->bars[5], device->bar_sizes[5], KB_AHCI_PORT_SIG, KB_AHCI_PXSIG_ATA);
+    mock_mmio_write32(device->bars[5], device->bar_sizes[5], KB_AHCI_PORT_SSTS, KB_AHCI_PXSSTS_PRESENT_GEN2_ACTIVE);
+}
+
 static void mock_destroy(kb_device_backend_t *backend)
 {
     kb_linux_mock_backend_t *mock = mock_from_backend(backend);
@@ -324,6 +354,14 @@ static void configure_mock_pci_id_from_env(kb_linux_mock_backend_t *backend)
         backend->device.bar_sizes[3] = 32u * 1024u * 1024u;
         backend->device.bar_flags[3] = KB_MOCK_IORESOURCE_MEM;
     }
+    if (backend->device.pci_id.class_code == 0x01 &&
+        backend->device.pci_id.subclass == 0x06 &&
+        backend->device.pci_id.prog_if == 0x01)
+    {
+        backend->device.bar_starts[5] = 0x80100000ull;
+        backend->device.bar_sizes[5] = 4096;
+        backend->device.bar_flags[5] = KB_MOCK_IORESOURCE_MEM;
+    }
 }
 
 static const kb_device_backend_ops_t mock_ops = {
@@ -384,6 +422,7 @@ kb_status_t kb_linux_mock_device_create(kb_device_backend_t **out_backend)
         }
     }
     initialize_mock_gpu_mmio(&backend->device);
+    initialize_mock_ahci_mmio(&backend->device);
 
     *out_backend = &backend->base;
     return KB_OK;

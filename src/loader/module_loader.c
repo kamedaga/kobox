@@ -10,6 +10,7 @@
 #include "linux_personality/linux_core_symbols.h"
 #include "linux_personality/linux_symbol_registry.h"
 #include "linux_personality/linux_stub_symbols.h"
+#include "linux_subsystem/ata/ata_symbols.h"
 #include "linux_subsystem/block/block_symbols.h"
 #include "linux_subsystem/dma/dma_symbols.h"
 #include "linux_subsystem/fs/fs_symbols.h"
@@ -1176,6 +1177,7 @@ _Static_assert(
 static size_t shim_symbol_count(void)
 {
     size_t block_count = 0;
+    size_t ata_count = 0;
     size_t core_count = 0;
     size_t dma_count = 0;
     size_t fs_count = 0;
@@ -1187,6 +1189,7 @@ static size_t shim_symbol_count(void)
     size_t sound_count = 0;
     size_t stub_count = 0;
     size_t usb_count = 0;
+    (void)kb_linux_ata_symbols(&ata_count);
     (void)kb_linux_block_symbols(&block_count);
     (void)kb_linux_core_symbols(&core_count);
     (void)kb_linux_dma_symbols(&dma_count);
@@ -1200,7 +1203,7 @@ static size_t shim_symbol_count(void)
     (void)kb_linux_stub_symbols(&stub_count);
     (void)kb_linux_usb_symbols(&usb_count);
     return (sizeof(shim_symbols) / sizeof(shim_symbols[0])) +
-        core_count + stub_count + pci_count + usb_count + block_count + dma_count + fs_count + input_count +
+        core_count + stub_count + pci_count + usb_count + ata_count + block_count + dma_count + fs_count + input_count +
         net_count + security_count + sound_count + kvm_count;
 }
 
@@ -1239,9 +1242,16 @@ static const kb_linux_symbol_t *shim_symbol_at(size_t index)
         return &usb_symbols[index];
     }
 
+    size_t ata_count = 0;
+    const kb_linux_symbol_t *ata_symbols = kb_linux_ata_symbols(&ata_count);
+    index -= usb_count;
+    if (index < ata_count) {
+        return &ata_symbols[index];
+    }
+
     size_t block_count = 0;
     const kb_linux_symbol_t *block_symbols = kb_linux_block_symbols(&block_count);
-    index -= usb_count;
+    index -= ata_count;
     if (index < block_count) {
         return &block_symbols[index];
     }

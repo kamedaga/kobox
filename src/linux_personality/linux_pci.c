@@ -45,6 +45,8 @@ typedef struct linux_pci_device_id {
     uint32_t class;
     uint32_t class_mask;
     uintptr_t driver_data;
+    uint32_t override_only;
+    uint32_t reserved;
 } linux_pci_device_id_t;
 
 #define KB_PCI_ANY_ID UINT32_C(0xffffffff)
@@ -59,6 +61,7 @@ typedef struct shim_pci_binding {
     uint64_t dma_mask_storage;
     uint32_t pci_domain_storage;
     uint16_t pci_command;
+    void *pcim_iomap_table[6];
     int probed;
 } shim_pci_binding_t;
 
@@ -1028,10 +1031,15 @@ static const linux_pci_device_id_t *match_pci_id_table_stride(
         const uint32_t class = read_u32_field(entry + 16);
         const uint32_t class_mask = read_u32_field(entry + 20);
         const uintptr_t driver_data = read_ulong_field(entry + 24);
+        const uint32_t override_only = read_u32_field(entry + 32);
+        const uint32_t reserved = read_u32_field(entry + 36);
         if (vendor == 0 && device == 0 && subvendor == 0 && subdevice == 0 && class == 0 && class_mask == 0 &&
-            driver_data == 0)
+            driver_data == 0 && override_only == 0 && reserved == 0)
         {
             return NULL;
+        }
+        if (vendor == KB_PCI_ANY_ID && device == KB_PCI_ANY_ID && class_mask == 0) {
+            continue;
         }
         if (!pci_id_field_matches(vendor, device_id->vendor_id) ||
             !pci_id_field_matches(device, device_id->device_id) ||
@@ -1050,11 +1058,7 @@ static const linux_pci_device_id_t *match_pci_id_table_stride(
 
 static const linux_pci_device_id_t *match_pci_id_table(const void *id_table, const kb_pci_id_t *device_id)
 {
-    const linux_pci_device_id_t *match = match_pci_id_table_stride(id_table, device_id, sizeof(linux_pci_device_id_t));
-    if (match != NULL) {
-        return match;
-    }
-    return match_pci_id_table_stride(id_table, device_id, 0x28);
+    return match_pci_id_table_stride(id_table, device_id, sizeof(linux_pci_device_id_t));
 }
 
 static uintptr_t read_pointer_field(const void *base, size_t offset)
@@ -1223,6 +1227,7 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
     memset(binding.pci_dev_storage, 0, sizeof(binding.pci_dev_storage));
     memset(binding.pci_bus_storage, 0, sizeof(binding.pci_bus_storage));
     memset(binding.pci_dev_name, 0, sizeof(binding.pci_dev_name));
+    memset(binding.pcim_iomap_table, 0, sizeof(binding.pcim_iomap_table));
     binding.dma_mask_storage = UINT64_MAX;
     uintptr_t dma_mask_ptr = (uintptr_t)&binding.dma_mask_storage;
     memcpy(
@@ -1816,7 +1821,31 @@ void *kb_pci_iomap(void *dev, int bar, unsigned long max)
 
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max)
 {
-    return kb_pci_iomap(dev, bar, max);
+    void *addr = kb_pci_iomap(dev, bar, max);
+    if (bar >= 0 && bar < (int)(sizeof(binding.pcim_iomap_table) / sizeof(binding.pcim_iomap_table[0]))) {
+        binding.pcim_iomap_table[bar] = addr;
+    }
+    return addr;
+}
+
+int kb_pcim_iomap_regions_request_all(void *dev, int mask, const char *name)
+{
+    (void)name;
+    for (int bar = 0; bar < (int)(sizeof(binding.pcim_iomap_table) / sizeof(binding.pcim_iomap_table[0])); bar++) {
+        if ((mask & (1 << bar)) == 0) {
+            continue;
+        }
+        if (kb_pcim_iomap(dev, bar, 0) == NULL) {
+            return -19;
+        }
+    }
+    return 0;
+}
+
+void **kb_pcim_iomap_table(void *dev)
+{
+    (void)dev;
+    return binding.pcim_iomap_table;
 }
 
 void kb_pci_iounmap(void *dev, void *addr)

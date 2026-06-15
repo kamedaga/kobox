@@ -22,6 +22,7 @@ fi
 
 common_ko="${KOBOX_KVM_COMMON_KO:-${KOBOX_KVM_KO:-}}"
 target_ko="${KOBOX_KVM_ARCH_KO:-}"
+block_backend="${KOBOX_KVM_BLOCK_BACKEND:-image}"
 
 if [ -z "$common_ko" ]; then
     kernel_release="$(uname -r 2>/dev/null || true)"
@@ -224,22 +225,50 @@ debugfs -w -f "$debugfs_cmds" "$disk" >/dev/null 2>&1 || true
 
 cmdline="${KOBOX_KVM_CMDLINE:-console=ttyS0 earlycon root=/dev/vda rw rootwait panic=-1 virtio_mmio.device=4K@0x10001000:5}"
 
+extra_dep_args=
+block_arg="--block-image=$disk"
+if [ "$block_backend" = "ahci" ] || [ "$block_backend" = "kobox-ata-ahci" ]; then
+    kernel_version="${KERNEL_VERSION:-6.8.0-117-generic}"
+    modules_root="${KOBOX_6_8_MODULES_ROOT:-$repo_root/.artifacts/qemu-vfio-nvme-ext4/modules-root/lib/modules/$kernel_version}"
+    zstd_bin="${ZSTD_BIN:-$repo_root/.artifacts/qemu-vfio-nvme-ext4/zstd-root/usr/bin/zstd}"
+    libahci_src="$modules_root/kernel/drivers/ata/libahci.ko.zst"
+    ahci_src="$modules_root/kernel/drivers/ata/ahci.ko.zst"
+    if [ ! -x "$zstd_bin" ]; then
+        echo "skip: zstd not found for AHCI backend at $zstd_bin" >&2
+        exit 77
+    fi
+    if [ ! -f "$libahci_src" ] || [ ! -f "$ahci_src" ]; then
+        echo "skip: AHCI modules not found under $modules_root" >&2
+        exit 77
+    fi
+    "$zstd_bin" -q -d -f "$libahci_src" -o "$work_dir/libahci.ko"
+    "$zstd_bin" -q -d -f "$ahci_src" -o "$work_dir/ahci.ko"
+    extra_dep_args="--dep=$work_dir/libahci.ko --dep=$work_dir/ahci.ko"
+    block_arg="--kobox-ata-image=$disk"
+fi
+
 set +e
 KOBOX_KVM_RUN_BACKEND=linux-kvm \
 KOBOX_KVM_LINUX_ENTRY_BOOT_LOOP=1 \
 KOBOX_KVM_LINUX_ENTRY_BOOT_STEPS="${KOBOX_KVM_LINUX_ENTRY_BOOT_STEPS:-420000}" \
 KOBOX_KVM_LINUX_ENTRY_SERIAL_UNTIL="${KOBOX_KVM_LINUX_ENTRY_SERIAL_UNTIL:-exitcode=0x00002b00}" \
+KOBOX_KVM_TRACE_SERIAL_BYTES="${KOBOX_KVM_TRACE_SERIAL_BYTES:-1}" \
+KOBOX_MOCK_PCI_ID="${KOBOX_MOCK_PCI_ID:-8086:2922:01:06:01}" \
+KOBOX_TRACE_ATA="${KOBOX_TRACE_ATA:-0}" \
+KOBOX_TRACE_IRQ="${KOBOX_TRACE_IRQ:-0}" \
 "$runner" \
     "--dep=$common_ko" \
+    $extra_dep_args \
     "--bzimage=$bzimage" \
     "--cmdline=$cmdline" \
-    "--block-image=$disk" \
+    "$block_arg" \
     "$target_ko" >"$log" 2>&1
 status=$?
 set -e
 
-cat "$log"
-
+if [ "$status" -ne 0 ] || [ "${KOBOX_KVM_PRINT_FULL_LOG:-0}" != "0" ]; then
+    cat "$log"
+fi
 if [ "$status" -ne 0 ]; then
     exit "$status"
 fi
@@ -252,11 +281,19 @@ while IFS= read -r hex; do
 done >"$decoded_log"
 
 grep -q "virtio_blk virtio0: \\[vda\\]" "$decoded_log"
-grep -q "VFS: Mounted root (ext4 filesystem) on device 253:0" "$decoded_log"
+grep -q "VFS: Mounted root (ext4 filesystem) on devic.*253:0" "$decoded_log"
 grep -q "Run /sbin/init as init process" "$decoded_log"
 grep -q "kvm-virtio-blk: request .* type=1 " "$log"
+if [ "$block_backend" = "ahci" ] || [ "$block_backend" = "kobox-ata-ahci" ]; then
+    grep -q "kvm-block-route: backend=kobox-ata-ahci" "$log"
+    grep -q "kvm-block-route-summary: backend=kobox-ata-ahci .* ahci_block_reads=.* ahci_block_writes=.* completions=.* irq_dispatches=.* errors=0 result=0" "$log"
+fi
 grep -q "exitcode=0x00002b00" "$log"
 
 rm -f "$guest_proof_dump"
 debugfs -R "dump /kobox-init-proof.txt $guest_proof_dump" "$disk" >/dev/null 2>&1
 grep -q "KOBOX_GUEST_BLOCK_WRITE_READ_OK" "$guest_proof_dump"
+
+grep -E "kvm-block-route: backend=|kvm-linux-boot-loop-serial-match|kvm-block-route: writeback|kvm-block-route-summary" "$log"
+grep -E "virtio_blk virtio0|VFS: Mounted root|Run /sbin/init" "$decoded_log"
+echo "kobox-kvm-linux-rootfs-smoke: backend=$block_backend result=0"

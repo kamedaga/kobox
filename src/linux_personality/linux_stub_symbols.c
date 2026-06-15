@@ -3,11 +3,16 @@
 
 #include <stdint.h>
 
+static int kb_pm_suspend_default_s2idle;
+static unsigned int kb_pm_suspend_global_flags;
+
 static const kb_linux_symbol_t stub_symbols[] = {
     {"__fentry__", (void *)(uintptr_t)&kb_noop_stub},
     {"__x86_return_thunk", (void *)(uintptr_t)&kb_noop_stub},
     {"___drm_dbg", (void *)(uintptr_t)&kb_noop_stub},
     {"__drm_err", (void *)(uintptr_t)&kb_noop_stub},
+    {"pm_suspend_default_s2idle", (void *)(uintptr_t)&kb_pm_suspend_default_s2idle},
+    {"pm_suspend_global_flags", (void *)(uintptr_t)&kb_pm_suspend_global_flags},
     {"pm_vt_switch_unregister", (void *)(uintptr_t)&kb_noop_stub},
     {"devres_close_group", (void *)(uintptr_t)&kb_noop_stub},
     {"devres_remove_group", (void *)(uintptr_t)&kb_noop_stub},
@@ -153,6 +158,7 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"delayed_work_timer_fn", (void *)(uintptr_t)&kb_noop_stub},
     {"destroy_workqueue", (void *)(uintptr_t)&kb_noop_stub},
     {"dev_driver_string", (void *)(uintptr_t)&kb_empty_string},
+    {"devm_kfree", (void *)(uintptr_t)&kb_noop_stub},
     {"dev_pm_qos_expose_latency_tolerance", (void *)(uintptr_t)&kb_return_zero},
     {"dev_pm_qos_hide_latency_tolerance", (void *)(uintptr_t)&kb_noop_stub},
     {"dev_pm_qos_update_user_latency_tolerance", (void *)(uintptr_t)&kb_return_zero},
@@ -160,7 +166,11 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"device_initialize", (void *)(uintptr_t)&kb_noop_stub},
     {"disk_uevent", (void *)(uintptr_t)&kb_noop_stub},
     {"dmi_match", (void *)(uintptr_t)&kb_return_zero},
+    {"dmi_check_system", (void *)(uintptr_t)&kb_return_zero},
+    {"dmi_first_match", (void *)(uintptr_t)&kb_return_zero},
+    {"dmi_get_date", (void *)(uintptr_t)&kb_return_zero},
     {"dmi_get_system_info", (void *)(uintptr_t)&kb_empty_string},
+    {"disable_irq", (void *)(uintptr_t)&kb_noop_stub},
     {"__drm_atomic_helper_crtc_destroy_state", (void *)(uintptr_t)&kb_noop_stub},
     {"__drm_atomic_helper_crtc_duplicate_state", (void *)(uintptr_t)&kb_alloc_stub},
     {"__drm_atomic_helper_plane_destroy_state", (void *)(uintptr_t)&kb_noop_stub},

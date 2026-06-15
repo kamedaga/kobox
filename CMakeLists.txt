@@ -28,6 +28,8 @@ add_library(kobox_runtime STATIC
     src/loader/module_loader.c
     src/loader/symbol_registry.c
     src/platform/platform.c
+    src/linux_subsystem/ata/ata.c
+    src/linux_subsystem/ata/ata_symbols.c
     src/linux_subsystem/block/block.c
     src/linux_subsystem/block/block_symbols.c
     src/linux_subsystem/dma/dma.c
@@ -352,12 +354,42 @@ set_tests_properties(kobox-kvm-real-ops PROPERTIES
     SKIP_RETURN_CODE 77
 )
 
+add_test(
+    NAME kobox-ahci-ko-smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+        KOBOX_RUNNER=$<TARGET_FILE:kobox-run>
+        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ahci_ko_smoke.sh
+)
+set_tests_properties(kobox-ahci-ko-smoke PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    SKIP_RETURN_CODE 77
+)
+
+add_test(
+    NAME kobox-ahci-mock-probe-smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+        KOBOX_RUNNER=$<TARGET_FILE:kobox-run>
+        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ahci_mock_probe_smoke.sh
+)
+set_tests_properties(kobox-ahci-mock-probe-smoke PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    SKIP_RETURN_CODE 77
+)
+
 if(KOBOX_ENABLE_QEMU_TESTS)
     add_test(
         NAME kobox-qemu-nested-kvm-smoke
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_qemu_nested_kvm_smoke.sh
     )
     set_tests_properties(kobox-qemu-nested-kvm-smoke PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        SKIP_RETURN_CODE 77
+    )
+    add_test(
+        NAME kobox-qemu-vfio-nvme-kvm-linux-rootfs-smoke
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_qemu_vfio_nvme_kvm_linux_rootfs_smoke.sh
+    )
+    set_tests_properties(kobox-qemu-vfio-nvme-kvm-linux-rootfs-smoke PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         SKIP_RETURN_CODE 77
     )

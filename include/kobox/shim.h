@@ -89,11 +89,20 @@ int kb_request_threaded_irq(
     unsigned long flags,
     const char *name,
     void *dev_id);
+int kb_devm_request_threaded_irq(
+    void *dev,
+    unsigned int irq,
+    int (*handler)(int, void *),
+    int (*thread_fn)(int, void *),
+    unsigned long flags,
+    const char *name,
+    void *dev_id);
 void kb_free_irq(unsigned int irq, void *dev_id);
 void kb_free_all_irqs(void);
 int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
 int kb_wait_irq_signal_for_dev_id(void *dev_id, uint64_t timeout_ns);
 int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns);
+int kb_trigger_irq_for_dev_id(void *dev_id);
 int kb_handle_any_irq(uint64_t timeout_ns);
 int kb_handle_any_irq_no_work(uint64_t timeout_ns);
 int kb_irq_allocate_mapping(unsigned int backend_kind, unsigned int backend_vector, unsigned int *out_linux_irq);
@@ -177,6 +186,8 @@ int kb_pci_msix_unmask_entries(void *dev, const uint16_t *entries, unsigned int 
 void *kb_pci_get_class(unsigned int class, void *from);
 void *kb_pci_iomap(void *dev, int bar, unsigned long max);
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max);
+int kb_pcim_iomap_regions_request_all(void *dev, int mask, const char *name);
+void **kb_pcim_iomap_table(void *dev);
 void kb_pci_iounmap(void *dev, void *addr);
 void kb_pci_release_all_mmio_mappings(void);
 void *kb_ioremap(uint64_t phys_addr, size_t size);
@@ -185,6 +196,9 @@ uint8_t kb_ioread8(const void *addr);
 void kb_iowrite8(uint8_t value, void *addr);
 uint32_t kb_ioread32(const void *addr);
 void kb_iowrite32(uint32_t value, void *addr);
+typedef int (*kb_mmio_write32_hook_t)(void *user, void *addr, uint32_t value);
+int kb_mmio_register_write32_hook(void *base, size_t size, kb_mmio_write32_hook_t hook, void *user);
+void kb_mmio_unregister_write32_hook(void *base, void *user);
 void *kb_pci_dev_get(void *dev);
 void kb_pci_dev_put(void *dev);
 void kb_pci_d3cold_disable(void *dev);
