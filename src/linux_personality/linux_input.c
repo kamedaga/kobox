@@ -27,69 +27,6 @@ void kb_ubsan_handle_out_of_bounds(void *data, void *index)
     (void)index;
 }
 
-int kb_register_virtio_driver(void *driver)
-{
-    (void)driver;
-    return 0;
-}
-
-void kb_unregister_virtio_driver(void *driver)
-{
-    (void)driver;
-}
-
-void kb_virtio_reset_device(void *device)
-{
-    (void)device;
-}
-
-int kb_virtqueue_add_inbuf(void *vq, void *sgs, unsigned int num, void *data, unsigned int gfp)
-{
-    (void)vq;
-    (void)sgs;
-    (void)num;
-    (void)data;
-    (void)gfp;
-    return 0;
-}
-
-int kb_virtqueue_add_outbuf(void *vq, void *sgs, unsigned int num, void *data, unsigned int gfp)
-{
-    (void)vq;
-    (void)sgs;
-    (void)num;
-    (void)data;
-    (void)gfp;
-    return 0;
-}
-
-void *kb_virtqueue_detach_unused_buf(void *vq)
-{
-    (void)vq;
-    return NULL;
-}
-
-void *kb_virtqueue_get_buf(void *vq, unsigned int *len)
-{
-    (void)vq;
-    if (len != NULL) {
-        *len = 0;
-    }
-    return NULL;
-}
-
-unsigned int kb_virtqueue_get_vring_size(void *vq)
-{
-    (void)vq;
-    return 0;
-}
-
-int kb_virtqueue_kick(void *vq)
-{
-    (void)vq;
-    return 1;
-}
-
 void kb_sg_init_one(void *sg, const void *buf, unsigned int buflen)
 {
     (void)buf;
@@ -156,51 +93,6 @@ void __ubsan_handle_load_invalid_value(void *data, void *ptr)
 void __ubsan_handle_out_of_bounds(void *data, void *index)
 {
     kb_ubsan_handle_out_of_bounds(data, index);
-}
-
-int register_virtio_driver(void *driver)
-{
-    return kb_register_virtio_driver(driver);
-}
-
-void unregister_virtio_driver(void *driver)
-{
-    kb_unregister_virtio_driver(driver);
-}
-
-void virtio_reset_device(void *device)
-{
-    kb_virtio_reset_device(device);
-}
-
-int virtqueue_add_inbuf(void *vq, void *sgs, unsigned int num, void *data, unsigned int gfp)
-{
-    return kb_virtqueue_add_inbuf(vq, sgs, num, data, gfp);
-}
-
-int virtqueue_add_outbuf(void *vq, void *sgs, unsigned int num, void *data, unsigned int gfp)
-{
-    return kb_virtqueue_add_outbuf(vq, sgs, num, data, gfp);
-}
-
-void *virtqueue_detach_unused_buf(void *vq)
-{
-    return kb_virtqueue_detach_unused_buf(vq);
-}
-
-void *virtqueue_get_buf(void *vq, unsigned int *len)
-{
-    return kb_virtqueue_get_buf(vq, len);
-}
-
-unsigned int virtqueue_get_vring_size(void *vq)
-{
-    return kb_virtqueue_get_vring_size(vq);
-}
-
-int virtqueue_kick(void *vq)
-{
-    return kb_virtqueue_kick(vq);
 }
 
 void sg_init_one(void *sg, const void *buf, unsigned int buflen)

@@ -134,7 +134,11 @@ static void write_ptr(void *ptr, void *value)
 
 static int trace_block_enabled(void)
 {
+#if defined(__pachaos__)
+    return 0;
+#else
     return getenv("KOBOX_TRACE_BLOCK") != NULL || getenv("KOBOX_TRACE_NVME") != NULL;
+#endif
 }
 
 void kb_linux_block_register_driver_ops(const kb_linux_block_driver_ops_t *ops)
@@ -171,6 +175,53 @@ static const kb_linux_block_driver_ops_t *block_driver_ops_for_tag_set(void *tag
         }
     }
     return NULL;
+}
+
+static const kb_linux_block_driver_ops_t *block_driver_ops_for_disk(void *disk, void **out_queue)
+{
+    kb_block_disk_snapshot_t snapshot;
+    if (kb_block_subsystem_disk_snapshot(disk, &snapshot) != 0 || snapshot.queue == NULL) {
+        return NULL;
+    }
+
+    void *tag_set = kb_block_subsystem_queue_tag_set(snapshot.queue);
+    if (tag_set == NULL) {
+        return NULL;
+    }
+    if (out_queue != NULL) {
+        *out_queue = snapshot.queue;
+    }
+    return block_driver_ops_for_tag_set(tag_set);
+}
+
+static int shim_blk_disk_read(void *ctx, uint64_t sector, void *buffer, size_t byte_count)
+{
+    void *queue = NULL;
+    const kb_linux_block_driver_ops_t *ops = block_driver_ops_for_disk(ctx, &queue);
+    if (ops == NULL || ops->disk_read == NULL) {
+        return -95;
+    }
+    return ops->disk_read(queue, sector, buffer, byte_count);
+}
+
+static int shim_blk_disk_write(void *ctx, uint64_t sector, const void *buffer, size_t byte_count)
+{
+    void *queue = NULL;
+    const kb_linux_block_driver_ops_t *ops = block_driver_ops_for_disk(ctx, &queue);
+    if (ops == NULL || ops->disk_write == NULL) {
+        return -95;
+    }
+    return ops->disk_write(queue, sector, buffer, byte_count);
+}
+
+static void shim_blk_disk_attach_io(void *disk)
+{
+    void *queue = NULL;
+    const kb_linux_block_driver_ops_t *ops = block_driver_ops_for_disk(disk, &queue);
+    if (ops == NULL || (ops->disk_read == NULL && ops->disk_write == NULL)) {
+        return;
+    }
+    kb_block_subsystem_disk_set_io(disk, disk, shim_blk_disk_read, shim_blk_disk_write);
 }
 
 void *kb_linux_block_tag_set_driver_data(void *tag_set)
@@ -596,15 +647,39 @@ static int map_request_dma(
     kb_device_backend_t *backend = kb_shim_current_device_backend();
     kb_device_t *device = kb_subsystem_dma_default_device(backend);
     if (device == NULL) {
+        fprintf(stderr,
+            "kobox blk-mq: dma map no default device backend=%p request=%p cpu=%p len=%u dir=%u\n",
+            (void *)backend,
+            (void *)request,
+            cpu_addr,
+            length,
+            (unsigned)direction);
         return -19;
     }
 
     kb_status_t dma_status = KB_ERR_INVALID;
     uint64_t dma_addr = kb_subsystem_dma_map(backend, device, cpu_addr, length, direction, &dma_status);
     if (dma_status == KB_ERR_UNSUPPORTED) {
+        fprintf(stderr,
+            "kobox blk-mq: dma map unsupported backend=%p device=%p request=%p cpu=%p len=%u dir=%u\n",
+            (void *)backend,
+            (void *)device,
+            (void *)request,
+            cpu_addr,
+            length,
+            (unsigned)direction);
         return -95;
     }
     if (dma_status != KB_OK) {
+        fprintf(stderr,
+            "kobox blk-mq: dma map failed status=%d backend=%p device=%p request=%p cpu=%p len=%u dir=%u\n",
+            (int)dma_status,
+            (void *)backend,
+            (void *)device,
+            (void *)request,
+            cpu_addr,
+            length,
+            (unsigned)direction);
         return -5;
     }
 
@@ -973,6 +1048,7 @@ void kb_blk_queue_update_dma_alignment(void *queue, int mask)
 
 int kb_device_add_disk(void *parent, void *disk, void *groups)
 {
+    shim_blk_disk_attach_io(disk);
     return kb_block_subsystem_disk_register(parent, disk, groups);
 }
 

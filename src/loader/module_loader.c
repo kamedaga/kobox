@@ -36,8 +36,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
-#include <sys/wait.h>
-#if defined(__x86_64__)
+#if defined(__x86_64__) && !defined(__pachaos__)
 #include <asm/prctl.h>
 #include <sys/syscall.h>
 #endif
@@ -84,6 +83,28 @@ enum {
     KB_LOCAL_USB_MISC_DATA_STRIDE = 128,
     KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET = KB_LOCAL_USB_DATA_OFFSET + KB_LOCAL_USB_MISC_DATA_OFFSET,
 };
+
+enum {
+    KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE = 12,
+};
+
+#if defined(__pachaos__) && defined(__x86_64__)
+static long kb_pachaos_syscall1(uint64_t nr, uint64_t a0)
+{
+    uint64_t ret;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0)
+        : "rcx", "r11", "memory");
+    return (long)ret;
+}
+
+static long kb_pachaos_set_gs_base(uint64_t gs_base)
+{
+    return kb_pachaos_syscall1(KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE, gs_base);
+}
+#endif
 
 static int trace_modules_enabled(void)
 {
@@ -569,6 +590,73 @@ static char *kb_kasprintf_shim(unsigned int flags, const char *fmt, ...)
 #if defined(__x86_64__) && !defined(_WIN32)
 __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
 {
+#if defined(__pachaos__)
+    __asm__ volatile(
+        "mov %rax, -8(%rsp)\n\t"
+        "mov %rsp, %rax\n\t"
+        "lea -704(%rsp), %rsp\n\t"
+        "and $-16, %rsp\n\t"
+        "mov %rax, 512(%rsp)\n\t"
+        "mov %r11, 520(%rsp)\n\t"
+        "mov %rdi, 528(%rsp)\n\t"
+        "mov %rsi, 536(%rsp)\n\t"
+        "mov %rdx, 544(%rsp)\n\t"
+        "mov %rcx, 552(%rsp)\n\t"
+        "mov %r8, 560(%rsp)\n\t"
+        "mov %r9, 568(%rsp)\n\t"
+        "mov %rbx, 576(%rsp)\n\t"
+        "mov %rbp, 584(%rsp)\n\t"
+        "mov %r12, 592(%rsp)\n\t"
+        "mov %r13, 600(%rsp)\n\t"
+        "mov %r14, 608(%rsp)\n\t"
+        "mov %r15, 616(%rsp)\n\t"
+        "mov %r10, 624(%rsp)\n\t"
+        "mov -8(%rax), %r10\n\t"
+        "mov %r10, 648(%rsp)\n\t"
+        "mov 512(%rsp), %rsi\n\t"
+        "lea 8(%rsi), %rsi\n\t"
+        "mov %rsp, %rdi\n\t"
+        "mov $64, %ecx\n\t"
+        "cld\n\t"
+        "rep movsq\n\t"
+        "mov 648(%rsp), %rdi\n\t"
+        "test %rdi, %rdi\n\t"
+        "jz 1f\n\t"
+        "mov $12, %eax\n\t"
+        "syscall\n\t"
+        "1:\n\t"
+        "mov 528(%rsp), %rdi\n\t"
+        "mov 536(%rsp), %rsi\n\t"
+        "mov 544(%rsp), %rdx\n\t"
+        "mov 552(%rsp), %rcx\n\t"
+        "mov 560(%rsp), %r8\n\t"
+        "mov 568(%rsp), %r9\n\t"
+        "mov 520(%rsp), %r11\n\t"
+        "mov %r11, kb_current_external_call_target(%rip)\n\t"
+        "mov 624(%rsp), %r10\n\t"
+        "mov %r10, kb_current_external_call_caller_gs(%rip)\n\t"
+        "mov 648(%rsp), %r10\n\t"
+        "mov %r10, kb_current_external_call_callee_gs(%rip)\n\t"
+        "xor %eax, %eax\n\t"
+        "call *%r11\n\t"
+        "mov %rax, 632(%rsp)\n\t"
+        "mov %rdx, 640(%rsp)\n\t"
+        "mov 624(%rsp), %rdi\n\t"
+        "mov $12, %eax\n\t"
+        "syscall\n\t"
+        "movq $0, kb_current_external_call_target(%rip)\n\t"
+        "mov 632(%rsp), %rax\n\t"
+        "mov 640(%rsp), %rdx\n\t"
+        "mov 576(%rsp), %rbx\n\t"
+        "mov 584(%rsp), %rbp\n\t"
+        "mov 592(%rsp), %r12\n\t"
+        "mov 600(%rsp), %r13\n\t"
+        "mov 608(%rsp), %r14\n\t"
+        "mov 616(%rsp), %r15\n\t"
+        "mov 512(%rsp), %r11\n\t"
+        "mov %r11, %rsp\n\t"
+        "ret\n\t");
+#else
     __asm__ volatile(
         "mov %rax, -8(%rsp)\n\t"
         "mov %rsp, %rax\n\t"
@@ -637,6 +725,7 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "mov 512(%rsp), %r11\n\t"
         "mov %r11, %rsp\n\t"
         "ret\n\t");
+#endif
 }
 
 #define KB_DEFINE_X86_INDIRECT_THUNK(name, reg) \
@@ -730,7 +819,15 @@ static int kb_ascii_strncasecmp(const char *a, const char *b, size_t n)
 static int kb_low_or_err_pointer(const void *ptr)
 {
     uintptr_t value = (uintptr_t)ptr;
-    return ptr == NULL || value < 4096u || value >= UINTPTR_MAX - 4095u;
+    if (ptr == NULL || value < 4096u || value >= UINTPTR_MAX - 4095u) {
+        return 1;
+    }
+#if defined(__x86_64__)
+    if (value > UINT64_C(0x00007fffffffffff) && value < UINT64_C(0xffff800000000000)) {
+        return 1;
+    }
+#endif
+    return 0;
 }
 
 static size_t kb_safe_strlen(const char *value)
@@ -927,7 +1024,7 @@ static char *kb_kobject_get_path_shim(void *kobj, unsigned int flags)
     return NULL;
 }
 
-static int kb_vprintk(const char *fmt, va_list args)
+static int KB_STACK_REALIGN kb_vprintk(const char *fmt, va_list args)
 {
     return kb_vprintk_safe(fmt, args);
 }
@@ -1451,6 +1548,8 @@ static uint64_t page_size(void)
     SYSTEM_INFO info;
     GetSystemInfo(&info);
     return info.dwPageSize;
+#elif defined(__pachaos__)
+    return 4096;
 #else
     long value = sysconf(_SC_PAGESIZE);
     return value > 0 ? (uint64_t)value : 4096;
@@ -2835,8 +2934,7 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
         if (!relocation_operand_fits(module, relocation, 4)) {
             return KB_ERR_INVALID;
         }
-        const int64_t pc_base =
-            relocation_is_relative_branch(target) || addend == -4 ? (int64_t)place : (int64_t)place + 4;
+        const int64_t pc_base = (int64_t)place;
         if (!value_fits_i32(value - pc_base)) {
             return KB_ERR_UNSUPPORTED;
         }
@@ -3189,7 +3287,13 @@ kb_status_t kb_loader_enter_module_context(kb_module_t *module, unsigned long *o
         return KB_ERR_INVALID;
     }
     kb_shim_set_device_backend(module->backend);
-#if !defined(_WIN32) && defined(__x86_64__)
+#if defined(__pachaos__) && defined(__x86_64__)
+    *out_old_gs = 0;
+    if (kb_pachaos_set_gs_base((uint64_t)(uintptr_t)module->kernel_gs) != 0) {
+        kb_shim_set_device_backend(0);
+        return KB_ERR_UNSUPPORTED;
+    }
+#elif !defined(_WIN32) && defined(__x86_64__)
     if (module_backend_is_pachaos(module)) {
         (void)syscall(SYS_arch_prctl, ARCH_SET_GS, 0ul);
     }
@@ -3238,7 +3342,9 @@ kb_status_t kb_loader_enter_module_context(kb_module_t *module, unsigned long *o
 
 void kb_loader_leave_module_context(unsigned long old_gs)
 {
-#if !defined(_WIN32) && defined(__x86_64__)
+#if defined(__pachaos__) && defined(__x86_64__)
+    (void)kb_pachaos_set_gs_base((uint64_t)old_gs);
+#elif !defined(_WIN32) && defined(__x86_64__)
     (void)syscall(SYS_arch_prctl, ARCH_SET_GS, old_gs);
 #else
     (void)old_gs;
@@ -3248,31 +3354,59 @@ void kb_loader_leave_module_context(unsigned long old_gs)
 
 static kb_status_t prepare_module(kb_module_t *module)
 {
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=load_sections module=%s\n", module->module_name);
+        fflush(stderr);
+    }
     kb_status_t status = load_sections(module);
     if (status != KB_OK) {
         return status;
+    }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=apply_relocations module=%s\n", module->module_name);
+        fflush(stderr);
     }
     status = apply_relocations(module);
     if (status != KB_OK) {
         return status;
     }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=patch_static_trace module=%s\n", module->module_name);
+        fflush(stderr);
+    }
     status = patch_module_static_trace_calls(module);
     if (status != KB_OK) {
         return status;
+    }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=patch_xhci module=%s\n", module->module_name);
+        fflush(stderr);
     }
     status = patch_module_xhci_command_doorbell(module);
     if (status != KB_OK) {
         return status;
     }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=patch_ext4 module=%s\n", module->module_name);
+        fflush(stderr);
+    }
     status = patch_module_ext4_journal_boundary(module);
     if (status != KB_OK) {
         return status;
+    }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=register_exports module=%s\n", module->module_name);
+        fflush(stderr);
     }
     status = register_module_exports(module);
     if (status != KB_OK) {
         return status;
     }
 
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=find_init module=%s\n", module->module_name);
+        fflush(stderr);
+    }
     uint64_t init_address = 0;
     status = find_symbol_address(module, "init_module", &init_address);
     if (status == KB_ERR_NOT_FOUND) {
@@ -3289,6 +3423,10 @@ static kb_status_t prepare_module(kb_module_t *module)
         module->cleanup_module = (void (*)(void))(uintptr_t)cleanup_address;
     } else if (status != KB_ERR_NOT_FOUND) {
         return status;
+    }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare done module=%s init=%p cleanup=%p\n", module->module_name, (void *)module->init_module, (void *)module->cleanup_module);
+        fflush(stderr);
     }
     return KB_OK;
 }
@@ -3376,12 +3514,24 @@ kb_status_t kb_module_call_init(kb_module_t *module, int *out_result)
         return KB_ERR_NOT_FOUND;
     }
     unsigned long old_gs = 0;
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: init enter_context module=%s init=%p\n", module->module_name, (void *)module->init_module);
+        fflush(stderr);
+    }
     kb_status_t status = kb_loader_enter_module_context(module, &old_gs);
     if (status != KB_OK) {
         return status;
     }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: init call module=%s init=%p\n", module->module_name, (void *)module->init_module);
+        fflush(stderr);
+    }
     kb_loader_set_active_module(module);
     *out_result = module->init_module();
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: init returned module=%s result=%d\n", module->module_name, *out_result);
+        fflush(stderr);
+    }
     kb_loader_leave_module_context(old_gs);
     kb_loader_set_active_module(NULL);
     return KB_OK;

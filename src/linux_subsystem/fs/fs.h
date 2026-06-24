@@ -84,6 +84,8 @@ typedef struct kb_fs_mount_path_probe {
     uint64_t get_tree_bdev_calls;
 } kb_fs_mount_path_probe_t;
 
+typedef kb_fs_mount_path_probe_t kb_fs_mount_result_t;
+
 extern unsigned char kb_fs_subsystem_blockdev_superblock[];
 
 typedef struct kb_fs_block_device kb_fs_block_device_t;
@@ -159,9 +161,21 @@ int kb_fs_subsystem_unregister_filesystem(void *fs_type);
 int kb_fs_block_device_create(const kb_fs_block_device_desc_t *desc, kb_fs_block_device_t **out_device);
 int kb_fs_block_device_create_image(const char *name, const char *image_path, kb_fs_block_device_t **out_device);
 int kb_fs_block_device_create_from_disk(const char *name, void *disk, kb_fs_block_device_t **out_device);
+int kb_fs_block_device_create_from_disk_range(
+    const char *name,
+    void *disk,
+    uint64_t start_sector,
+    uint64_t sector_count,
+    kb_fs_block_device_t **out_device);
+int kb_fs_block_device_create_from_disk_gpt_partition(
+    const char *name,
+    void *disk,
+    uint32_t partition_index,
+    kb_fs_block_device_t **out_device);
 int kb_fs_block_device_read(kb_fs_block_device_t *device, uint64_t offset, void *buffer, size_t size);
 int kb_fs_block_device_write(kb_fs_block_device_t *device, uint64_t offset, const void *buffer, size_t size);
 void kb_fs_block_device_destroy(kb_fs_block_device_t *device);
+int kb_fs_subsystem_set_mount_block_device(kb_fs_block_device_t *device);
 int kb_fs_subsystem_set_mount_probe_block_device(kb_fs_block_device_t *device);
 int kb_fs_subsystem_get_tree_bdev(void *fs_context, int (*fill_super)(void *super_block, void *fs_context));
 void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned int block_size, unsigned int gfp);
@@ -200,6 +214,7 @@ long kb_fs_subsystem_generic_perform_write(void *kiocb, void *iter);
 int kb_fs_subsystem_bmap(void *inode, uint64_t *block);
 int kb_fs_subsystem_sb_min_blocksize(void *super_block, int size);
 int kb_fs_subsystem_sb_set_blocksize(void *super_block, int size);
+int kb_fs_subsystem_mount_registered_root(const char *name, kb_fs_mount_result_t *out_mount);
 int kb_fs_subsystem_probe_registered_mount_path(const char *name, kb_fs_mount_path_probe_t *out_probe);
 size_t kb_fs_subsystem_registered_type_count(void);
 int kb_fs_subsystem_type_snapshot(const char *name, kb_fs_type_snapshot_t *out_snapshot);

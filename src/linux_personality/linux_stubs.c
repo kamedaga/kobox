@@ -9,8 +9,9 @@
 
 typedef struct kb_ida_record {
     void *ida;
-    uint64_t *words;
-    size_t word_count;
+    unsigned int *ids;
+    size_t count;
+    size_t capacity;
     struct kb_ida_record *next;
 } kb_ida_record_t;
 
@@ -65,6 +66,16 @@ int kb_return_zero(void)
 int kb_return_one(void)
 {
     return 1;
+}
+
+void kb_string_get_size(uint64_t size, uint64_t blk_size, int units, char *buf, int len)
+{
+    (void)units;
+    if (buf == NULL || len <= 0) {
+        return;
+    }
+    const uint64_t bytes = blk_size == 0 ? size : size * blk_size;
+    (void)snprintf(buf, (size_t)len, "%llu B", (unsigned long long)bytes);
 }
 
 uint32_t kb_get_random_u32_below(uint32_t ceil)
@@ -601,21 +612,43 @@ static kb_ida_record_t *ida_record_for(void *ida, int create)
     return record;
 }
 
-static int ida_ensure_words(kb_ida_record_t *record, size_t required_words)
+static int ida_contains(const kb_ida_record_t *record, unsigned int id)
 {
     if (record == NULL) {
         return 0;
     }
-    if (record->word_count >= required_words) {
-        return 1;
+    for (size_t i = 0; i < record->count; i++) {
+        if (record->ids[i] == id) {
+            return 1;
+        }
     }
-    uint64_t *words = kb_krealloc_managed(record->words, required_words * sizeof(*words), 0);
-    if (words == NULL) {
+    return 0;
+}
+
+static int ida_ensure_capacity(kb_ida_record_t *record, size_t required_capacity)
+{
+    if (record == NULL) {
         return 0;
     }
-    memset(words + record->word_count, 0, (required_words - record->word_count) * sizeof(*words));
-    record->words = words;
-    record->word_count = required_words;
+    if (record->capacity >= required_capacity) {
+        return 1;
+    }
+    size_t next_capacity = record->capacity == 0 ? 8 : record->capacity * 2u;
+    while (next_capacity < required_capacity) {
+        if (next_capacity > SIZE_MAX / 2u) {
+            return 0;
+        }
+        next_capacity *= 2u;
+    }
+    if (next_capacity > SIZE_MAX / sizeof(*record->ids)) {
+        return 0;
+    }
+    unsigned int *ids = kb_krealloc_managed(record->ids, next_capacity * sizeof(*ids), 0);
+    if (ids == NULL) {
+        return 0;
+    }
+    record->ids = ids;
+    record->capacity = next_capacity;
     return 1;
 }
 
@@ -629,15 +662,12 @@ int kb_ida_alloc_range(void *ida, unsigned int min, unsigned int max, unsigned i
     if (record == NULL) {
         return -12;
     }
-    size_t required_words = ((size_t)max / 64u) + 1u;
-    if (!ida_ensure_words(record, required_words)) {
-        return -12;
-    }
     for (unsigned int id = min; id <= max; id++) {
-        size_t word_index = (size_t)id / 64u;
-        uint64_t bit = 1ull << (id % 64u);
-        if ((record->words[word_index] & bit) == 0) {
-            record->words[word_index] |= bit;
+        if (!ida_contains(record, id)) {
+            if (!ida_ensure_capacity(record, record->count + 1u)) {
+                return -12;
+            }
+            record->ids[record->count++] = id;
             return (int)id;
         }
         if (id == UINT32_MAX) {
@@ -653,11 +683,13 @@ void kb_ida_free(void *ida, unsigned int id)
     if (record == NULL) {
         return;
     }
-    size_t word_index = (size_t)id / 64u;
-    if (word_index >= record->word_count) {
-        return;
+    for (size_t i = 0; i < record->count; i++) {
+        if (record->ids[i] == id) {
+            record->ids[i] = record->ids[record->count - 1u];
+            record->count--;
+            return;
+        }
     }
-    record->words[word_index] &= ~(1ull << (id % 64u));
 }
 
 void kb_ida_destroy(void *ida)
@@ -667,7 +699,7 @@ void kb_ida_destroy(void *ida)
         kb_ida_record_t *record = *cursor;
         if (record->ida == ida) {
             *cursor = record->next;
-            kb_kfree(record->words);
+            kb_kfree(record->ids);
             kb_kfree(record);
             return;
         }

@@ -69,6 +69,7 @@ typedef struct nvme_io_smoke_case {
 } nvme_io_smoke_case_t;
 
 static void *tracked_admin_tag_set;
+static void *tracked_io_tag_set;
 static unsigned char *tracked_admin_nvmeq;
 static unsigned char *tracked_io_nvmeq;
 static unsigned int tracked_io_irq_waits;
@@ -80,6 +81,13 @@ static uint64_t recreated_io_cq_dma;
 static uint16_t read_u16(const void *ptr)
 {
     uint16_t value;
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+static uint32_t read_u32(const void *ptr)
+{
+    uint32_t value;
     memcpy(&value, ptr, sizeof(value));
     return value;
 }
@@ -149,7 +157,11 @@ static void *read_ptr(const void *ptr)
 
 static int trace_nvme_enabled(void)
 {
+#if defined(__pachaos__)
+    return 0;
+#else
     return getenv("KOBOX_TRACE_NVME") != NULL;
+#endif
 }
 
 static uint64_t nvme_monotonic_ns(void)
@@ -242,10 +254,6 @@ void kb_nvme_shim_track_queue(void *nvmeq_raw)
     uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
     if (qid == 0) {
         tracked_admin_nvmeq = nvmeq;
-        unsigned char *dev = read_ptr(nvmeq + KB_NVME_QUEUE_DEV_OFFSET);
-        if (dev != NULL) {
-            tracked_admin_tag_set = dev + KB_NVME_DEV_TAGSET_OFFSET;
-        }
     } else {
         tracked_io_nvmeq = nvmeq;
     }
@@ -259,7 +267,7 @@ static int nvme_block_match_tag_set(void *tag_set)
     if (tag_set == NULL) {
         return 0;
     }
-    if (tag_set == tracked_admin_tag_set) {
+    if (tag_set == tracked_admin_tag_set || tag_set == tracked_io_tag_set) {
         return 1;
     }
 
@@ -270,15 +278,30 @@ static int nvme_block_match_tag_set(void *tag_set)
 
 static void nvme_block_track_tag_set(void *tag_set)
 {
-    tracked_admin_tag_set = tag_set;
+    if (tag_set == NULL) {
+        return;
+    }
+    if (tracked_admin_tag_set == NULL) {
+        tracked_admin_tag_set = tag_set;
+    } else if (tag_set != tracked_admin_tag_set) {
+        tracked_io_tag_set = tag_set;
+    }
     if (trace_nvme_enabled()) {
-        fprintf(stderr, "kobox nvme: track admin tag_set=%p\n", tag_set);
+        fprintf(
+            stderr,
+            "kobox nvme: track tag_set=%p admin=%p io=%p\n",
+            tag_set,
+            tracked_admin_tag_set,
+            tracked_io_tag_set);
     }
 }
 
 static void *nvme_block_request_driver_data(void *queue, void *tag_set)
 {
     (void)queue;
+    if (tag_set == tracked_io_tag_set && tracked_io_nvmeq != NULL) {
+        return tracked_io_nvmeq;
+    }
     if (tag_set == tracked_admin_tag_set && tracked_admin_nvmeq != NULL) {
         return tracked_admin_nvmeq;
     }
@@ -320,8 +343,15 @@ static int nvme_block_map_kernel_buffer(void *request, void *buffer, unsigned in
         return -22;
     }
 
+    kb_dma_dir_t direction = KB_DMA_BIDIRECTIONAL;
+    if (cmd[0] == KB_NVME_CMD_WRITE) {
+        direction = KB_DMA_TO_DEVICE;
+    } else if (cmd[0] == KB_NVME_CMD_READ) {
+        direction = KB_DMA_FROM_DEVICE;
+    }
+
     uint64_t dma_addr = 0;
-    int result = kb_linux_block_request_map_dma(request, buffer, length, KB_DMA_BIDIRECTIONAL, &dma_addr);
+    int result = kb_linux_block_request_map_dma(request, buffer, length, direction, &dma_addr);
     if (result != 0) {
         return result;
     }
@@ -374,13 +404,13 @@ static int nvme_block_map_kernel_buffer(void *request, void *buffer, unsigned in
         fprintf(
             stderr,
             "kobox nvme: blk_rq_map_kern request=%p buffer=%p len=%u dma=0x%llx prp2=0x%llx opcode=0x%x cdw10=0x%x\n",
-            request,
-            buffer,
-            length,
-            (unsigned long long)dma_addr,
-            (unsigned long long)read_u64(cmd + 32),
-            (unsigned)cmd[0],
-            (unsigned)read_u64(cmd + 40));
+                request,
+                buffer,
+                length,
+                (unsigned long long)dma_addr,
+                (unsigned long long)read_u64(cmd + 32),
+                (unsigned)cmd[0],
+                (unsigned)read_u64(cmd + 40));
     }
     return 0;
 }
@@ -390,6 +420,22 @@ static int nvme_block_before_execute(void *request)
     unsigned char *cmd = kb_linux_block_request_command(request);
     if (cmd == NULL) {
         return -22;
+    }
+    if (cmd[0] == KB_NVME_ADMIN_CREATE_CQ) {
+        uint32_t cdw11 = read_u32(cmd + 44);
+        cdw11 &= 0x0000ffffu;
+        write_u32(cmd + 44, cdw11);
+    }
+    if (trace_nvme_enabled()) {
+        fprintf(
+            stderr,
+            "kobox nvme: execute opcode=0x%x nsid=0x%x prp1=0x%llx prp2=0x%llx cdw10=0x%x cdw11=0x%x\n",
+            (unsigned)cmd[0],
+            (unsigned)read_u32(cmd + 4),
+            (unsigned long long)read_u64(cmd + 24),
+            (unsigned long long)read_u64(cmd + 32),
+            (unsigned)read_u32(cmd + 40),
+            (unsigned)read_u32(cmd + 44));
     }
     if (cmd[0] == KB_NVME_ADMIN_DBBUF_CONFIG) {
         kb_nvme_subsystem_track_dbbuf(read_u64(cmd + 24), read_u64(cmd + 32));
@@ -442,7 +488,11 @@ static int nvme_submit_rw(unsigned char *nvmeq, uint8_t opcode, uint64_t lba, un
 {
     unsigned int op = opcode == KB_NVME_CMD_WRITE ? KB_NVME_REQ_OP_DRV_OUT : KB_NVME_REQ_OP_DRV_IN;
     unsigned char *dev = read_ptr(nvmeq + KB_NVME_QUEUE_DEV_OFFSET);
-    void *tag_set = dev == NULL ? tracked_admin_tag_set : dev + KB_NVME_DEV_TAGSET_OFFSET;
+    uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
+    void *tag_set = qid == 0 ? tracked_admin_tag_set : tracked_io_tag_set;
+    if (tag_set == NULL && dev != NULL) {
+        tag_set = dev + KB_NVME_DEV_TAGSET_OFFSET;
+    }
     void *request = nvme_smoke_alloc_request_for_queue(nvmeq, tag_set, op);
     if (request == NULL) {
         return -12;
@@ -467,6 +517,51 @@ static int nvme_submit_rw(unsigned char *nvmeq, uint8_t opcode, uint64_t lba, un
     return result;
 }
 
+static int nvme_block_disk_io(void *queue, uint8_t opcode, uint64_t sector, void *buffer, size_t byte_count)
+{
+    if (queue == NULL || buffer == NULL || byte_count == 0 || (byte_count % KB_NVME_LBA_SIZE) != 0) {
+        return -22;
+    }
+    if (byte_count > UINT32_MAX) {
+        return -34;
+    }
+
+    unsigned int blocks = (unsigned int)(byte_count / KB_NVME_LBA_SIZE);
+    unsigned int op = opcode == KB_NVME_CMD_WRITE ? KB_NVME_REQ_OP_DRV_OUT : KB_NVME_REQ_OP_DRV_IN;
+    void *request = kb_blk_mq_alloc_request(queue, op, 0);
+    if (request == NULL) {
+        return -12;
+    }
+
+    unsigned char *cmd = kb_linux_block_request_command(request);
+    if (cmd == NULL) {
+        kb_blk_mq_free_request(request);
+        return -22;
+    }
+    memset(cmd, 0, 64);
+    cmd[0] = opcode;
+    write_u32(cmd + 4, KB_NVME_NSID_FIRST);
+    write_u64(cmd + 40, sector);
+    write_u32(cmd + 48, blocks - 1u);
+
+    int result = kb_blk_rq_map_kern(queue, request, buffer, (unsigned int)byte_count, 0);
+    if (result == 0) {
+        result = kb_blk_execute_rq(request, 0);
+    }
+    kb_blk_mq_free_request(request);
+    return result;
+}
+
+static int nvme_block_disk_read(void *queue, uint64_t sector, void *buffer, size_t byte_count)
+{
+    return nvme_block_disk_io(queue, KB_NVME_CMD_READ, sector, buffer, byte_count);
+}
+
+static int nvme_block_disk_write(void *queue, uint64_t sector, const void *buffer, size_t byte_count)
+{
+    return nvme_block_disk_io(queue, KB_NVME_CMD_WRITE, sector, (void *)(uintptr_t)buffer, byte_count);
+}
+
 static int nvme_submit_admin_create_queue(unsigned char *adminq, uint8_t opcode, uint16_t qid, uint16_t depth, uint64_t prp1)
 {
     void *request = nvme_smoke_alloc_request_for_queue(adminq, tracked_admin_tag_set, KB_NVME_REQ_OP_DRV_OUT);
@@ -484,10 +579,21 @@ static int nvme_submit_admin_create_queue(unsigned char *adminq, uint8_t opcode,
     write_u64(cmd + 24, prp1);
     write_u32(cmd + 40, ((uint32_t)(depth - 1u) << 16) | qid);
     if (opcode == KB_NVME_ADMIN_CREATE_CQ) {
-        unsigned int cq_vector = kb_pci_subsystem_irq_vector_count() > qid ? qid : 0u;
+        unsigned int cq_vector = 0;
         write_u32(cmd + 44, (cq_vector << 16) | 0x00000003u);
     } else {
         write_u32(cmd + 44, ((uint32_t)qid << 16) | 0x00000001u);
+    }
+    if (trace_nvme_enabled()) {
+        fprintf(
+            stderr,
+            "kobox nvme: create queue opcode=0x%x qid=%u depth=%u prp1=0x%llx cdw10=0x%x cdw11=0x%x\n",
+            (unsigned)opcode,
+            (unsigned)qid,
+            (unsigned)depth,
+            (unsigned long long)prp1,
+            (unsigned)read_u32(cmd + 40),
+            (unsigned)read_u32(cmd + 44));
     }
 
     int result = kb_blk_execute_rq(request, 0);
@@ -996,7 +1102,7 @@ static int nvme_block_complete_execute(void *request)
             (unsigned long long)result64,
             head);
     }
-    return 0;
+    return (completion_status >> 1) == 0 ? 0 : -5;
 }
 
 static const kb_linux_block_driver_ops_t nvme_block_ops = {
@@ -1009,6 +1115,8 @@ static const kb_linux_block_driver_ops_t nvme_block_ops = {
     .map_kernel_buffer = nvme_block_map_kernel_buffer,
     .before_execute = nvme_block_before_execute,
     .complete_execute = nvme_block_complete_execute,
+    .disk_read = nvme_block_disk_read,
+    .disk_write = nvme_block_disk_write,
 };
 
 void kb_nvme_shim_register_block_driver(void)

@@ -45,6 +45,33 @@ static const char *printk_format(const char *fmt)
     return fmt;
 }
 
+static int printk_loglevel(const char *fmt)
+{
+    if (fmt != NULL && (unsigned char)fmt[0] == 1 && fmt[1] >= '0' && fmt[1] <= '7') {
+        return fmt[1] - '0';
+    }
+    return -1;
+}
+
+static int printk_trace_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_PRINTK");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int routine_printk_message(const char *text)
+{
+    if (text == NULL) {
+        return 0;
+    }
+    if ((unsigned char)text[0] == 1 && text[1] >= '5' && text[1] <= '7') {
+        return 1;
+    }
+    return strncmp(text, "pci function ", 13) == 0 ||
+        strstr(text, " default/read/poll queues") != NULL ||
+        strncmp(text, "Ignoring bogus Namespace Identifiers", 36) == 0;
+}
+
 static size_t safe_bounded_strlen(const char *text, size_t limit)
 {
     size_t length = 0;
@@ -260,7 +287,7 @@ static void safe_buffer_put_pointer(safe_snprintf_buffer_t *out, const void *ptr
     safe_buffer_put_number(out, (uintptr_t)ptr, 0, 16u, 0, 0, &pointer_options);
 }
 
-int kb_vsnprintf_safe(char *buf, size_t size, const char *fmt, va_list args)
+int KB_STACK_REALIGN kb_vsnprintf_safe(char *buf, size_t size, const char *fmt, va_list args)
 {
     safe_snprintf_buffer_t out = {
         .buf = buf,
@@ -440,7 +467,7 @@ int kb_vsnprintf_safe(char *buf, size_t size, const char *fmt, va_list args)
     return out.total;
 }
 
-int kb_vprintk_safe(const char *fmt, va_list args)
+int KB_STACK_REALIGN kb_vprintk_safe(const char *fmt, va_list args)
 {
     char buffer[4096];
     va_list copy;
@@ -448,12 +475,35 @@ int kb_vprintk_safe(const char *fmt, va_list args)
     int needed = kb_vsnprintf_safe(buffer, sizeof(buffer), fmt, copy);
     va_end(copy);
 
+    int level = printk_loglevel(fmt);
+    if (!printk_trace_enabled() && (level >= 5 || routine_printk_message(buffer))) {
+        return needed;
+    }
+
     size_t length = safe_bounded_strlen(buffer, sizeof(buffer));
     (void)stderr_write_all(buffer, length);
     return needed;
 }
 
-int kb_snprintf_safe(char *buf, size_t size, const char *fmt, ...)
+static int KB_STACK_REALIGN kb_vprintk_filtered(const char *fmt, va_list args)
+{
+    char buffer[4096];
+    va_list copy;
+    va_copy(copy, args);
+    int needed = kb_vsnprintf_safe(buffer, sizeof(buffer), fmt, copy);
+    va_end(copy);
+
+    int level = printk_loglevel(fmt);
+    if (!printk_trace_enabled() && (level >= 5 || routine_printk_message(buffer))) {
+        return needed;
+    }
+
+    size_t length = safe_bounded_strlen(buffer, sizeof(buffer));
+    (void)stderr_write_all(buffer, length);
+    return needed;
+}
+
+int KB_STACK_REALIGN kb_snprintf_safe(char *buf, size_t size, const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
@@ -462,7 +512,7 @@ int kb_snprintf_safe(char *buf, size_t size, const char *fmt, ...)
     return result;
 }
 
-int kb_sprintf_safe(char *buf, const char *fmt, ...)
+int KB_STACK_REALIGN kb_sprintf_safe(char *buf, const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
@@ -471,7 +521,16 @@ int kb_sprintf_safe(char *buf, const char *fmt, ...)
     return result;
 }
 
-int kb_printk(const char *fmt, ...)
+int KB_STACK_REALIGN kb_printk(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    int written = kb_vprintk_filtered(fmt, args);
+    va_end(args);
+    return written;
+}
+
+int KB_STACK_REALIGN kb_tracef(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
@@ -480,20 +539,11 @@ int kb_printk(const char *fmt, ...)
     return written;
 }
 
-int kb_tracef(const char *fmt, ...)
+int KB_STACK_REALIGN printk(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    int written = kb_vprintk_safe(fmt, args);
-    va_end(args);
-    return written;
-}
-
-int printk(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    int written = kb_vprintk_safe(fmt, args);
+    int written = kb_vprintk_filtered(fmt, args);
     va_end(args);
     return written;
 }

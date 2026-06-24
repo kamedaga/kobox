@@ -83,8 +83,12 @@ static int trace_work_enabled(void)
     if (cached >= 0) {
         return cached;
     }
+#if defined(__pachaos__)
+    cached = 0;
+#else
     const char *value = getenv("KOBOX_TRACE_WORK");
     cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+#endif
     return cached;
 }
 
@@ -117,6 +121,11 @@ static uint64_t host_time_ns(void)
 
 static int pachaos_backend_active(void)
 {
+#if defined(__pachaos__)
+    if (kb_shim_current_device_backend() != NULL) {
+        return 1;
+    }
+#endif
     static int cached = -1;
     if (cached >= 0) {
         return cached;
@@ -128,6 +137,11 @@ static int pachaos_backend_active(void)
     }
     cached = getenv("KOBOX_PACHAOS_DEVICE_CAPSULE") != NULL || getenv("KOBOX_PACHAOS_DEVICE_CATALOG") != NULL;
     return cached;
+}
+
+static int trace_work_or_pachaos_enabled(void)
+{
+    return trace_work_enabled();
 }
 
 static uint64_t elapsed_ns(void)
@@ -669,13 +683,13 @@ static int work_function_usable(void *work, void (*func)(void *), const char *op
         return 0;
     }
     if (!kb_module_is_executable_address((const void *)func)) {
-        if (trace_work_enabled()) {
+        if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: skip invalid %s work=%p func=%p\n", op, work, (void *)func);
         }
         return 0;
     }
     if (is_obviously_not_work_function(func)) {
-        if (trace_work_enabled()) {
+        if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: skip non-work %s work=%p func=%p\n", op, work, (void *)func);
         }
         return 0;
@@ -695,16 +709,16 @@ static int run_work(void *work, unsigned long fallback_gs)
         return 0;
     }
     if (is_usb_lpm_work_function(func)) {
-        if (trace_work_enabled()) {
+        if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: skip usb lpm work=%p func=%p\n", work, (void *)func);
         }
         return 1;
     }
-    if (trace_work_enabled()) {
+    if (trace_work_or_pachaos_enabled()) {
         fprintf(stderr, "kobox work: run work=%p func=%p\n", work, (void *)func);
     }
     if (!kb_usb_root_hub_poll_needed() && is_usb_root_hub_poll_function(func)) {
-        if (trace_work_enabled()) {
+        if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: skip paused root hub poll work=%p func=%p\n", work, (void *)func);
         }
         return 1;
@@ -716,7 +730,7 @@ static int run_work(void *work, unsigned long fallback_gs)
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
-    if (trace_work_enabled()) {
+    if (trace_work_or_pachaos_enabled()) {
         fprintf(stderr, "kobox work: done work=%p func=%p\n", work, (void *)func);
     }
     return 1;
@@ -874,7 +888,7 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
     (void)cpu;
     (void)wq;
     if (work == NULL) {
-        if (trace_work_enabled()) {
+        if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: queue_work skip wq=%p work=%p func=%p pending=%d\n",
                 wq,
                 work,
@@ -892,7 +906,7 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
 
     if (work_pending(work)) {
         if (deferred_contains(KB_DEFERRED_WORK, work)) {
-            if (trace_work_enabled()) {
+            if (trace_work_or_pachaos_enabled()) {
                 fprintf(stderr, "kobox work: queue_work skip wq=%p work=%p func=%p pending=1\n",
                     wq,
                     work,
@@ -900,7 +914,7 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
             }
             return 0;
         }
-        if (trace_work_enabled()) {
+        if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: queue_work clear stale pending wq=%p work=%p func=%p\n",
                 wq,
                 work,
@@ -909,7 +923,7 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
         clear_work_pending(work);
     }
 
-    if (trace_work_enabled()) {
+    if (trace_work_or_pachaos_enabled()) {
         fprintf(stderr, "kobox work: queue_work wq=%p work=%p func=%p\n",
             wq,
             work,
@@ -921,6 +935,11 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
         return 0;
     }
     return 1;
+}
+
+int kb_kblockd_schedule_work(void *work)
+{
+    return kb_queue_work_on(-1, NULL, work);
 }
 
 int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay)
@@ -939,7 +958,7 @@ int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay
         if (deferred_contains(KB_DEFERRED_WORK, dwork)) {
             return 0;
         }
-        if (trace_work_enabled()) {
+        if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: queue_delayed_work clear stale pending wq=%p work=%p func=%p delay=%lu\n",
                 wq,
                 dwork,
@@ -950,7 +969,7 @@ int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay
     }
     set_work_pending(dwork);
     uint64_t due_ns = delay == 0 ? 0 : elapsed_ns() + jiffies_to_ns(delay);
-    if (trace_work_enabled()) {
+    if (trace_work_or_pachaos_enabled()) {
         fprintf(stderr,
             "kobox work: queue_delayed_work wq=%p work=%p func=%p delay=%lu due_ns=%llu caller=%p\n",
             wq,
@@ -1090,16 +1109,12 @@ unsigned long kb_schedule_timeout(unsigned long timeout)
     kb_jbd2_progress_registered_journals();
     if (timeout == ULONG_MAX) {
         kb_run_deferred_bottom_halves();
-        (void)kb_handle_any_irq_no_work(1000000ull);
+        (void)kb_handle_any_irq_no_work(0);
         kb_jbd2_progress_registered_journals();
         return timeout;
     }
-    uint64_t ns = jiffies_to_ns(timeout);
-    const uint64_t max_real_wait_ns = 10ull * KB_NSEC_PER_MSEC;
-    if (ns > max_real_wait_ns) {
-        ns = max_real_wait_ns;
-    }
-    sleep_ns(ns);
+    kb_run_deferred_bottom_halves();
+    (void)kb_handle_any_irq_no_work(0);
     kb_jbd2_progress_registered_journals();
     return 0;
 }

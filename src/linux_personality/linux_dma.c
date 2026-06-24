@@ -28,8 +28,12 @@ static kb_device_t *dma_device(void *dev)
 
 static int trace_dma_enabled(void)
 {
+#if defined(__pachaos__)
+    return 0;
+#else
     const char *value = getenv("KOBOX_TRACE_DMA");
     return value != NULL && value[0] != '\0' && value[0] != '0';
+#endif
 }
 
 static int linux_page_to_cpu_addr(void *page, unsigned long offset, void **out_addr)

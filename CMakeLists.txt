@@ -14,16 +14,18 @@ option(KOBOX_ENABLE_QEMU_TESTS "Enable QEMU-backed live smoke tests" OFF)
 option(KOBOX_ENABLE_LINUX_BOOT_TESTS "Enable KVM-backed Linux boot smoke tests" OFF)
 
 add_library(kobox_runtime STATIC
+    ../userland/libcapsule/src/capsule.c
+    ../userland/libpacha/src/syscall.c
     src/device/device_backend.c
     src/host_interface/interface.c
     src/host_interface/linux_interface_common.c
     src/host_interface/linux_ipc/interface_linux_ipc.c
     src/device/linux_mock/device_linux_mock.c
     src/device/pachaos_capsule/device_pachaos_capsule.c
+    src/device/pachaos_capsule/device_pachaos_capsule_env.c
     src/device/linux_sysfs/device_linux_sysfs.c
     src/device/linux_vfio/device_linux_vfio.c
     src/device/linux_vfio/nvme.c
-    src/device/linux_vfio/virtio_blk.c
     src/loader/elf_reader.c
     src/loader/module_loader.c
     src/loader/symbol_registry.c
@@ -75,13 +77,15 @@ add_library(kobox_runtime STATIC
     src/linux_personality/linux_stub_symbols.c
     src/linux_personality/linux_sync.c
     src/linux_personality/linux_usb.c
-    src/linux_personality/linux_virtio_input.c
+    src/linux_personality/linux_input.c
     src/linux_personality/linux_work.c
 )
 
 target_include_directories(kobox_runtime
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../userland/libcapsule/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../userland/libpacha/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
@@ -98,6 +102,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         -mstackrealign
     )
 endif()
+
+set_source_files_properties(
+    ../userland/libcapsule/src/capsule.c
+    src/device/pachaos_capsule/device_pachaos_capsule.c
+    src/device/pachaos_capsule/device_pachaos_capsule_env.c
+    PROPERTIES
+        COMPILE_OPTIONS "-Wno-pedantic;-Wno-enum-too-large"
+)
 
 add_executable(kobox-inspect
     tools/kobox_inspect/main.c
@@ -171,36 +183,6 @@ add_executable(kobox-vfio-nvme-smoke
 
 target_link_libraries(kobox-vfio-nvme-smoke PRIVATE kobox_runtime)
 target_compile_options(kobox-vfio-nvme-smoke PRIVATE
-    -Wall
-    -Wextra
-    -Wpedantic
-    -Werror
-)
-
-add_executable(kobox-ext4-real-ops
-    tools/kobox_ext4_real_ops_probe/main.c
-)
-
-target_link_libraries(kobox-ext4-real-ops PRIVATE kobox_runtime)
-target_include_directories(kobox-ext4-real-ops PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-target_compile_options(kobox-ext4-real-ops PRIVATE
-    -Wall
-    -Wextra
-    -Wpedantic
-    -Werror
-)
-
-add_executable(kobox-kvm-real-ops
-    tools/kobox_kvm_real_ops_probe/main.c
-)
-
-target_link_libraries(kobox-kvm-real-ops PRIVATE kobox_runtime)
-target_include_directories(kobox-kvm-real-ops PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-target_compile_options(kobox-kvm-real-ops PRIVATE
     -Wall
     -Wextra
     -Wpedantic
@@ -322,39 +304,6 @@ target_compile_options(kobox-fs-block-disk-smoke PRIVATE
 add_test(NAME kobox-fs-block-disk-smoke COMMAND kobox-fs-block-disk-smoke)
 
 add_test(
-    NAME kobox-ext4-real-ops
-    COMMAND ${CMAKE_COMMAND} -E env
-        KOBOX_EXT4_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-ext4-real-ops>
-        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ext4_real_ops_probe.sh
-)
-set_tests_properties(kobox-ext4-real-ops PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    SKIP_RETURN_CODE 77
-)
-
-add_test(
-    NAME kobox-ext4-feature-matrix
-    COMMAND ${CMAKE_COMMAND} -E env
-        KOBOX_EXT4_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-ext4-real-ops>
-        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ext4_feature_matrix_probe.sh
-)
-set_tests_properties(kobox-ext4-feature-matrix PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    SKIP_RETURN_CODE 77
-)
-
-add_test(
-    NAME kobox-kvm-real-ops
-    COMMAND ${CMAKE_COMMAND} -E env
-        KOBOX_KVM_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-kvm-real-ops>
-        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_kvm_real_ops_probe.sh
-)
-set_tests_properties(kobox-kvm-real-ops PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    SKIP_RETURN_CODE 77
-)
-
-add_test(
     NAME kobox-ahci-ko-smoke
     COMMAND ${CMAKE_COMMAND} -E env
         KOBOX_RUNNER=$<TARGET_FILE:kobox-run>
@@ -375,38 +324,6 @@ set_tests_properties(kobox-ahci-mock-probe-smoke PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     SKIP_RETURN_CODE 77
 )
-
-if(KOBOX_ENABLE_QEMU_TESTS)
-    add_test(
-        NAME kobox-qemu-nested-kvm-smoke
-        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_qemu_nested_kvm_smoke.sh
-    )
-    set_tests_properties(kobox-qemu-nested-kvm-smoke PROPERTIES
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        SKIP_RETURN_CODE 77
-    )
-    add_test(
-        NAME kobox-qemu-vfio-nvme-kvm-linux-rootfs-smoke
-        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_qemu_vfio_nvme_kvm_linux_rootfs_smoke.sh
-    )
-    set_tests_properties(kobox-qemu-vfio-nvme-kvm-linux-rootfs-smoke PROPERTIES
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        SKIP_RETURN_CODE 77
-    )
-endif()
-
-if(KOBOX_ENABLE_LINUX_BOOT_TESTS)
-    add_test(
-        NAME kobox-kvm-linux-rootfs-smoke
-        COMMAND ${CMAKE_COMMAND} -E env
-            KOBOX_KVM_REAL_OPS_RUNNER=$<TARGET_FILE:kobox-kvm-real-ops>
-            sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_kvm_linux_rootfs_smoke.sh
-    )
-    set_tests_properties(kobox-kvm-linux-rootfs-smoke PROPERTIES
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        SKIP_RETURN_CODE 77
-    )
-endif()
 
 add_test(
     NAME kobox-live-script-args

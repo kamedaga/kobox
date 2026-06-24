@@ -61,7 +61,7 @@ int main(void)
     }
 
     kb_fs_block_device_t *fs_device = NULL;
-    if (kb_fs_block_device_create_from_disk("pachaos-virtio-blk-smoke", disk, &fs_device) != 0 ||
+    if (kb_fs_block_device_create_from_disk("pachaos-block-smoke", disk, &fs_device) != 0 ||
         fs_device == NULL)
     {
         return 4;

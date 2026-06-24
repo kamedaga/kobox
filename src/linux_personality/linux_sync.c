@@ -14,8 +14,12 @@ static int trace_work_enabled(void)
     if (cached >= 0) {
         return cached;
     }
+#if defined(__pachaos__)
+    cached = 0;
+#else
     const char *value = getenv("KOBOX_TRACE_WORK");
     cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+#endif
     return cached;
 }
 

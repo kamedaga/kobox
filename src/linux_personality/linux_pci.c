@@ -12,6 +12,12 @@ kb_device_backend_t *kb_shim_current_device_backend(void);
 
 static kb_status_t first_device(kb_device_backend_t *backend, kb_device_t **out_device);
 static int trace_pci_enabled(void);
+#define kb_pci_tracef(...) \
+    do { \
+        if (trace_pci_enabled()) { \
+            kb_tracef(__VA_ARGS__); \
+        } \
+    } while (0)
 typedef struct shim_mmio_mapping shim_mmio_mapping_t;
 static int remember_mmio_mapping(
     kb_device_backend_t *backend,
@@ -121,14 +127,23 @@ static void trace_xhci_dma_window(const char *label, uint64_t dma_addr, size_t b
 
 static int pachaos_backend_active(void)
 {
+#if defined(__pachaos__)
+    return 1;
+#else
     const char *backend = getenv("KOBOX_DEVICE_BACKEND");
     return backend != NULL && (strcmp(backend, "pachaos") == 0 || strcmp(backend, "pachaos_capsule") == 0);
+#endif
 }
 
 static int env_enabled(const char *name)
 {
+#if defined(__pachaos__)
+    (void)name;
+    return 0;
+#else
     const char *value = getenv(name);
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+#endif
 }
 
 static int pci_device_is_xhci(void *dev)
@@ -213,7 +228,10 @@ enum {
     KB_LINUX_6_8_PCI_BUS_DOMAIN_PTR_OFFSET = 0x0c8,
     KB_LINUX_6_8_PCI_BUS_NUMBER_OFFSET = 0x0d8,
     KB_LINUX_6_8_DEVICE_POWER_USAGE_COUNT_OFFSET = 0x1b0,
+    KB_LINUX_IORESOURCE_IO = 0x00000100,
     KB_LINUX_IORESOURCE_MEM = 0x00000200,
+    KB_LINUX_IORESOURCE_PREFETCH = 0x00002000,
+    KB_LINUX_IORESOURCE_MEM_64 = 0x00100000,
     KB_IRQ_BACKEND_KIND_MSI = 1,
     KB_IRQ_BACKEND_KIND_MSIX = 2,
 };
@@ -283,6 +301,9 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
         KB_PCI_MSI_CONTROL_MME_MASK = 0x0070,
     };
 
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: alloc_irq_vectors enter min=%u max=%u flags=0x%x\n", min_vecs, max_vecs, flags);
+#endif
     if (min_vecs == 0) {
         min_vecs = 1;
     }
@@ -299,6 +320,9 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
     kb_pci_subsystem_irq_vectors_clear();
     kb_irq_clear_mappings();
 
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: alloc_irq_vectors before xhci legacy check\n");
+#endif
     if (pachaos_xhci_uses_legacy_irq(dev)) {
         if (min_vecs > 1) {
             if (trace_pci_enabled()) {
@@ -329,26 +353,60 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
             flags);
     }
 
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: alloc_irq_vectors before msix check\n");
+#endif
     if ((flags & KB_PCI_IRQ_MSIX) != 0) {
         int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSIX);
+#if defined(__pachaos__)
+        kb_pci_tracef("kobox pci: alloc_irq_vectors msix cap=%d\n", cap);
+#endif
         if (cap != 0) {
             uint16_t control = 0;
-            if (kb_pci_read_config_word(dev, cap + 2, &control) == 0) {
+            int read_status = kb_pci_read_config_word(dev, cap + 2, &control);
+#if defined(__pachaos__)
+            kb_pci_tracef("kobox pci: alloc_irq_vectors msix control read=%d value=0x%x\n", read_status, (unsigned int)control);
+#endif
+            if (read_status == 0) {
                 unsigned int table_size = (unsigned int)((control & KB_PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1u);
                 unsigned int vectors = max_vecs < table_size ? max_vecs : table_size;
+#if defined(__pachaos__)
+                kb_pci_tracef(
+                    "kobox pci: alloc_irq_vectors msix table_size=%u vectors=%u min=%u\n",
+                    table_size,
+                    vectors,
+                    min_vecs);
+#endif
                 if (vectors >= min_vecs) {
                     int backend_programs_table = pachaos_backend_programs_msix_table();
+#if defined(__pachaos__)
+                    kb_pci_tracef(
+                        "kobox pci: alloc_irq_vectors msix backend_programs_table=%d\n",
+                        backend_programs_table);
+#endif
                     unsigned int linux_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
                     uint16_t entries[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
                     for (unsigned int i = 0; i < vectors; i++) {
                         entries[i] = (uint16_t)i;
+#if defined(__pachaos__)
+                        kb_pci_tracef("kobox pci: alloc_irq_vectors msix before irq map i=%u\n", i);
+#endif
                         if (kb_irq_allocate_mapping(KB_IRQ_BACKEND_KIND_MSIX, i, &linux_vectors[i]) != 0) {
                             kb_irq_clear_mappings();
                             kb_pci_subsystem_irq_vectors_clear();
                             return -12;
                         }
+#if defined(__pachaos__)
+                        kb_pci_tracef(
+                            "kobox pci: alloc_irq_vectors msix irq map i=%u linux=%u\n",
+                            i,
+                            linux_vectors[i]);
+#endif
                     }
                     if (!backend_programs_table) {
+#if defined(__pachaos__)
+                        kb_pci_tracef("kobox pci: alloc_irq_vectors msix before enable write\n");
+#endif
                         control |= KB_PCI_MSIX_CONTROL_ENABLE;
                         control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
                         if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
@@ -356,16 +414,25 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
                             kb_pci_subsystem_irq_vectors_clear();
                             return -5;
                         }
+#if defined(__pachaos__)
+                        kb_pci_tracef("kobox pci: alloc_irq_vectors msix before unmask\n");
+#endif
                         if (kb_pci_msix_unmask_entries(dev, entries, vectors) != 0) {
                             kb_irq_clear_mappings();
                             kb_pci_subsystem_irq_vectors_clear();
                             return -5;
                         }
                     }
+#if defined(__pachaos__)
+                    kb_pci_tracef("kobox pci: alloc_irq_vectors msix before vector set\n");
+#endif
                     if (kb_pci_subsystem_irq_vectors_set(vectors, linux_vectors) != 0) {
                         kb_irq_clear_mappings();
                         return -22;
                     }
+#if defined(__pachaos__)
+                    kb_pci_tracef("kobox pci: alloc_irq_vectors msix done vectors=%u\n", vectors);
+#endif
                     if (trace_pci_enabled()) {
                         fprintf(
                             stderr,
@@ -384,8 +451,14 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
             }
         }
     }
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: alloc_irq_vectors before msi check\n");
+#endif
     if ((flags & KB_PCI_IRQ_MSI) != 0) {
         int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSI);
+#if defined(__pachaos__)
+        kb_pci_tracef("kobox pci: alloc_irq_vectors msi cap=%d\n", cap);
+#endif
         if (cap != 0) {
             uint16_t control = 0;
             if (kb_pci_read_config_word(dev, cap + 2, &control) == 0) {
@@ -623,7 +696,8 @@ static kb_status_t update_pci_command(uint16_t set_bits, uint16_t clear_bits)
 
 static int trace_pci_enabled(void)
 {
-    return getenv("KOBOX_TRACE_PCI") != NULL;
+    const char *value = getenv("KOBOX_TRACE_PCI");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
 static int remember_mmio_mapping(
@@ -1279,6 +1353,14 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
                 continue;
             }
             uint64_t flags = bar.flags == 0 ? KB_LINUX_IORESOURCE_MEM : bar.flags;
+#if defined(__pachaos__)
+            kb_pci_tracef(
+                "kobox pci: resource bar=%u start=0x%llx end=0x%llx flags=0x%llx\n",
+                bar_index,
+                (unsigned long long)bar.start,
+                (unsigned long long)bar.end,
+                (unsigned long long)flags);
+#endif
             write_pci_resource(
                 KB_LINUX_6_8_PCI_RESOURCE0_START_OFFSET,
                 KB_LINUX_6_8_PCI_RESOURCE0_END_OFFSET,
@@ -1351,10 +1433,16 @@ void kb_pci_unregister_driver(void *driver)
 int kb_pci_enable_device(void *dev)
 {
     (void)dev;
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: enable_device enter\n");
+#endif
     if (trace_pci_enabled()) {
         fprintf(stderr, "kobox pci: pci_enable_device\n");
     }
     kb_status_t status = update_pci_command(KB_PCI_COMMAND_MEMORY, KB_PCI_COMMAND_INTX_DISABLE);
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: enable_device command status=%d\n", (int)status);
+#endif
     binding.pci_command = (uint16_t)(binding.pci_command | KB_PCI_COMMAND_MEMORY);
     write_u32(binding.pci_dev_storage + KB_LINUX_6_8_PCI_DEV_ENABLE_CNT_OFFSET, 1);
     write_u32(
@@ -1386,10 +1474,16 @@ void kb_pci_disable_device(void *dev)
 void kb_pci_set_master(void *dev)
 {
     (void)dev;
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: set_master enter\n");
+#endif
     if (trace_pci_enabled()) {
         fprintf(stderr, "kobox pci: pci_set_master\n");
     }
     (void)update_pci_command(KB_PCI_COMMAND_MASTER, 0);
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: set_master done\n");
+#endif
     binding.pci_command = (uint16_t)(binding.pci_command | KB_PCI_COMMAND_MASTER);
 }
 
@@ -1501,10 +1595,27 @@ static int read_config_bytes(void *dev, int where, void *dst, size_t len)
                 continue;
             }
             uint32_t raw_bar = (uint32_t)(bar.start & UINT64_C(0xfffffff0));
-            if ((bar.flags & KB_LINUX_IORESOURCE_MEM) == 0) {
+            if ((bar.flags & KB_LINUX_IORESOURCE_IO) != 0 || (bar.flags & KB_LINUX_IORESOURCE_MEM) == 0) {
                 raw_bar = (uint32_t)((bar.start & UINT64_C(0xfffffffc)) | 1u);
+            } else {
+                if ((bar.flags & KB_LINUX_IORESOURCE_MEM_64) != 0) {
+                    raw_bar |= 0x4u;
+                }
+                if ((bar.flags & KB_LINUX_IORESOURCE_PREFETCH) != 0) {
+                    raw_bar |= 0x8u;
+                }
             }
             config_write_u32(config, 0x10 + ((size_t)bar_index * sizeof(uint32_t)), raw_bar);
+            if ((bar.flags & KB_LINUX_IORESOURCE_MEM) != 0 &&
+                (bar.flags & KB_LINUX_IORESOURCE_MEM_64) != 0 &&
+                bar_index + 1u < 6)
+            {
+                config_write_u32(
+                    config,
+                    0x10 + (((size_t)bar_index + 1u) * sizeof(uint32_t)),
+                    (uint32_t)(bar.start >> 32));
+                bar_index++;
+            }
         }
     }
 
@@ -1765,6 +1876,9 @@ void *kb_pci_iomap(void *dev, int bar, unsigned long max)
 {
     (void)dev;
     (void)max;
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: pci_iomap enter bar=%d max=%lu\n", bar, max);
+#endif
     kb_device_backend_t *backend = kb_shim_current_device_backend();
     kb_device_t *device = binding.device;
     if (device == NULL && first_device(backend, &device) != KB_OK) {
@@ -1796,8 +1910,19 @@ void *kb_pci_iomap(void *dev, int bar, unsigned long max)
 
     kb_mmio_region_t region;
     if (ops->map_bar(device, (unsigned)bar, &region) != KB_OK) {
+#if defined(__pachaos__)
+        kb_pci_tracef("kobox pci: pci_iomap map_bar failed bar=%d\n", bar);
+#endif
         return NULL;
     }
+#if defined(__pachaos__)
+    kb_pci_tracef(
+        "kobox pci: pci_iomap mapped bar=%d addr=%p size=0x%llx phys=0x%llx\n",
+        bar,
+        region.addr,
+        (unsigned long long)region.size,
+        (unsigned long long)region.host_phys);
+#endif
     if (remember_mmio_mapping(backend, device, &region, region.addr, (size_t)region.size, bar) != 0) {
         ops->unmap_bar(device, &region);
         return NULL;
@@ -1831,6 +1956,9 @@ void *kb_pcim_iomap(void *dev, int bar, unsigned long max)
 int kb_pcim_iomap_regions_request_all(void *dev, int mask, const char *name)
 {
     (void)name;
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: pcim_iomap_regions_request_all mask=0x%x\n", mask);
+#endif
     for (int bar = 0; bar < (int)(sizeof(binding.pcim_iomap_table) / sizeof(binding.pcim_iomap_table[0])); bar++) {
         if ((mask & (1 << bar)) == 0) {
             continue;
@@ -1868,6 +1996,9 @@ void kb_pci_release_all_mmio_mappings(void)
 
 void *kb_ioremap(uint64_t phys_addr, size_t size)
 {
+#if defined(__pachaos__)
+    kb_pci_tracef("kobox pci: ioremap enter phys=0x%llx size=0x%zx\n", (unsigned long long)phys_addr, size);
+#endif
     kb_device_backend_t *backend = kb_shim_current_device_backend();
     kb_device_t *device = binding.device;
     if (device == NULL && first_device(backend, &device) != KB_OK) {
@@ -1884,6 +2015,15 @@ void *kb_ioremap(uint64_t phys_addr, size_t size)
         return NULL;
     }
     if (phys_addr < bar.start || size > bar.size || phys_addr + size - 1u > bar.end) {
+#if defined(__pachaos__)
+        kb_pci_tracef(
+            "kobox pci: ioremap reject phys=0x%llx size=0x%zx bar_start=0x%llx bar_end=0x%llx bar_size=0x%llx\n",
+            (unsigned long long)phys_addr,
+            size,
+            (unsigned long long)bar.start,
+            (unsigned long long)bar.end,
+            (unsigned long long)bar.size);
+#endif
         return NULL;
     }
 
@@ -1910,9 +2050,20 @@ void *kb_ioremap(uint64_t phys_addr, size_t size)
 
     kb_mmio_region_t region;
     if (ops->map_bar(device, 0, &region) != KB_OK) {
+#if defined(__pachaos__)
+        kb_pci_tracef("kobox pci: ioremap map_bar failed\n");
+#endif
         return NULL;
     }
     void *mapped_addr = (unsigned char *)region.addr + (phys_addr - bar.start);
+#if defined(__pachaos__)
+    kb_pci_tracef(
+        "kobox pci: ioremap mapped phys=0x%llx addr=%p region=%p region_size=0x%llx\n",
+        (unsigned long long)phys_addr,
+        mapped_addr,
+        region.addr,
+        (unsigned long long)region.size);
+#endif
     if (remember_mmio_mapping(backend, device, &region, mapped_addr, size, 0) != 0) {
         ops->unmap_bar(device, &region);
         return NULL;

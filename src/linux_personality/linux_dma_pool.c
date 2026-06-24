@@ -27,8 +27,12 @@ static int low_or_error_pointer(const void *ptr)
 
 static int trace_dma_enabled(void)
 {
+#if defined(__pachaos__)
+    return 0;
+#else
     const char *value = getenv("KOBOX_TRACE_DMA");
     return value != NULL && value[0] != '\0' && value[0] != '0';
+#endif
 }
 
 void *kb_dma_pool_create(const char *name, void *dev, size_t size, size_t align, size_t allocation)

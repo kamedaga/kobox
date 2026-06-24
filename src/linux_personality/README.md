@@ -18,7 +18,7 @@ Symbol providers owned by this layer:
 
 - `linux_core_symbols.c`: common implemented Linux ABI symbols such as printk,
   memory allocation, IRQ helpers, sync primitives, timers, workqueues, and
-  virtio/input-adjacent generic helpers.
+  input-adjacent generic helpers.
 - `linux_stub_symbols.c`: temporary generic fallback symbols such as no-op,
   return-zero, return-one, allocation stub, identity pointer, and empty string
   mappings.

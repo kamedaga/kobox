@@ -10,6 +10,12 @@
 extern "C" {
 #endif
 
+#if (defined(__i386__) || defined(__x86_64__)) && (defined(__GNUC__) || defined(__clang__))
+#define KB_STACK_REALIGN __attribute__((force_align_arg_pointer))
+#else
+#define KB_STACK_REALIGN
+#endif
+
 void *kb_kmalloc(size_t size, unsigned int flags);
 void *kb_kzalloc(size_t size, unsigned int flags);
 void *kb_kmalloc_trace(void *cache, unsigned int flags, size_t size);
@@ -22,14 +28,14 @@ void kb_kmem_cache_free(void *cache, void *ptr);
 void kb_kfree(void *ptr);
 void *kb_krealloc_managed(void *ptr, size_t size, unsigned int flags);
 size_t kb_kmalloc_usable_size(const void *ptr);
-int kb_printk(const char *fmt, ...);
-int kb_vprintk_safe(const char *fmt, va_list args);
-int kb_vsnprintf_safe(char *buf, size_t size, const char *fmt, va_list args);
-int kb_snprintf_safe(char *buf, size_t size, const char *fmt, ...);
-int kb_sprintf_safe(char *buf, const char *fmt, ...);
+int KB_STACK_REALIGN kb_printk(const char *fmt, ...);
+int KB_STACK_REALIGN kb_vprintk_safe(const char *fmt, va_list args);
+int KB_STACK_REALIGN kb_vsnprintf_safe(char *buf, size_t size, const char *fmt, va_list args);
+int KB_STACK_REALIGN kb_snprintf_safe(char *buf, size_t size, const char *fmt, ...);
+int KB_STACK_REALIGN kb_sprintf_safe(char *buf, const char *fmt, ...);
 char *kb_strreplace(char *s, char old_char, char new_char);
 size_t kb_memweight(const void *ptr, size_t bytes);
-int kb_tracef(const char *fmt, ...);
+int KB_STACK_REALIGN kb_tracef(const char *fmt, ...);
 
 void kb_shim_set_device_backend(kb_device_backend_t *backend);
 unsigned long kb_shim_current_kernel_gs(void);
@@ -109,6 +115,7 @@ int kb_irq_allocate_mapping(unsigned int backend_kind, unsigned int backend_vect
 unsigned int kb_irq_backend_vector(unsigned int linux_irq);
 void kb_irq_clear_mappings(void);
 int kb_queue_work_on(int cpu, void *wq, void *work);
+int kb_kblockd_schedule_work(void *work);
 int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay);
 int kb_mod_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay);
 int kb_flush_work(void *work);
@@ -250,15 +257,6 @@ void *kb_kmalloc_alias(size_t size, unsigned int flags);
 void kb_might_resched(void);
 void kb_ubsan_handle_load_invalid_value(void *data, void *ptr);
 void kb_ubsan_handle_out_of_bounds(void *data, void *index);
-int kb_register_virtio_driver(void *driver);
-void kb_unregister_virtio_driver(void *driver);
-void kb_virtio_reset_device(void *device);
-int kb_virtqueue_add_inbuf(void *vq, void *sgs, unsigned int num, void *data, unsigned int gfp);
-int kb_virtqueue_add_outbuf(void *vq, void *sgs, unsigned int num, void *data, unsigned int gfp);
-void *kb_virtqueue_detach_unused_buf(void *vq);
-void *kb_virtqueue_get_buf(void *vq, unsigned int *len);
-unsigned int kb_virtqueue_get_vring_size(void *vq);
-int kb_virtqueue_kick(void *vq);
 void kb_sg_init_one(void *sg, const void *buf, unsigned int buflen);
 void *kb_input_allocate_device(void);
 void kb_input_free_device(void *dev);
@@ -339,6 +337,7 @@ int kb_return_one(void);
 uint32_t kb_get_random_u32_below(uint32_t ceil);
 uint16_t kb_get_random_u16(void);
 void kb_generate_random_uuid(unsigned char *uuid);
+void kb_string_get_size(uint64_t size, uint64_t blk_size, int units, char *buf, int len);
 char *kb_d_path(void *path, char *buffer, int buffer_length);
 void *kb_kmemdup_nul(const void *src, size_t len, unsigned int flags);
 long kb_sized_strscpy(char *dst, const char *src, size_t size);

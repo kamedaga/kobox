@@ -5,8 +5,8 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build_dir="${BUILD_DIR:-$repo_root/.artifacts/build-current}"
 runner="${KOBOX_RUNNER:-$build_dir/kobox-run}"
 kernel_version="${KERNEL_VERSION:-6.8.0-117-generic}"
-modules_root="${KOBOX_6_8_MODULES_ROOT:-$repo_root/.artifacts/qemu-vfio-nvme-ext4/modules-root/lib/modules/$kernel_version}"
-zstd_bin="${ZSTD_BIN:-$repo_root/.artifacts/qemu-vfio-nvme-ext4/zstd-root/usr/bin/zstd}"
+modules_root="${KOBOX_6_8_MODULES_ROOT:-$repo_root/.artifacts/kobox-linux-modules/modules-root/lib/modules/$kernel_version}"
+zstd_bin="${ZSTD_BIN:-$repo_root/.artifacts/kobox-linux-modules/zstd-root/usr/bin/zstd}"
 work_dir="$repo_root/.artifacts/ahci-ko"
 
 if [ ! -x "$runner" ]; then

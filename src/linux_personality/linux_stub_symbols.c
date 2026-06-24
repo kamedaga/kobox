@@ -302,7 +302,6 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"io_uring_cmd_import_fixed", (void *)(uintptr_t)&kb_return_zero},
     {"iov_iter_kvec", (void *)(uintptr_t)&kb_noop_stub},
     {"is_vmalloc_addr", (void *)(uintptr_t)&kb_return_zero},
-    {"kblockd_schedule_work", (void *)(uintptr_t)&kb_return_zero},
     {"kernel_read", (void *)(uintptr_t)&kb_return_zero},
     {"kernel_write", (void *)(uintptr_t)&kb_return_zero},
     {"kill_fasync", (void *)(uintptr_t)&kb_noop_stub},

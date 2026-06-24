@@ -42,7 +42,11 @@ static kb_heap_arena_chunk_t *heap_arena_chunks;
 
 static int trace_memory(void)
 {
+#if defined(__pachaos__)
+    return 0;
+#else
     return getenv("KOBOX_TRACE_SHIMS") != NULL;
+#endif
 }
 
 static int is_kernel_non_heap_pointer(const void *ptr)
@@ -59,21 +63,29 @@ static int is_kernel_non_heap_pointer(const void *ptr)
 
 static int kmalloc_mmap_enabled(void)
 {
+#if defined(__pachaos__)
+    return 0;
+#else
     const char *override = getenv("KOBOX_KMALLOC_MMAP");
     if (override != NULL && override[0] != '\0') {
         return strcmp(override, "0") != 0;
     }
     return 0;
+#endif
 }
 
 static int kmalloc_arena_enabled(void)
 {
+#if defined(__pachaos__)
+    return 1;
+#else
     const char *override = getenv("KOBOX_KMALLOC_ARENA");
     if (override != NULL && override[0] != '\0') {
         return strcmp(override, "0") != 0;
     }
     const char *backend = getenv("KOBOX_DEVICE_BACKEND");
     return backend != NULL && (strcmp(backend, "pachaos") == 0 || strcmp(backend, "pachaos_capsule") == 0);
+#endif
 }
 
 static size_t align_up_size(size_t value, size_t align)

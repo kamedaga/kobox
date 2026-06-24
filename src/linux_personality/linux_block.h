@@ -15,6 +15,8 @@ typedef struct kb_linux_block_driver_ops {
     int (*map_kernel_buffer)(void *request, void *buffer, unsigned int length, unsigned int gfp);
     int (*before_execute)(void *request);
     int (*complete_execute)(void *request);
+    int (*disk_read)(void *queue, uint64_t sector, void *buffer, size_t byte_count);
+    int (*disk_write)(void *queue, uint64_t sector, const void *buffer, size_t byte_count);
 } kb_linux_block_driver_ops_t;
 
 void kb_linux_block_register_driver_ops(const kb_linux_block_driver_ops_t *ops);
@@ -37,7 +39,6 @@ int kb_linux_block_request_completed(const void *request);
 unsigned int kb_linux_block_request_end_status(const void *request);
 void kb_linux_block_request_set_result_status(void *request, uint64_t result, uint16_t status);
 void kb_linux_block_request_mark_complete(void *request, unsigned int status);
-
 int kb_linux_block_request_map_dma(
     void *request,
     void *cpu_addr,

@@ -570,6 +570,16 @@ int kb_block_subsystem_disk_snapshot(const void *disk, kb_block_disk_snapshot_t 
     return 0;
 }
 
+void *kb_block_subsystem_first_registered_disk(void)
+{
+    for (kb_block_disk_state_t *state = disks; state != NULL; state = state->next) {
+        if (state->registered && !state->dead) {
+            return state->disk;
+        }
+    }
+    return NULL;
+}
+
 void kb_block_subsystem_disk_set_io(
     void *disk,
     void *ctx,

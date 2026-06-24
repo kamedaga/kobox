@@ -92,6 +92,7 @@ void kb_block_subsystem_disk_set_zoned(void *disk, uint32_t model);
 void kb_block_subsystem_disk_update_readahead(void *disk);
 int kb_block_subsystem_disk_revalidate_zones(void *disk);
 int kb_block_subsystem_disk_snapshot(const void *disk, kb_block_disk_snapshot_t *out_snapshot);
+void *kb_block_subsystem_first_registered_disk(void);
 void kb_block_subsystem_disk_set_io(
     void *disk,
     void *ctx,

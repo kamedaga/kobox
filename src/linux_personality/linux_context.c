@@ -8,13 +8,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if !defined(_WIN32) && defined(__x86_64__)
+#if !defined(_WIN32) && defined(__x86_64__) && !defined(__pachaos__)
 #include <asm/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
 static kb_device_backend_t *current_backend;
+
+enum {
+    KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE = 12,
+};
+
+#if defined(__pachaos__) && defined(__x86_64__)
+static long pachaos_set_gs_base(uint64_t gs_base)
+{
+    uint64_t ret;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"((uint64_t)KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE), "D"(gs_base)
+        : "rcx", "r11", "memory");
+    return (long)ret;
+}
+#endif
 
 uintptr_t kb_ref_stack_chk_guard = 0x6b6f626f785f7370ull;
 uint32_t kb_preempt_count;
@@ -36,7 +53,13 @@ kb_device_backend_t *kb_shim_current_device_backend(void)
 
 unsigned long kb_shim_current_kernel_gs(void)
 {
-#if !defined(_WIN32) && defined(__x86_64__)
+#if defined(__pachaos__) && defined(__x86_64__)
+    unsigned long gs = kb_module_current_external_call_caller_gs();
+    if (gs == 0) {
+        gs = kb_module_current_external_call_callee_gs();
+    }
+    return gs;
+#elif !defined(_WIN32) && defined(__x86_64__)
     unsigned long gs = 0;
     if (syscall(SYS_arch_prctl, ARCH_GET_GS, &gs) != 0) {
         return 0;
@@ -52,7 +75,12 @@ int kb_shim_enter_kernel_gs(unsigned long kernel_gs, unsigned long *out_old_gs)
     if (out_old_gs == NULL) {
         return -22;
     }
-#if !defined(_WIN32) && defined(__x86_64__)
+#if defined(__pachaos__) && defined(__x86_64__)
+    *out_old_gs = kb_module_current_external_call_callee_gs();
+    if (kernel_gs != 0 && pachaos_set_gs_base(kernel_gs) != 0) {
+        return -95;
+    }
+#elif !defined(_WIN32) && defined(__x86_64__)
     if (syscall(SYS_arch_prctl, ARCH_GET_GS, out_old_gs) != 0) {
         return -95;
     }
@@ -68,7 +96,9 @@ int kb_shim_enter_kernel_gs(unsigned long kernel_gs, unsigned long *out_old_gs)
 
 void kb_shim_leave_kernel_gs(unsigned long old_gs)
 {
-#if !defined(_WIN32) && defined(__x86_64__)
+#if defined(__pachaos__) && defined(__x86_64__)
+    (void)pachaos_set_gs_base((uint64_t)old_gs);
+#elif !defined(_WIN32) && defined(__x86_64__)
     (void)syscall(SYS_arch_prctl, ARCH_SET_GS, old_gs);
 #else
     (void)old_gs;
@@ -83,5 +113,9 @@ void kb_stack_chk_fail(void)
         kb_module_current_external_call_target(),
         kb_module_current_external_call_caller_gs(),
         kb_module_current_external_call_callee_gs());
+#if defined(__pachaos__)
+    _Exit(127);
+#else
     abort();
+#endif
 }

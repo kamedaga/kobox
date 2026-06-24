@@ -9,8 +9,12 @@ kb_device_backend_t *kb_shim_current_device_backend(void);
 
 static int trace_irq_enabled(void)
 {
+#if defined(__pachaos__)
+    return 0;
+#else
     const char *value = getenv("KOBOX_TRACE_IRQ");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+#endif
 }
 
 typedef struct shim_irq {

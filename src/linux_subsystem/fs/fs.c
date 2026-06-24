@@ -121,6 +121,8 @@ typedef struct kb_fs_image_block_ctx {
 
 typedef struct kb_fs_block_disk_ctx {
     void *disk;
+    uint64_t start_sector;
+    uint64_t sector_count;
 } kb_fs_block_disk_ctx_t;
 
 typedef struct kb_fs_bdev_binding {
@@ -360,7 +362,11 @@ static int block_disk_read(void *ctx, uint64_t offset, void *buffer, size_t size
         return -22;
     }
     if ((offset % 512u) == 0 && (size % 512u) == 0) {
-        return kb_block_subsystem_disk_read(disk_ctx->disk, offset / 512u, buffer, size);
+        uint64_t sector = 0;
+        if (__builtin_add_overflow(disk_ctx->start_sector, offset / 512u, &sector)) {
+            return -34;
+        }
+        return kb_block_subsystem_disk_read(disk_ctx->disk, sector, buffer, size);
     }
 
     uint64_t end = 0;
@@ -370,6 +376,10 @@ static int block_disk_read(void *ctx, uint64_t offset, void *buffer, size_t size
     uint64_t start_sector = offset / 512u;
     uint64_t end_sector = (end + 511u) / 512u;
     uint64_t sector_count = end_sector - start_sector;
+    uint64_t disk_sector = 0;
+    if (__builtin_add_overflow(disk_ctx->start_sector, start_sector, &disk_sector)) {
+        return -34;
+    }
     uint64_t bounce_size64 = 0;
     if (__builtin_mul_overflow(sector_count, 512ull, &bounce_size64) || bounce_size64 > SIZE_MAX) {
         return -34;
@@ -378,7 +388,7 @@ static int block_disk_read(void *ctx, uint64_t offset, void *buffer, size_t size
     if (bounce == NULL) {
         return -12;
     }
-    int status = kb_block_subsystem_disk_read(disk_ctx->disk, start_sector, bounce, (size_t)bounce_size64);
+    int status = kb_block_subsystem_disk_read(disk_ctx->disk, disk_sector, bounce, (size_t)bounce_size64);
     if (status == 0) {
         memcpy(buffer, (const uint8_t *)bounce + (offset % 512u), size);
     }
@@ -393,7 +403,11 @@ static int block_disk_write(void *ctx, uint64_t offset, const void *buffer, size
         return -22;
     }
     if ((offset % 512u) == 0 && (size % 512u) == 0) {
-        return kb_block_subsystem_disk_write(disk_ctx->disk, offset / 512u, buffer, size);
+        uint64_t sector = 0;
+        if (__builtin_add_overflow(disk_ctx->start_sector, offset / 512u, &sector)) {
+            return -34;
+        }
+        return kb_block_subsystem_disk_write(disk_ctx->disk, sector, buffer, size);
     }
 
     uint64_t end = 0;
@@ -403,6 +417,10 @@ static int block_disk_write(void *ctx, uint64_t offset, const void *buffer, size
     uint64_t start_sector = offset / 512u;
     uint64_t end_sector = (end + 511u) / 512u;
     uint64_t sector_count = end_sector - start_sector;
+    uint64_t disk_sector = 0;
+    if (__builtin_add_overflow(disk_ctx->start_sector, start_sector, &disk_sector)) {
+        return -34;
+    }
     uint64_t bounce_size64 = 0;
     if (__builtin_mul_overflow(sector_count, 512ull, &bounce_size64) || bounce_size64 > SIZE_MAX) {
         return -34;
@@ -411,10 +429,10 @@ static int block_disk_write(void *ctx, uint64_t offset, const void *buffer, size
     if (bounce == NULL) {
         return -12;
     }
-    int status = kb_block_subsystem_disk_read(disk_ctx->disk, start_sector, bounce, (size_t)bounce_size64);
+    int status = kb_block_subsystem_disk_read(disk_ctx->disk, disk_sector, bounce, (size_t)bounce_size64);
     if (status == 0) {
         memcpy((uint8_t *)bounce + (offset % 512u), buffer, size);
-        status = kb_block_subsystem_disk_write(disk_ctx->disk, start_sector, bounce, (size_t)bounce_size64);
+        status = kb_block_subsystem_disk_write(disk_ctx->disk, disk_sector, bounce, (size_t)bounce_size64);
     }
     free(bounce);
     return status;
@@ -444,6 +462,80 @@ static int image_size_bytes(const char *path, uint64_t *out_size)
         return -5;
     }
     *out_size = (uint64_t)size;
+    return 0;
+}
+
+static uint32_t read_le32_local(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] |
+        ((uint32_t)bytes[1] << 8) |
+        ((uint32_t)bytes[2] << 16) |
+        ((uint32_t)bytes[3] << 24);
+}
+
+static uint64_t read_le64_local(const uint8_t *bytes)
+{
+    return (uint64_t)bytes[0] |
+        ((uint64_t)bytes[1] << 8) |
+        ((uint64_t)bytes[2] << 16) |
+        ((uint64_t)bytes[3] << 24) |
+        ((uint64_t)bytes[4] << 32) |
+        ((uint64_t)bytes[5] << 40) |
+        ((uint64_t)bytes[6] << 48) |
+        ((uint64_t)bytes[7] << 56);
+}
+
+static int disk_gpt_partition_range(void *disk, uint32_t partition_index, uint64_t *out_start_sector, uint64_t *out_sector_count)
+{
+    if (disk == NULL || partition_index == 0 || out_start_sector == NULL || out_sector_count == NULL) {
+        return -22;
+    }
+
+    uint8_t header[512];
+    int status = kb_block_subsystem_disk_read(disk, 1, header, sizeof(header));
+    if (status != 0) {
+        return status;
+    }
+    if (memcmp(header, "EFI PART", 8) != 0) {
+        return -22;
+    }
+
+    const uint64_t entry_lba = read_le64_local(header + 72);
+    const uint32_t entry_count = read_le32_local(header + 80);
+    const uint32_t entry_size = read_le32_local(header + 84);
+    if (partition_index > entry_count || entry_size < 48 || entry_size > 512) {
+        return -22;
+    }
+
+    const uint64_t entry_offset = (uint64_t)(partition_index - 1u) * (uint64_t)entry_size;
+    const uint64_t entry_sector = entry_lba + entry_offset / 512u;
+    const size_t within_sector = (size_t)(entry_offset % 512u);
+    uint8_t entry_storage[1024];
+    uint8_t *entry = entry_storage + within_sector;
+    status = kb_block_subsystem_disk_read(disk, entry_sector, entry_storage, sizeof(entry_storage));
+    if (status != 0) {
+        return status;
+    }
+
+    int unused = 1;
+    for (size_t i = 0; i < 16; i++) {
+        if (entry[i] != 0) {
+            unused = 0;
+            break;
+        }
+    }
+    if (unused) {
+        return -2;
+    }
+
+    const uint64_t first_lba = read_le64_local(entry + 32);
+    const uint64_t last_lba = read_le64_local(entry + 40);
+    if (last_lba < first_lba) {
+        return -22;
+    }
+
+    *out_start_sector = first_lba;
+    *out_sector_count = last_lba - first_lba + 1u;
     return 0;
 }
 
@@ -926,6 +1018,21 @@ int kb_fs_block_device_create_image(const char *name, const char *image_path, kb
 
 int kb_fs_block_device_create_from_disk(const char *name, void *disk, kb_fs_block_device_t **out_device)
 {
+    kb_block_disk_snapshot_t snapshot;
+    int status = kb_block_subsystem_disk_snapshot(disk, &snapshot);
+    if (status != 0) {
+        return status;
+    }
+    return kb_fs_block_device_create_from_disk_range(name, disk, 0, snapshot.capacity_sectors, out_device);
+}
+
+int kb_fs_block_device_create_from_disk_range(
+    const char *name,
+    void *disk,
+    uint64_t start_sector,
+    uint64_t sector_count,
+    kb_fs_block_device_t **out_device)
+{
     if (disk == NULL || out_device == NULL) {
         return -22;
     }
@@ -936,9 +1043,12 @@ int kb_fs_block_device_create_from_disk(const char *name, void *disk, kb_fs_bloc
     if (status != 0) {
         return status;
     }
+    if (sector_count == 0 || start_sector > snapshot.capacity_sectors || sector_count > snapshot.capacity_sectors - start_sector) {
+        return -34;
+    }
 
     uint64_t size_bytes = 0;
-    if (__builtin_mul_overflow(snapshot.capacity_sectors, 512ull, &size_bytes)) {
+    if (__builtin_mul_overflow(sector_count, 512ull, &size_bytes)) {
         return -34;
     }
 
@@ -956,6 +1066,8 @@ int kb_fs_block_device_create_from_disk(const char *name, void *disk, kb_fs_bloc
         return -12;
     }
     ctx->disk = disk;
+    ctx->start_sector = start_sector;
+    ctx->sector_count = sector_count;
 
     kb_fs_block_device_desc_t desc = {
         .name = name == NULL ? "kobox-block-disk" : name,
@@ -971,6 +1083,21 @@ int kb_fs_block_device_create_from_disk(const char *name, void *disk, kb_fs_bloc
         block_disk_destroy(ctx);
     }
     return status;
+}
+
+int kb_fs_block_device_create_from_disk_gpt_partition(
+    const char *name,
+    void *disk,
+    uint32_t partition_index,
+    kb_fs_block_device_t **out_device)
+{
+    uint64_t start_sector = 0;
+    uint64_t sector_count = 0;
+    int status = disk_gpt_partition_range(disk, partition_index, &start_sector, &sector_count);
+    if (status != 0) {
+        return status;
+    }
+    return kb_fs_block_device_create_from_disk_range(name, disk, start_sector, sector_count, out_device);
 }
 
 static int block_device_range_valid(const kb_fs_block_device_t *device, uint64_t offset, size_t size)
@@ -1040,6 +1167,11 @@ int kb_fs_subsystem_set_mount_probe_block_device(kb_fs_block_device_t *device)
         clear_mount_probe_objects();
     }
     return 0;
+}
+
+int kb_fs_subsystem_set_mount_block_device(kb_fs_block_device_t *device)
+{
+    return kb_fs_subsystem_set_mount_probe_block_device(device);
 }
 
 static kb_fs_bio_record_t *bio_record_from_handle(void *bio)
@@ -1868,13 +2000,46 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
         uint64_t file_block = current_pos / block_size;
         uint64_t block_offset = current_pos % block_size;
         uint64_t block_available = block_size - block_offset;
-        uint64_t chunk = read_size - total_read;
-        if (chunk > block_available) {
-            chunk = block_available;
-        }
+        uint64_t requested = read_size - total_read;
+        uint64_t chunk = requested < block_available ? requested : block_available;
         uint32_t disk_block = ext4_extent_block_number(inode, file_block);
-        if (disk_block == 0 || chunk > SIZE_MAX) {
+        if (chunk > SIZE_MAX) {
             break;
+        }
+        if (disk_block == 0) {
+            memset((uint8_t *)buffer + total_read, 0, (size_t)chunk);
+            if (fs_trace_enabled()) {
+                fprintf(stderr,
+                    "kobox-fs: generic_file_read_iter inode=%p file_block=%llu sparse-hole offset=%llu bytes=%llu\n",
+                    inode,
+                    (unsigned long long)file_block,
+                    (unsigned long long)current_pos,
+                    (unsigned long long)chunk);
+            }
+            total_read += chunk;
+            continue;
+        }
+        if (block_offset == 0 && requested >= block_size) {
+            uint64_t max_blocks = requested / block_size;
+            uint64_t max_bulk_blocks = (128u * 1024u) / block_size;
+            if (max_bulk_blocks == 0) {
+                max_bulk_blocks = 1;
+            }
+            if (max_blocks > max_bulk_blocks) {
+                max_blocks = max_bulk_blocks;
+            }
+            uint64_t run_blocks = 1;
+            while (run_blocks < max_blocks) {
+                uint32_t next_disk_block = ext4_extent_block_number(inode, file_block + run_blocks);
+                if (next_disk_block != disk_block + run_blocks) {
+                    break;
+                }
+                run_blocks++;
+            }
+            chunk = run_blocks * block_size;
+            if (chunk > SIZE_MAX) {
+                break;
+            }
         }
         uint64_t disk_offset = ((uint64_t)disk_block * block_size) + block_offset;
         if (active_bdev_binding.device->read(active_bdev_binding.device->ctx,
@@ -2240,6 +2405,11 @@ int kb_fs_subsystem_probe_registered_mount_path(const char *name, kb_fs_mount_pa
     free(fs_context);
     last_mount_path_probe.fs_context = NULL;
     return get_tree_result;
+}
+
+int kb_fs_subsystem_mount_registered_root(const char *name, kb_fs_mount_result_t *out_mount)
+{
+    return kb_fs_subsystem_probe_registered_mount_path(name, out_mount);
 }
 
 size_t kb_fs_subsystem_registered_type_count(void)
