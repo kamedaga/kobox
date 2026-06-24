@@ -181,6 +181,7 @@ int kb_fs_subsystem_get_tree_bdev(void *fs_context, int (*fill_super)(void *supe
 void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned int block_size, unsigned int gfp);
 void kb_fs_subsystem_buffer_head_put(void *buffer_head);
 void kb_fs_subsystem_mark_buffer_dirty(void *buffer_head);
+int kb_fs_subsystem_jbd2_journal_dirty_metadata(void *handle, void *buffer_head);
 int kb_fs_subsystem_sync_dirty_buffer(void *buffer_head);
 void *kb_fs_subsystem_bio_alloc_bioset(void *bdev, unsigned short nr_vecs, unsigned int opf, unsigned int gfp, void *bioset);
 int kb_fs_subsystem_bio_add_folio(void *bio, void *folio, size_t len, size_t offset);
@@ -196,6 +197,8 @@ void kb_fs_subsystem_bio_set_sector(void *bio, uint64_t sector);
 void kb_fs_subsystem_bio_set_end_io(void *bio, void (*end_io)(void *));
 int kb_fs_subsystem_bio_result(void *bio);
 int kb_fs_subsystem_bio_snapshot(void *bio, kb_fs_bio_snapshot_t *out_snapshot);
+void *kb_fs_subsystem_filemap_get_folio(void *mapping, unsigned long index, unsigned int fgp_flags, unsigned int gfp);
+void kb_fs_subsystem_folio_unlock(void *folio);
 void *kb_fs_subsystem_iget_locked(void *super_block, unsigned long inode_number);
 void *kb_fs_subsystem_new_inode(void *super_block);
 int kb_fs_subsystem_inode_init_owner(void *idmap, void *inode, void *dir, unsigned short mode);
@@ -206,6 +209,14 @@ void kb_fs_subsystem_d_instantiate_new(void *dentry, void *inode);
 void kb_fs_subsystem_iget_failed(void *inode);
 void kb_fs_subsystem_unlock_new_inode(void *inode);
 void kb_fs_subsystem_set_nlink(void *inode, unsigned int nlink);
+void kb_fs_subsystem_clear_nlink(void *inode);
+void kb_fs_subsystem_drop_nlink(void *inode);
+void kb_fs_subsystem_inc_nlink(void *inode);
+void kb_fs_subsystem_mark_inode_freeing(void *inode);
+int kb_fs_subsystem_ext4_detach_inode_data_blocks(void *inode);
+int kb_fs_subsystem_ext4_release_inode_record(void *super_block, uint64_t inode_number);
+int kb_fs_subsystem_dquot_alloc_space(void *inode, uint64_t bytes, int flags);
+void kb_fs_subsystem_dquot_free_space(void *inode, uint64_t bytes, int flags);
 int kb_fs_subsystem_fscrypt_match_name(const void *fname, const void *de_name, unsigned int de_name_len);
 int kb_fs_subsystem_fscrypt_setup_filename(void *dir, const void *qstr, int lookup, void *fname);
 long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter);
@@ -215,7 +226,14 @@ int kb_fs_subsystem_bmap(void *inode, uint64_t *block);
 int kb_fs_subsystem_sb_min_blocksize(void *super_block, int size);
 int kb_fs_subsystem_sb_set_blocksize(void *super_block, int size);
 int kb_fs_subsystem_mount_registered_root(const char *name, kb_fs_mount_result_t *out_mount);
+int kb_fs_subsystem_ext4_sync_group_free_counts(void *super_block);
+int kb_fs_subsystem_ext4_sync_super_free_blocks(void *super_block);
 int kb_fs_subsystem_probe_registered_mount_path(const char *name, kb_fs_mount_path_probe_t *out_probe);
+int kb_fs_subsystem_run_ext4_image_smoke(
+    const char *image_path,
+    unsigned long inode_number,
+    unsigned long large_inode_number,
+    unsigned long zero_inode_number);
 size_t kb_fs_subsystem_registered_type_count(void);
 int kb_fs_subsystem_type_snapshot(const char *name, kb_fs_type_snapshot_t *out_snapshot);
 int kb_fs_subsystem_mount_snapshot(uint64_t handle, kb_fs_mount_snapshot_t *out_snapshot);

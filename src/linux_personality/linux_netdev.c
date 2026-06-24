@@ -43,6 +43,15 @@ static kb_percpu_alloc_record_t percpu_alloc_records[256];
 static atomic_flag rwsem_records_lock = ATOMIC_FLAG_INIT;
 static kb_rwsem_record_t *rwsem_records;
 
+static void rwsem_write_state(void *sem, const kb_rwsem_record_t *record)
+{
+    unsigned long state = 0;
+    if (record != NULL && (record->writer != 0 || record->readers != 0)) {
+        state = 1;
+    }
+    memcpy(sem, &state, sizeof(state));
+}
+
 static int trace_lock_enabled(void)
 {
     static int cached = -1;
@@ -337,6 +346,7 @@ void kb_init_rwsem(void *sem)
     if (record != NULL) {
         record->readers = 0;
         record->writer = 0;
+        rwsem_write_state(sem, record);
     }
     rwsem_table_unlock();
     if (trace_lock_enabled()) {
@@ -355,6 +365,7 @@ void kb_down_read(void *sem)
         if (record == NULL || record->writer == 0) {
             if (record != NULL) {
                 record->readers++;
+                rwsem_write_state(sem, record);
             }
             rwsem_table_unlock();
             if (trace_lock_enabled()) {
@@ -376,6 +387,7 @@ void kb_up_read(void *sem)
     if (record != NULL && record->readers > 0) {
         record->readers--;
     }
+    rwsem_write_state(sem, record);
     rwsem_table_unlock();
     if (trace_lock_enabled()) {
         fprintf(stderr, "kobox lock: up_read sem=%p\n", sem);
@@ -393,6 +405,7 @@ void kb_down_write(void *sem)
         if (record == NULL || (record->writer == 0 && record->readers == 0)) {
             if (record != NULL) {
                 record->writer = 1;
+                rwsem_write_state(sem, record);
             }
             rwsem_table_unlock();
             if (trace_lock_enabled()) {
@@ -414,6 +427,7 @@ void kb_up_write(void *sem)
     if (record != NULL) {
         record->writer = 0;
     }
+    rwsem_write_state(sem, record);
     rwsem_table_unlock();
     if (trace_lock_enabled()) {
         fprintf(stderr, "kobox lock: up_write sem=%p\n", sem);
@@ -427,6 +441,19 @@ unsigned long kb_find_next_bit(const unsigned long *addr, unsigned long size, un
     }
     for (unsigned long bit = offset; bit < size; bit++) {
         if ((addr[bit / (sizeof(unsigned long) * 8)] & (1ul << (bit % (sizeof(unsigned long) * 8)))) != 0) {
+            return bit;
+        }
+    }
+    return size;
+}
+
+unsigned long kb_find_next_zero_bit(const unsigned long *addr, unsigned long size, unsigned long offset)
+{
+    if (addr == NULL || offset >= size) {
+        return size;
+    }
+    for (unsigned long bit = offset; bit < size; bit++) {
+        if ((addr[bit / (sizeof(unsigned long) * 8)] & (1ul << (bit % (sizeof(unsigned long) * 8)))) == 0) {
             return bit;
         }
     }

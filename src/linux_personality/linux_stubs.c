@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__pachaos__)
+#include <time.h>
+#endif
 
 typedef struct kb_ida_record {
     void *ida;
@@ -41,6 +44,8 @@ enum {
     KB_JBD2_JOURNAL_COMMIT_SEQUENCE_OFFSET = 0x428,
     KB_JBD2_JOURNAL_COMMIT_REQUEST_OFFSET = 0x42c,
     KB_JBD2_JOURNAL_TASK_OFFSET = 0x440,
+    KB_PERCPU_COUNTER_STRIDE = 0x28,
+    KB_PERCPU_COUNTER_COUNT_OFFSET = 0x8,
 };
 
 void kb_noop_stub(void)
@@ -66,6 +71,17 @@ int kb_return_zero(void)
 int kb_return_one(void)
 {
     return 1;
+}
+
+int64_t kb_ktime_get_real_seconds(void)
+{
+#if defined(__pachaos__)
+    static int64_t synthetic_seconds = 1;
+    return synthetic_seconds++;
+#else
+    time_t now = time(NULL);
+    return now > 0 ? (int64_t)now : 1;
+#endif
 }
 
 void kb_string_get_size(uint64_t size, uint64_t blk_size, int units, char *buf, int len)
@@ -290,7 +306,7 @@ void *kb_jbd2_journal_init_stub(void)
 
 void *kb_jbd2_journal_start_stub(void)
 {
-    void *handle = kb_kzalloc(256, 0);
+    void *handle = (void *)1;
     if (jbd2_trace_enabled()) {
         fprintf(stderr, "kobox jbd2: start handle=%p\n", handle);
     }
@@ -714,15 +730,41 @@ void *kb_alloc_stub(void)
 
 int kb_percpu_counter_init_many_stub(void *counters, long amount, unsigned int batch, unsigned int count, void *key)
 {
-    (void)counters;
-    (void)amount;
     (void)batch;
-    (void)count;
     (void)key;
+    if (counters != NULL) {
+        for (unsigned int i = 0; i < count; i++) {
+            int64_t value = (int64_t)amount;
+            uint8_t *counter = (uint8_t *)counters + (size_t)i * KB_PERCPU_COUNTER_STRIDE;
+            memcpy(counter + KB_PERCPU_COUNTER_COUNT_OFFSET, &value, sizeof(value));
+        }
+    }
     if (crypto_trace_enabled()) {
         fprintf(stderr, "kobox-core: percpu_counter_init_many amount=%ld batch=%u count=%u\n", amount, batch, count);
     }
     return 0;
+}
+
+void kb_percpu_counter_add_batch_stub(void *counter, int64_t amount, int32_t batch)
+{
+    (void)batch;
+    if (counter == NULL) {
+        return;
+    }
+    int64_t value = 0;
+    memcpy(&value, (uint8_t *)counter + KB_PERCPU_COUNTER_COUNT_OFFSET, sizeof(value));
+    value += amount;
+    memcpy((uint8_t *)counter + KB_PERCPU_COUNTER_COUNT_OFFSET, &value, sizeof(value));
+}
+
+int64_t kb_percpu_counter_sum_stub(void *counter)
+{
+    if (counter == NULL) {
+        return 0;
+    }
+    int64_t value = 0;
+    memcpy(&value, (uint8_t *)counter + KB_PERCPU_COUNTER_COUNT_OFFSET, sizeof(value));
+    return value;
 }
 
 void *kb_crypto_alloc_shash_stub(const char *alg_name, unsigned int type, unsigned int mask)

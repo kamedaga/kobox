@@ -63,8 +63,11 @@ enum {
     KB_LOCAL_PAGE_OFFSET_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7168,
     KB_LOCAL_VMEMMAP_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7176,
     KB_LOCAL_PHYS_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7184,
+    KB_LOCAL_CURRENT_CRED_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7680,
     KB_LOCAL_CURRENT_MM_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4608,
     KB_LOCAL_CURRENT_TASK_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 8192,
+    KB_LOCAL_CURRENT_TASK_REAL_CRED_OFFSET = 0x7e8,
+    KB_LOCAL_CURRENT_TASK_CRED_OFFSET = 0x7f0,
     KB_LOCAL_USB_DATA_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 11264,
     KB_LOCAL_JIFFIES_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4096,
     KB_LOCAL_GS_SIZE = 4096,
@@ -2415,6 +2418,12 @@ static kb_status_t load_sections(kb_module_t *module)
     ((uint8_t *)module->shim_boot_cpu_data)[2] = 2; /* X86_VENDOR_AMD */
     write_u64le(module->kernel_gs + KB_LOCAL_GS_CPU_INFO_OFFSET + 0x48, 1ull << 2); /* X86_FEATURE_SVM */
     write_u64le((uint8_t *)module->shim_current_task + 0xe8, (uint64_t)(uintptr_t)module->shim_current_mm);
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_CURRENT_TASK_REAL_CRED_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_CURRENT_TASK_CRED_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
     write_u64le((uint8_t *)module->shim_current_task + 0x938, (uint64_t)(uintptr_t)module->shim_current_mm);
     write_u64le(
         (uint8_t *)module->shim_current_task + 0x950,
@@ -2771,17 +2780,6 @@ static int should_interpose_exported_symbol(const char *name)
 static int relocation_is_direct_call(const uint8_t *target)
 {
     return target != 0 && target[-1] == 0xe8;
-}
-
-static int relocation_is_relative_branch(const uint8_t *target)
-{
-    if (target == NULL) {
-        return 0;
-    }
-    if (target[-1] == 0xe8 || target[-1] == 0xe9) {
-        return 1;
-    }
-    return target[-2] == 0x0f && target[-1] >= 0x80 && target[-1] <= 0x8f;
 }
 
 static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_relocation_t *relocation)

@@ -9,6 +9,7 @@
 #include "kobox/module.h"
 #include "kobox/shim.h"
 #include "linux_subsystem/ata/ata.h"
+#include "linux_subsystem/fs/fs.h"
 #include "linux_subsystem/input/input.h"
 #include "linux_subsystem/usb/storage.h"
 #include "linux_subsystem/usb/usb.h"
@@ -834,6 +835,70 @@ int main(int argc, char **argv)
             free(data);
             fprintf(stderr, "fops smoke failed: %d\n", fops_result);
             return 9;
+        }
+    }
+    const char *ext4_image_smoke = getenv("KOBOX_EXT4_IMAGE_SMOKE");
+    if (ext4_image_smoke != NULL && ext4_image_smoke[0] != '\0') {
+        const char *inode_text = getenv("KOBOX_EXT4_IMAGE_SMOKE_INODE");
+        char *inode_end = NULL;
+        unsigned long inode_number = inode_text == NULL ? 0 : strtoul(inode_text, &inode_end, 0);
+        const char *large_inode_text = getenv("KOBOX_EXT4_IMAGE_SMOKE_LARGE_INODE");
+        char *large_inode_end = NULL;
+        unsigned long large_inode_number = (large_inode_text == NULL || large_inode_text[0] == '\0') ?
+            0 :
+            strtoul(large_inode_text, &large_inode_end, 0);
+        const char *zero_inode_text = getenv("KOBOX_EXT4_IMAGE_SMOKE_ZERO_INODE");
+        char *zero_inode_end = NULL;
+        unsigned long zero_inode_number = (zero_inode_text == NULL || zero_inode_text[0] == '\0') ?
+            0 :
+            strtoul(zero_inode_text, &zero_inode_end, 0);
+        if (inode_text == NULL || inode_text[0] == '\0' || inode_end == inode_text || *inode_end != '\0' || inode_number == 0) {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            destroy_backend_after_cleanup(backend);
+            free(data);
+            fprintf(stderr, "ext4 image smoke requires KOBOX_EXT4_IMAGE_SMOKE_INODE\n");
+            return 10;
+        }
+        if ((large_inode_text != NULL && large_inode_text[0] != '\0' &&
+                (large_inode_end == large_inode_text || *large_inode_end != '\0' || large_inode_number == 0)) ||
+            (zero_inode_text != NULL && zero_inode_text[0] != '\0' &&
+                (zero_inode_end == zero_inode_text || *zero_inode_end != '\0' || zero_inode_number == 0)))
+        {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            destroy_backend_after_cleanup(backend);
+            free(data);
+            fprintf(stderr, "ext4 image smoke optional inode env is invalid\n");
+            return 10;
+        }
+        int ext4_smoke_result = kb_fs_subsystem_run_ext4_image_smoke(
+            ext4_image_smoke,
+            inode_number,
+            large_inode_number,
+            zero_inode_number);
+        if (ext4_smoke_result != 0) {
+            (void)kb_module_call_cleanup(module);
+            kb_module_close(module);
+            for (size_t i = dep_count; i > 0; i--) {
+                (void)kb_module_call_cleanup(deps[i - 1].module);
+                kb_module_close(deps[i - 1].module);
+                free(deps[i - 1].data);
+            }
+            destroy_backend_after_cleanup(backend);
+            free(data);
+            fprintf(stderr, "ext4 image smoke failed: %d\n", ext4_smoke_result);
+            return 11;
         }
     }
     if (mouse_live_enabled()) {

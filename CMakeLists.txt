@@ -393,3 +393,14 @@ add_test(
 set_tests_properties(kobox-fixture-modules PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_test(
+    NAME kobox-ext4-real-module-probe
+    COMMAND ${CMAKE_COMMAND} -E env
+        KOBOX_RUNNER=$<TARGET_FILE:kobox-run>
+        sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ext4_real_module_probe.sh
+)
+set_tests_properties(kobox-ext4-real-module-probe PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    SKIP_RETURN_CODE 77
+)
