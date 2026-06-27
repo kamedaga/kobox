@@ -666,9 +666,40 @@ static void nvme_reset_queue_state(unsigned char *nvmeq)
     *(uint8_t *)(nvmeq + KB_NVME_QUEUE_PHASE_OFFSET) = 1;
 }
 
+static void nvme_set_queue_depth(unsigned char *nvmeq, uint16_t depth)
+{
+    if (nvmeq != NULL && depth != 0) {
+        write_u16(nvmeq + KB_NVME_QUEUE_DEPTH_OFFSET, depth);
+    }
+}
+
 static void nvme_reset_dbbuf_shadow(void)
 {
     kb_nvme_subsystem_reset_dbbuf_shadow();
+}
+
+static void nvme_write_dbbuf_shadow(unsigned char *nvmeq, unsigned int doorbell, uint32_t value)
+{
+    unsigned char *dev = nvmeq == NULL ? NULL : read_ptr(nvmeq + KB_NVME_QUEUE_DEV_OFFSET);
+    if (dev == NULL || !kb_nvme_subsystem_dbbuf_ready()) {
+        return;
+    }
+
+    uint32_t db_stride = 0;
+    memcpy(&db_stride, dev + KB_NVME_DEV_DB_STRIDE_OFFSET, sizeof(db_stride));
+    if (db_stride == 0) {
+        db_stride = 1;
+    }
+
+    uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
+    const size_t db_index = ((size_t)qid * 2u * (size_t)db_stride) + doorbell;
+    size_t dbs_size = 0;
+    uint32_t *dbs = kb_nvme_subsystem_dbbuf_dbs_cpu(&dbs_size);
+    if (dbs == NULL || (db_index + 1u) * sizeof(*dbs) > dbs_size) {
+        return;
+    }
+    dbs[db_index] = value;
+    atomic_thread_fence(memory_order_release);
 }
 
 static int nvme_wait_ready(unsigned char *bar, int ready)
@@ -758,6 +789,8 @@ static int nvme_reset_controller_and_recreate_io_queue(void)
         }
     }
 
+    nvme_set_queue_depth(tracked_admin_nvmeq, KB_NVME_ADMIN_QUEUE_DEPTH);
+    nvme_set_queue_depth(tracked_io_nvmeq, KB_NVME_IO_QUEUE_DEPTH);
     nvme_reset_queue_state(tracked_admin_nvmeq);
     nvme_reset_queue_state(tracked_io_nvmeq);
     nvme_reset_dbbuf_shadow();
@@ -952,6 +985,11 @@ int kb_nvme_io_smoke(void)
     return 0;
 }
 
+int kb_nvme_recreate_io_queue(void)
+{
+    return nvme_reset_controller_and_recreate_io_queue();
+}
+
 static int nvme_block_complete_execute(void *request)
 {
     if (request == NULL) {
@@ -1063,18 +1101,16 @@ static int nvme_block_complete_execute(void *request)
         nvme_completion_poll_pause();
     }
     if (!completed) {
-        if (trace_nvme_enabled()) {
-            fprintf(
-                stderr,
-                "kobox nvme: blk_execute_rq timeout request=%p head=%u phase=%u tag=%u gen=%u cid=0x%x status=0x%x\n",
-                request,
-                head,
-                phase,
-                request_tag,
-                request_gen,
-                (unsigned)read_volatile_u16(completion + 12),
-                (unsigned)read_volatile_u16(completion + 14));
-        }
+        fprintf(
+            stderr,
+            "kobox nvme: request timeout qid=%u head=%u phase=%u tag=%u gen=%u cid=0x%x status=0x%x\n",
+            (unsigned)qid,
+            head,
+            phase,
+            request_tag,
+            request_gen,
+            (unsigned)read_volatile_u16(completion + 12),
+            (unsigned)read_volatile_u16(completion + 14));
         return -110;
     }
 
@@ -1089,6 +1125,7 @@ static int nvme_block_complete_execute(void *request)
         *(uint8_t *)(nvmeq + KB_NVME_QUEUE_PHASE_OFFSET) = phase;
     }
     write_u16(nvmeq + KB_NVME_QUEUE_CQ_HEAD_OFFSET, head);
+    nvme_write_dbbuf_shadow(nvmeq, 1u, head);
     if (cq_head_db != NULL) {
         *cq_head_db = head;
     }

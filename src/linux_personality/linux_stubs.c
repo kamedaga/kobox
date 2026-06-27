@@ -728,6 +728,12 @@ void *kb_alloc_stub(void)
     return kb_kzalloc(4096, 0);
 }
 
+void kb_free_first_arg_stub(void *ptr, void *ignored)
+{
+    (void)ignored;
+    kb_kfree(ptr);
+}
+
 int kb_percpu_counter_init_many_stub(void *counters, long amount, unsigned int batch, unsigned int count, void *key)
 {
     (void)batch;

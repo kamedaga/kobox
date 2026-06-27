@@ -201,6 +201,7 @@ void *kb_fs_subsystem_filemap_get_folio(void *mapping, unsigned long index, unsi
 void kb_fs_subsystem_folio_unlock(void *folio);
 void *kb_fs_subsystem_iget_locked(void *super_block, unsigned long inode_number);
 void *kb_fs_subsystem_new_inode(void *super_block);
+void kb_fs_subsystem_free_fake_inode(void *inode);
 int kb_fs_subsystem_inode_init_owner(void *idmap, void *inode, void *dir, unsigned short mode);
 void *kb_fs_subsystem_d_make_root(void *inode);
 void *kb_fs_subsystem_d_splice_alias(void *inode, void *dentry);
@@ -228,11 +229,13 @@ int kb_fs_subsystem_sb_set_blocksize(void *super_block, int size);
 int kb_fs_subsystem_mount_registered_root(const char *name, kb_fs_mount_result_t *out_mount);
 int kb_fs_subsystem_ext4_sync_group_free_counts(void *super_block);
 int kb_fs_subsystem_ext4_sync_super_free_blocks(void *super_block);
+int kb_fs_subsystem_ext4_recount_allocator_counts(void *super_block);
 int kb_fs_subsystem_probe_registered_mount_path(const char *name, kb_fs_mount_path_probe_t *out_probe);
 int kb_fs_subsystem_run_ext4_image_smoke(
     const char *image_path,
     unsigned long inode_number,
     unsigned long large_inode_number,
+    unsigned long ldlike_inode_number,
     unsigned long zero_inode_number);
 size_t kb_fs_subsystem_registered_type_count(void);
 int kb_fs_subsystem_type_snapshot(const char *name, kb_fs_type_snapshot_t *out_snapshot);

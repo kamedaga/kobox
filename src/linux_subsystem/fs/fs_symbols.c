@@ -255,7 +255,7 @@ static const kb_linux_symbol_t fs_symbols[] = {
     {"get_inode_acl", (void *)(uintptr_t)&kb_return_zero},
     {"iget_failed", (void *)(uintptr_t)&kb_fs_subsystem_iget_failed},
     {"iget_locked", (void *)(uintptr_t)&kb_fs_subsystem_iget_locked},
-    {"igrab", (void *)(uintptr_t)&kb_alloc_stub},
+    {"igrab", (void *)(uintptr_t)&kb_identity_ptr},
     {"ihold", (void *)(uintptr_t)&kb_noop_stub},
     {"inc_nlink", (void *)(uintptr_t)&kb_fs_subsystem_inc_nlink},
     {"init_special_inode", (void *)(uintptr_t)&kb_noop_stub},

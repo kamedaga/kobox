@@ -37,8 +37,14 @@ typedef struct kb_heap_arena_chunk {
     size_t used;
 } kb_heap_arena_chunk_t;
 
+typedef struct kb_heap_arena_free_block {
+    struct kb_heap_arena_free_block *next;
+    size_t size;
+} kb_heap_arena_free_block_t;
+
 static kb_heap_allocation_t *heap_allocations;
 static kb_heap_arena_chunk_t *heap_arena_chunks;
+static kb_heap_arena_free_block_t *heap_arena_free_blocks;
 
 static int trace_memory(void)
 {
@@ -145,6 +151,21 @@ static void *kernel_heap_os_alloc(size_t size, size_t *allocated_size, int *mmap
         *arena_backed = 0;
     }
     if (kmalloc_arena_enabled()) {
+        kb_heap_arena_free_block_t **cursor = &heap_arena_free_blocks;
+        while (*cursor != NULL) {
+            kb_heap_arena_free_block_t *block = *cursor;
+            if (block->size >= size) {
+                *cursor = block->next;
+                if (allocated_size != NULL) {
+                    *allocated_size = block->size;
+                }
+                if (arena_backed != NULL) {
+                    *arena_backed = 1;
+                }
+                return block;
+            }
+            cursor = &block->next;
+        }
         void *ptr = kernel_heap_arena_alloc(size, allocated_size);
         if (ptr != NULL && arena_backed != NULL) {
             *arena_backed = 1;
@@ -430,6 +451,12 @@ void kb_kfree(void *ptr)
     int mmap_backed = record->mmap_backed;
     int arena_backed = record->arena_backed;
     if (arena_backed) {
+        if (raw_size >= sizeof(kb_heap_arena_free_block_t)) {
+            kb_heap_arena_free_block_t *block = (kb_heap_arena_free_block_t *)raw;
+            block->size = raw_size;
+            block->next = heap_arena_free_blocks;
+            heap_arena_free_blocks = block;
+        }
         return;
     }
     kernel_heap_os_free(raw, raw_size, mmap_backed);

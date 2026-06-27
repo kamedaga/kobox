@@ -359,6 +359,7 @@ int kb_ida_alloc_range(void *ida, unsigned int min, unsigned int max, unsigned i
 void kb_ida_free(void *ida, unsigned int id);
 void kb_ida_destroy(void *ida);
 void *kb_alloc_stub(void);
+void kb_free_first_arg_stub(void *ptr, void *ignored);
 int kb_percpu_counter_init_many_stub(void *counters, long amount, unsigned int batch, unsigned int count, void *key);
 void kb_percpu_counter_add_batch_stub(void *counter, int64_t amount, int32_t batch);
 int64_t kb_percpu_counter_sum_stub(void *counter);
@@ -453,6 +454,7 @@ void kb_sg_miter_stop(void *miter);
 int kb_sg_nents(void *sg);
 void *kb_sg_next(void *sg);
 int kb_nvme_io_smoke(void);
+int kb_nvme_recreate_io_queue(void);
 void *kb_hwmon_device_register_with_info(void *dev, const char *name, void *data, const void *chip, const void *groups);
 int kb_usb_hcd_pci_probe(void *dev, const void *driver);
 void kb_usb_hcd_pci_remove(void *dev);

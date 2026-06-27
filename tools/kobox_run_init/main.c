@@ -13,6 +13,7 @@
 #include "linux_subsystem/input/input.h"
 #include "linux_subsystem/usb/storage.h"
 #include "linux_subsystem/usb/usb.h"
+#include "loader/module_context.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -847,6 +848,11 @@ int main(int argc, char **argv)
         unsigned long large_inode_number = (large_inode_text == NULL || large_inode_text[0] == '\0') ?
             0 :
             strtoul(large_inode_text, &large_inode_end, 0);
+        const char *ldlike_inode_text = getenv("KOBOX_EXT4_IMAGE_SMOKE_LDLIKE_INODE");
+        char *ldlike_inode_end = NULL;
+        unsigned long ldlike_inode_number = (ldlike_inode_text == NULL || ldlike_inode_text[0] == '\0') ?
+            0 :
+            strtoul(ldlike_inode_text, &ldlike_inode_end, 0);
         const char *zero_inode_text = getenv("KOBOX_EXT4_IMAGE_SMOKE_ZERO_INODE");
         char *zero_inode_end = NULL;
         unsigned long zero_inode_number = (zero_inode_text == NULL || zero_inode_text[0] == '\0') ?
@@ -867,6 +873,8 @@ int main(int argc, char **argv)
         }
         if ((large_inode_text != NULL && large_inode_text[0] != '\0' &&
                 (large_inode_end == large_inode_text || *large_inode_end != '\0' || large_inode_number == 0)) ||
+            (ldlike_inode_text != NULL && ldlike_inode_text[0] != '\0' &&
+                (ldlike_inode_end == ldlike_inode_text || *ldlike_inode_end != '\0' || ldlike_inode_number == 0)) ||
             (zero_inode_text != NULL && zero_inode_text[0] != '\0' &&
                 (zero_inode_end == zero_inode_text || *zero_inode_end != '\0' || zero_inode_number == 0)))
         {
@@ -882,11 +890,14 @@ int main(int argc, char **argv)
             fprintf(stderr, "ext4 image smoke optional inode env is invalid\n");
             return 10;
         }
+        kb_loader_set_active_module(module);
         int ext4_smoke_result = kb_fs_subsystem_run_ext4_image_smoke(
             ext4_image_smoke,
             inode_number,
             large_inode_number,
+            ldlike_inode_number,
             zero_inode_number);
+        kb_loader_set_active_module(NULL);
         if (ext4_smoke_result != 0) {
             (void)kb_module_call_cleanup(module);
             kb_module_close(module);

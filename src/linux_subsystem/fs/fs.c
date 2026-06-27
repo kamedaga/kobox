@@ -99,11 +99,13 @@ enum {
     KB_FS_DENTRY_SB_OFFSET = 0x68,
     KB_FS_QSTR_HASH_LEN_OFFSET = 0x0,
     KB_FS_QSTR_NAME_OFFSET = 0x8,
+    KB_FS_FILE_MAPPING_OFFSET = 0x20,
     KB_FS_FILE_INODE_OFFSET = 0x28,
     KB_FS_KIOCB_FILE_OFFSET = 0x0,
     KB_FS_KIOCB_POS_OFFSET = 0x8,
     KB_FS_IOV_ITER_COUNT_OFFSET = 0x18,
     KB_FS_IOV_ITER_BUFFER_OFFSET = 0x20,
+    KB_FS_IOV_ITER_BUFFER_CAPACITY_OFFSET = 0x78,
     KB_FS_INODE_OP_OFFSET = 0x20,
     KB_FS_INODE_OP_CREATE_OFFSET = 0x28,
     KB_FS_INODE_OP_UNLINK_OFFSET = 0x38,
@@ -252,15 +254,54 @@ static int bio_auto_drain = 1;
 static kb_fs_buffer_cache_record_t buffer_cache[KB_FS_BUFFER_CACHE_MAX];
 static kb_fs_filemap_folio_record_t filemap_folio_cache[KB_FS_FILEMAP_FOLIO_CACHE_MAX];
 
+static uint16_t read_le16_fs(const uint8_t *bytes);
+static uint32_t read_le32_fs(const uint8_t *bytes);
+static void write_le16_fs(uint8_t *bytes, uint16_t value);
+static void write_le32_fs(uint8_t *bytes, uint32_t value);
+static int active_bdev_read_exact(uint64_t offset, void *buffer, size_t size);
+static int active_bdev_write_exact(uint64_t offset, const void *buffer, size_t size);
+
+static void update_buffer_cache_from_write(uint64_t offset, const void *buffer, size_t size)
+{
+    if (buffer == NULL || size == 0) {
+        return;
+    }
+    uint64_t write_end = 0;
+    if (__builtin_add_overflow(offset, (uint64_t)size, &write_end)) {
+        return;
+    }
+    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+        if (!buffer_cache[i].active || buffer_cache[i].data == NULL || buffer_cache[i].block_size == 0) {
+            continue;
+        }
+        uint64_t block_start = 0;
+        uint64_t block_end = 0;
+        if (__builtin_mul_overflow(buffer_cache[i].block_number, buffer_cache[i].block_size, &block_start) ||
+            __builtin_add_overflow(block_start, buffer_cache[i].block_size, &block_end))
+        {
+            continue;
+        }
+        if (write_end <= block_start || offset >= block_end) {
+            continue;
+        }
+        uint64_t copy_start = offset > block_start ? offset : block_start;
+        uint64_t copy_end = write_end < block_end ? write_end : block_end;
+        memcpy(
+            (uint8_t *)buffer_cache[i].data + (copy_start - block_start),
+            (const uint8_t *)buffer + (copy_start - offset),
+            (size_t)(copy_end - copy_start));
+    }
+}
+
 static void clear_mount_probe_objects(void)
 {
     for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
         if (!buffer_cache[i].active) {
             continue;
         }
-        free(buffer_cache[i].buffer_head);
-        free(buffer_cache[i].folio);
-        free(buffer_cache[i].data);
+        kb_kfree(buffer_cache[i].buffer_head);
+        kb_kfree(buffer_cache[i].folio);
+        kb_kfree(buffer_cache[i].data);
     }
     memset(buffer_cache, 0, sizeof(buffer_cache));
     memset(filemap_folio_cache, 0, sizeof(filemap_folio_cache));
@@ -595,6 +636,172 @@ int kb_fs_subsystem_ext4_sync_group_free_counts(void *super_block)
                 free_clusters);
         }
     }
+    return 0;
+}
+
+int kb_fs_subsystem_ext4_recount_allocator_counts(void *super_block)
+{
+    if (super_block == NULL) {
+        return -22;
+    }
+    typedef void *(*ext4_get_group_desc_fn)(void *, unsigned int, void *);
+    typedef void *(*ext4_get_group_info_fn)(void *, unsigned int);
+    ext4_get_group_desc_fn ext4_get_group_desc =
+        (ext4_get_group_desc_fn)kb_module_lookup_exported_symbol("ext4_get_group_desc");
+    ext4_get_group_info_fn ext4_get_group_info =
+        (ext4_get_group_info_fn)kb_module_lookup_exported_symbol("ext4_get_group_info");
+    if (ext4_get_group_desc == NULL || ext4_get_group_info == NULL) {
+        return -95;
+    }
+
+    void *sbi = read_pointer_field(super_block, KB_FS_SUPER_BLOCK_FS_INFO_OFFSET);
+    uint32_t group_count = 0;
+    if (sbi != NULL) {
+        memcpy(&group_count, (const uint8_t *)sbi + KB_FS_EXT4_SBI_GROUP_COUNT_OFFSET, sizeof(group_count));
+    }
+    if (group_count == 0 || group_count > 1024u) {
+        return -5;
+    }
+
+    uint64_t block_size = 0;
+    memcpy(&block_size, (const uint8_t *)super_block + KB_FS_SUPER_BLOCK_BLOCKSIZE_OFFSET, sizeof(block_size));
+    if (block_size == 0 || block_size > SIZE_MAX || (block_size & (block_size - 1u)) != 0) {
+        return -22;
+    }
+
+    uint8_t super_disk[1024];
+    if (active_bdev_read_exact(KB_FS_EXT4_SUPER_OFFSET, super_disk, sizeof(super_disk)) != 0) {
+        return -5;
+    }
+    if (read_le16_fs(super_disk + KB_FS_EXT4_SUPER_MAGIC_OFFSET) != 0xef53u) {
+        return -5;
+    }
+
+    uint32_t blocks_count = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_BLOCKS_COUNT_LO_OFFSET);
+    uint32_t first_data_block = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_FIRST_DATA_BLOCK_OFFSET);
+    uint32_t blocks_per_group = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_BLOCKS_PER_GROUP_OFFSET);
+    uint32_t inodes_count = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_INODES_COUNT_OFFSET);
+    uint32_t inodes_per_group = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_INODES_PER_GROUP_OFFSET);
+    uint16_t desc_size = read_le16_fs(super_disk + KB_FS_EXT4_SUPER_DESC_SIZE_OFFSET);
+    if (blocks_count == 0 || blocks_per_group == 0 || inodes_count == 0 || inodes_per_group == 0 ||
+        first_data_block >= blocks_count)
+    {
+        return -5;
+    }
+    if (desc_size < 32) {
+        desc_size = 32;
+    }
+    if (desc_size > 1024) {
+        return -5;
+    }
+
+    uint8_t *block_bitmap = calloc(1, (size_t)block_size);
+    uint8_t *inode_bitmap = calloc(1, (size_t)block_size);
+    uint8_t group_desc_disk[1024];
+    if (block_bitmap == NULL || inode_bitmap == NULL) {
+        free(inode_bitmap);
+        free(block_bitmap);
+        return -12;
+    }
+
+    const uint64_t group_desc_table = (block_size == 1024u ? 2u : 1u) * block_size;
+    for (uint32_t group = 0; group < group_count; group++) {
+        unsigned long old_gs = 0;
+        int has_gs = kb_fs_enter_ext4_call((void *)ext4_get_group_desc, &old_gs);
+        uint8_t *group_desc = ext4_get_group_desc(super_block, group, NULL);
+        if (has_gs) {
+            kb_shim_leave_kernel_gs(old_gs);
+        }
+        old_gs = 0;
+        has_gs = kb_fs_enter_ext4_call((void *)ext4_get_group_info, &old_gs);
+        void *group_info = ext4_get_group_info(super_block, group);
+        if (has_gs) {
+            kb_shim_leave_kernel_gs(old_gs);
+        }
+        if (group_desc == NULL || group_info == NULL) {
+            free(inode_bitmap);
+            free(block_bitmap);
+            return -5;
+        }
+
+        const uint64_t desc_offset = group_desc_table + ((uint64_t)group * desc_size);
+        if (active_bdev_read_exact(desc_offset, group_desc_disk, desc_size) != 0) {
+            free(inode_bitmap);
+            free(block_bitmap);
+            return -5;
+        }
+
+        const uint32_t block_bitmap_block =
+            read_le32_fs(group_desc + KB_FS_EXT4_GROUP_DESC_BLOCK_BITMAP_LO_OFFSET);
+        const uint32_t inode_bitmap_block =
+            read_le32_fs(group_desc + KB_FS_EXT4_GROUP_DESC_INODE_BITMAP_LO_OFFSET);
+        if (block_bitmap_block == 0 || inode_bitmap_block == 0) {
+            free(inode_bitmap);
+            free(block_bitmap);
+            return -5;
+        }
+        if (active_bdev_read_exact((uint64_t)block_bitmap_block * block_size, block_bitmap, (size_t)block_size) != 0 ||
+            active_bdev_read_exact((uint64_t)inode_bitmap_block * block_size, inode_bitmap, (size_t)block_size) != 0)
+        {
+            free(inode_bitmap);
+            free(block_bitmap);
+            return -5;
+        }
+
+        uint64_t group_first_block = (uint64_t)first_data_block + ((uint64_t)group * blocks_per_group);
+        uint64_t group_block_count = blocks_per_group;
+        if (group_first_block + group_block_count > blocks_count) {
+            group_block_count = blocks_count - group_first_block;
+        }
+        uint32_t free_blocks = 0;
+        for (uint64_t bit = 0; bit < group_block_count; bit++) {
+            if ((block_bitmap[bit >> 3] & (uint8_t)(1u << (bit & 7u))) == 0) {
+                free_blocks++;
+            }
+        }
+
+        uint64_t group_first_inode = (uint64_t)group * inodes_per_group;
+        uint64_t group_inode_count = inodes_per_group;
+        if (group_first_inode + group_inode_count > inodes_count) {
+            group_inode_count = inodes_count - group_first_inode;
+        }
+        uint32_t free_inodes = 0;
+        for (uint64_t bit = 0; bit < group_inode_count; bit++) {
+            if ((inode_bitmap[bit >> 3] & (uint8_t)(1u << (bit & 7u))) == 0) {
+                free_inodes++;
+            }
+        }
+
+        uint32_t old_bb_free = 0;
+        memcpy(&old_bb_free, (const uint8_t *)group_info + KB_FS_EXT4_GROUP_INFO_BB_FREE_OFFSET, sizeof(old_bb_free));
+        write_u32_field(group_info, KB_FS_EXT4_GROUP_INFO_BB_FREE_OFFSET, free_blocks);
+        write_u32_field(group_info, KB_FS_EXT4_GROUP_INFO_GROUP_OFFSET, group);
+        void *prealloc_list = (uint8_t *)group_info + KB_FS_EXT4_GROUP_INFO_PREALLOC_LIST_OFFSET;
+        write_pointer_field(prealloc_list, 0, prealloc_list);
+        write_pointer_field(prealloc_list, sizeof(void *), prealloc_list);
+
+        write_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET, (uint16_t)free_blocks);
+        write_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_INODES_COUNT_LO_OFFSET, (uint16_t)free_inodes);
+        write_le16_fs(group_desc_disk + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET, (uint16_t)free_blocks);
+        write_le16_fs(group_desc_disk + KB_FS_EXT4_GROUP_DESC_FREE_INODES_COUNT_LO_OFFSET, (uint16_t)free_inodes);
+        if (active_bdev_write_exact(desc_offset, group_desc_disk, desc_size) != 0) {
+            free(inode_bitmap);
+            free(block_bitmap);
+            return -5;
+        }
+
+        if (fs_trace_enabled()) {
+            fprintf(stderr,
+                "kobox-fs: sync_group_free group=%u info=%p old=%u blocks=%u inodes=%u\n",
+                group,
+                group_info,
+                old_bb_free,
+                free_blocks,
+                free_inodes);
+        }
+    }
+    free(inode_bitmap);
+    free(block_bitmap);
     return 0;
 }
 
@@ -1947,28 +2154,28 @@ void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned in
         memcpy((uint8_t *)buffer_head + KB_FS_BUFFER_HEAD_REFCOUNT_OFFSET, &refcount, sizeof(refcount));
     }
     if (!cache_hit) {
-        buffer_head = calloc(1, KB_FS_FAKE_BUFFER_HEAD_BYTES);
-        folio = calloc(1, KB_FS_FAKE_FOLIO_BYTES);
-        data = calloc(1, block_size);
+        buffer_head = kb_kzalloc(KB_FS_FAKE_BUFFER_HEAD_BYTES, 0);
+        folio = kb_kzalloc(KB_FS_FAKE_FOLIO_BYTES, 0);
+        data = kb_kzalloc(block_size, 0);
         if (buffer_head == NULL || folio == NULL || data == NULL) {
-            free(buffer_head);
-            free(folio);
-            free(data);
+            kb_kfree(buffer_head);
+            kb_kfree(folio);
+            kb_kfree(data);
             return NULL;
         }
 
         uint64_t offset = 0;
         if (__builtin_mul_overflow(block_number, (uint64_t)block_size, &offset)) {
-            free(buffer_head);
-            free(folio);
-            free(data);
+            kb_kfree(buffer_head);
+            kb_kfree(folio);
+            kb_kfree(data);
             return NULL;
         }
         int status = kb_fs_block_device_read(device, offset, data, block_size);
         if (status != 0) {
-            free(buffer_head);
-            free(folio);
-            free(data);
+            kb_kfree(buffer_head);
+            kb_kfree(folio);
+            kb_kfree(data);
             return NULL;
         }
 
@@ -2046,12 +2253,11 @@ void kb_fs_subsystem_buffer_head_put(void *buffer_head)
             memcpy((uint8_t *)buffer_head + KB_FS_BUFFER_HEAD_REFCOUNT_OFFSET, &refcount, sizeof(refcount));
             return;
         }
-        free(buffer_cache[i].buffer_head);
-        free(buffer_cache[i].folio);
-        free(buffer_cache[i].data);
-        memset(&buffer_cache[i], 0, sizeof(buffer_cache[i]));
+        refcount = 0;
+        memcpy((uint8_t *)buffer_head + KB_FS_BUFFER_HEAD_REFCOUNT_OFFSET, &refcount, sizeof(refcount));
         return;
     }
+    kb_kfree(buffer_head);
 }
 
 void kb_fs_subsystem_mark_buffer_dirty(void *buffer_head)
@@ -2140,6 +2346,14 @@ void *kb_fs_subsystem_iget_locked(void *super_block, unsigned long inode_number)
 void *kb_fs_subsystem_new_inode(void *super_block)
 {
     return kb_fs_subsystem_iget_locked(super_block, 0);
+}
+
+void kb_fs_subsystem_free_fake_inode(void *inode)
+{
+    if (low_or_err_pointer(inode)) {
+        return;
+    }
+    free((uint8_t *)inode - KB_FS_FAKE_INODE_HEADROOM_BYTES);
 }
 
 int kb_fs_subsystem_inode_init_owner(void *idmap, void *inode, void *dir, unsigned short mode)
@@ -2438,12 +2652,16 @@ static void write_le32_fs(uint8_t *bytes, uint32_t value)
 static int active_bdev_read_exact(uint64_t offset, void *buffer, size_t size);
 static int active_bdev_write_exact(uint64_t offset, const void *buffer, size_t size);
 
-static int ext4_sum_group_desc_free_blocks(void *super_block, uint64_t *out_free_blocks)
+static int ext4_sum_group_desc_free_counts(
+    void *super_block,
+    uint64_t *out_free_blocks,
+    uint64_t *out_free_inodes)
 {
-    if (super_block == NULL || out_free_blocks == NULL) {
+    if (super_block == NULL || out_free_blocks == NULL || out_free_inodes == NULL) {
         return -22;
     }
     *out_free_blocks = 0;
+    *out_free_inodes = 0;
     typedef void *(*ext4_get_group_desc_fn)(void *, unsigned int, void *);
     ext4_get_group_desc_fn ext4_get_group_desc =
         (ext4_get_group_desc_fn)kb_module_lookup_exported_symbol("ext4_get_group_desc");
@@ -2461,6 +2679,7 @@ static int ext4_sum_group_desc_free_blocks(void *super_block, uint64_t *out_free
     }
 
     uint64_t free_blocks = 0;
+    uint64_t free_inodes = 0;
     for (uint32_t group = 0; group < group_count; group++) {
         unsigned long old_gs = 0;
         int has_gs = kb_fs_enter_ext4_call((void *)ext4_get_group_desc, &old_gs);
@@ -2472,8 +2691,10 @@ static int ext4_sum_group_desc_free_blocks(void *super_block, uint64_t *out_free
             return -5;
         }
         free_blocks += read_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET);
+        free_inodes += read_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_INODES_COUNT_LO_OFFSET);
     }
     *out_free_blocks = free_blocks;
+    *out_free_inodes = free_inodes;
     return 0;
 }
 
@@ -2548,11 +2769,15 @@ static int active_bdev_write_exact(uint64_t offset, const void *buffer, size_t s
         return -5;
     }
     if ((offset % logical) == 0 && (size % logical) == 0) {
-        return active_bdev_binding.device->write(
+        int status = active_bdev_binding.device->write(
             active_bdev_binding.device->ctx,
             offset,
             buffer,
             size);
+        if (status == 0) {
+            update_buffer_cache_from_write(offset, buffer, size);
+        }
+        return status;
     }
 
     uint64_t end = 0;
@@ -2581,6 +2806,9 @@ static int active_bdev_write_exact(uint64_t offset, const void *buffer, size_t s
             aligned_start,
             bounce,
             (size_t)bounce_size64);
+        if (status == 0) {
+            update_buffer_cache_from_write(offset, buffer, size);
+        }
     }
     free(bounce);
     return status;
@@ -2602,12 +2830,14 @@ int kb_fs_subsystem_ext4_sync_super_free_blocks(void *super_block)
     }
 
     uint64_t free_blocks = 0;
-    int status = ext4_sum_group_desc_free_blocks(super_block, &free_blocks);
+    uint64_t free_inodes = 0;
+    int status = ext4_sum_group_desc_free_counts(super_block, &free_blocks, &free_inodes);
     if (status != 0) {
         return status;
     }
     write_le32_fs(ext4_super + KB_FS_EXT4_SUPER_FREE_BLOCKS_COUNT_LO_OFFSET, (uint32_t)free_blocks);
     write_le32_fs(ext4_super + KB_FS_EXT4_SUPER_FREE_BLOCKS_COUNT_HI_OFFSET, (uint32_t)(free_blocks >> 32));
+    write_le32_fs(ext4_super + KB_FS_EXT4_SUPER_FREE_INODES_COUNT_OFFSET, (uint32_t)free_inodes);
 
     typedef void (*ext4_superblock_csum_set_fn)(void *);
     ext4_superblock_csum_set_fn ext4_superblock_csum_set =
@@ -2622,7 +2852,7 @@ int kb_fs_subsystem_ext4_sync_super_free_blocks(void *super_block)
         kb_shim_leave_kernel_gs(old_gs);
     }
     kb_fs_subsystem_mark_buffer_dirty(super_buffer);
-    return 0;
+    return active_bdev_write_exact(KB_FS_EXT4_SUPER_OFFSET, ext4_super, 1024);
 }
 
 int kb_fs_subsystem_ext4_release_inode_record(void *super_block, uint64_t ino64)
@@ -2845,14 +3075,6 @@ static int ext4_free_direct_data_block(void *super_block, uint32_t disk_block, u
         goto done;
     }
     (void)active_bdev_write_exact((uint64_t)disk_block * block_size, zero, (size_t)block_size);
-
-    uint16_t group_free = read_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET);
-    if (group_free != UINT16_MAX) {
-        write_le16_fs(
-            group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET,
-            (uint16_t)(group_free + 1u));
-        (void)active_bdev_write_exact(desc_offset, group_desc, desc_size);
-    }
 
 done:
     free(zero);
@@ -3183,6 +3405,7 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
     uint64_t file_size = 0;
     uint64_t block_size = 0;
     uint64_t count = 0;
+    uint64_t buffer_capacity = 0;
     memcpy(&file, (const uint8_t *)kiocb + KB_FS_KIOCB_FILE_OFFSET, sizeof(file));
     if (file == NULL) {
         return -22;
@@ -3197,7 +3420,14 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
     memcpy(&block_size, (const uint8_t *)super_block + KB_FS_SUPER_BLOCK_BLOCKSIZE_OFFSET, sizeof(block_size));
     memcpy(&count, (const uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, sizeof(count));
     memcpy(&buffer, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_OFFSET, sizeof(buffer));
+    memcpy(&buffer_capacity, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_CAPACITY_OFFSET, sizeof(buffer_capacity));
     if (buffer == NULL || block_size == 0 || active_bdev_binding.device == NULL) {
+        fprintf(stderr,
+            "kobox-fs: generic_file_read_iter setup failed inode=%p buffer=%p block_size=%llu device=%p\n",
+            inode,
+            buffer,
+            (unsigned long long)block_size,
+            (void *)active_bdev_binding.device);
         return -5;
     }
     if (pos >= file_size || count == 0) {
@@ -3256,11 +3486,55 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
             }
         }
         uint64_t disk_offset = ((uint64_t)disk_block * block_size) + block_offset;
-        if (active_bdev_binding.device->read(active_bdev_binding.device->ctx,
-                disk_offset,
-                (uint8_t *)buffer + total_read,
-                (size_t)chunk) != 0)
+        uint64_t submit_offset = disk_offset;
+        size_t submit_size = (size_t)chunk;
+        void *submit_buffer = (uint8_t *)buffer + total_read;
+        int read_status = 0;
+        if (block_offset == 0 && chunk == block_size) {
+            read_status = active_bdev_binding.device->read(active_bdev_binding.device->ctx,
+                    disk_offset,
+                    submit_buffer,
+                    submit_size);
+        } else {
+            if (block_size > SIZE_MAX || block_size > 1024u * 1024u) {
+                break;
+            }
+            submit_offset = (uint64_t)disk_block * block_size;
+            submit_size = (size_t)block_size;
+            const int can_use_caller_bounce =
+                buffer_capacity >= total_read &&
+                buffer_capacity - total_read >= block_size;
+            uint8_t *block_buffer = NULL;
+            if (can_use_caller_bounce) {
+                block_buffer = (uint8_t *)buffer + total_read;
+            } else {
+                block_buffer = malloc((size_t)block_size);
+                if (block_buffer == NULL) {
+                    break;
+                }
+            }
+            submit_buffer = block_buffer;
+            read_status = active_bdev_binding.device->read(active_bdev_binding.device->ctx,
+                    submit_offset,
+                    submit_buffer,
+                    submit_size);
+            if (read_status == 0) {
+                memmove((uint8_t *)buffer + total_read, block_buffer + block_offset, (size_t)chunk);
+            }
+            if (!can_use_caller_bounce) {
+                free(block_buffer);
+            }
+        }
+        if (read_status != 0)
         {
+            fprintf(stderr,
+                "kobox-fs: read block failed inode=%p file_block=%llu disk_block=%u offset=%llu bytes=%llu status=%d\n",
+                inode,
+                (unsigned long long)file_block,
+                disk_block,
+                (unsigned long long)submit_offset,
+                (unsigned long long)chunk,
+                read_status);
             break;
         }
         if (fs_trace_enabled()) {
@@ -3275,6 +3549,13 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
         total_read += chunk;
     }
     if (total_read == 0) {
+        fprintf(stderr,
+            "kobox-fs: generic_file_read_iter no data inode=%p pos=%llu count=%llu file_size=%llu block_size=%llu\n",
+            inode,
+            (unsigned long long)pos,
+            (unsigned long long)count,
+            (unsigned long long)file_size,
+            (unsigned long long)block_size);
         return -5;
     }
     pos += total_read;
@@ -3729,6 +4010,7 @@ int kb_fs_subsystem_run_ext4_image_smoke(
     const char *image_path,
     unsigned long inode_number,
     unsigned long large_inode_number,
+    unsigned long ldlike_inode_number,
     unsigned long zero_inode_number)
 {
     if (image_path == NULL || image_path[0] == '\0' || inode_number == 0) {
@@ -3910,6 +4192,132 @@ int kb_fs_subsystem_run_ext4_image_smoke(
         "kobox-ext4-smoke: append-noalloc ok bytes=%ld size=%llu\n",
         read_result,
         (unsigned long long)appended_size);
+
+    if (ldlike_inode_number != 0) {
+        old_gs = 0;
+        has_gs = kb_fs_enter_ext4_call((void *)ext4_iget, &old_gs);
+        void *ldlike_inode = ext4_iget(mount.super_block, ldlike_inode_number, 0, "kobox_ext4_ldlike", 0);
+        if (has_gs) {
+            kb_shim_leave_kernel_gs(old_gs);
+        }
+        if (low_or_err_pointer(ldlike_inode)) {
+            fprintf(stderr, "kobox-ext4-smoke: ldlike iget failed inode=%lu ptr=%p\n", ldlike_inode_number, ldlike_inode);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(device);
+            return -5;
+        }
+
+        uint8_t ldlike_file[KB_FS_FAKE_INODE_BYTES];
+        uint8_t ldlike_kiocb[64];
+        uint8_t ldlike_iter[64];
+        uint8_t ldlike_readback[4096];
+        uint64_t ldlike_size = 0;
+        memcpy(&ldlike_size, (const uint8_t *)ldlike_inode + KB_FS_INODE_SIZE_OFFSET, sizeof(ldlike_size));
+        if (ldlike_size == 0) {
+            fprintf(stderr, "kobox-ext4-smoke: ldlike inode size is zero inode=%lu\n", ldlike_inode_number);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(device);
+            return -5;
+        }
+        const uint64_t ldlike_deep_offset =
+            ldlike_size >= 761856u ? 757760u : 0u;
+        const size_t ldlike_deep_length =
+            ldlike_size - ldlike_deep_offset >= sizeof(ldlike_readback) ?
+                sizeof(ldlike_readback) :
+                (size_t)(ldlike_size - ldlike_deep_offset);
+        memset(ldlike_file, 0, sizeof(ldlike_file));
+        memset(ldlike_kiocb, 0, sizeof(ldlike_kiocb));
+        memset(ldlike_iter, 0, sizeof(ldlike_iter));
+        memset(ldlike_readback, 0, sizeof(ldlike_readback));
+        write_pointer_field(ldlike_file, KB_FS_FILE_INODE_OFFSET, ldlike_inode);
+        write_pointer_field(ldlike_kiocb, KB_FS_KIOCB_FILE_OFFSET, ldlike_file);
+        write_u64_field(ldlike_kiocb, KB_FS_KIOCB_POS_OFFSET, ldlike_deep_offset);
+        write_u64_field(ldlike_iter, KB_FS_IOV_ITER_COUNT_OFFSET, ldlike_deep_length);
+        write_pointer_field(ldlike_iter, KB_FS_IOV_ITER_BUFFER_OFFSET, ldlike_readback);
+
+        read_result = kb_fs_subsystem_generic_file_read_iter(ldlike_kiocb, ldlike_iter);
+        if (read_result != (long)ldlike_deep_length) {
+            fprintf(stderr,
+                "kobox-ext4-smoke: ldlike read failed inode=%lu offset=%llu result=%ld expected=%zu\n",
+                ldlike_inode_number,
+                (unsigned long long)ldlike_deep_offset,
+                read_result,
+                ldlike_deep_length);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(device);
+            return read_result < 0 ? (int)read_result : -5;
+        }
+        fprintf(stderr,
+            "kobox-ext4-smoke: ldlike read ok inode=%lu offset=%llu bytes=%ld\n",
+            ldlike_inode_number,
+            (unsigned long long)ldlike_deep_offset,
+            read_result);
+
+        typedef long (*ext4_file_read_iter_fn)(void *, void *);
+        ext4_file_read_iter_fn ext4_file_read_iter = NULL;
+        void *ext4_file_read_iter_addr = NULL;
+        if (kb_module_find_symbol(kb_loader_active_module(), "ext4_file_read_iter", &ext4_file_read_iter_addr) != KB_OK ||
+            ext4_file_read_iter_addr == NULL)
+        {
+            fprintf(stderr, "kobox-ext4-smoke: ext4_file_read_iter missing\n");
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(device);
+            return -95;
+        }
+        memcpy(&ext4_file_read_iter, &ext4_file_read_iter_addr, sizeof(ext4_file_read_iter));
+
+        uint8_t ext4_file[512];
+        uint8_t ext4_kiocb[128];
+        uint8_t ext4_iter[128];
+        uint8_t ext4_readback[4096];
+        void *ldlike_mapping = read_pointer_field(ldlike_inode, KB_FS_INODE_MAPPING_OFFSET);
+        memset(ext4_file, 0, sizeof(ext4_file));
+        if (ldlike_mapping == NULL) {
+            fprintf(stderr, "kobox-ext4-smoke: ldlike mapping missing inode=%lu\n", ldlike_inode_number);
+            kb_fs_subsystem_set_mount_probe_block_device(NULL);
+            kb_fs_block_device_destroy(device);
+            return -5;
+        }
+        write_pointer_field(ext4_file, KB_FS_FILE_MAPPING_OFFSET, ldlike_mapping);
+        write_pointer_field(ext4_file, KB_FS_FILE_INODE_OFFSET, ldlike_inode);
+
+        const uint64_t ext4_limit = ldlike_size >= 761856u ? 761856u : ldlike_size;
+        for (uint64_t ext4_offset = 0; ext4_offset < ext4_limit; ext4_offset += sizeof(ext4_readback)) {
+            const size_t ext4_want =
+                ext4_limit - ext4_offset >= sizeof(ext4_readback) ?
+                    sizeof(ext4_readback) :
+                    (size_t)(ext4_limit - ext4_offset);
+            memset(ext4_kiocb, 0, sizeof(ext4_kiocb));
+            memset(ext4_iter, 0, sizeof(ext4_iter));
+            memset(ext4_readback, 0, sizeof(ext4_readback));
+            write_pointer_field(ext4_kiocb, KB_FS_KIOCB_FILE_OFFSET, ext4_file);
+            write_u64_field(ext4_kiocb, KB_FS_KIOCB_POS_OFFSET, ext4_offset);
+            write_u64_field(ext4_iter, KB_FS_IOV_ITER_COUNT_OFFSET, ext4_want);
+            write_pointer_field(ext4_iter, KB_FS_IOV_ITER_BUFFER_OFFSET, ext4_readback);
+
+            old_gs = 0;
+            has_gs = kb_fs_enter_ext4_call((void *)ext4_file_read_iter, &old_gs);
+            read_result = ext4_file_read_iter(ext4_kiocb, ext4_iter);
+            if (has_gs) {
+                kb_shim_leave_kernel_gs(old_gs);
+            }
+            if (read_result != (long)ext4_want) {
+                fprintf(stderr,
+                    "kobox-ext4-smoke: ldlike ext4_file_read_iter failed inode=%lu offset=%llu result=%ld expected=%zu\n",
+                    ldlike_inode_number,
+                    (unsigned long long)ext4_offset,
+                    read_result,
+                    ext4_want);
+                kb_fs_subsystem_set_mount_probe_block_device(NULL);
+                kb_fs_block_device_destroy(device);
+                return read_result < 0 ? (int)read_result : -5;
+            }
+        }
+        fprintf(stderr,
+            "kobox-ext4-smoke: ldlike ext4_file_read_iter sequential ok inode=%lu bytes=%llu\n",
+            ldlike_inode_number,
+            (unsigned long long)ext4_limit);
+    }
 
     typedef void (*ext4_dirty_inode_fn)(void *, int);
     ext4_dirty_inode_fn ext4_dirty_inode =

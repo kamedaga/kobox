@@ -101,6 +101,7 @@ rm -rf "$seed_dir"
 mkdir -p "$seed_dir"
 printf 'kobox host ext4 smoke original data\n' > "$seed_dir/kobox-smoke.txt"
 awk 'BEGIN { for (i = 0; i < 600; i++) printf "0123456789abcdef" }' > "$seed_dir/kobox-large.txt"
+awk 'BEGIN { for (i = 0; i < 65536; i++) printf "%08x%08x\n", i, 65535 - i }' > "$seed_dir/kobox-ldlike.txt"
 printf 'kobox zero truncate payload\n' > "$seed_dir/kobox-zero.txt"
 rm -f "$image"
 truncate -s 64M "$image"
@@ -113,8 +114,9 @@ resolve_inode() {
 
 inode=$(resolve_inode /kobox-smoke.txt)
 large_inode=$(resolve_inode /kobox-large.txt)
+ldlike_inode=$(resolve_inode /kobox-ldlike.txt)
 zero_inode=$(resolve_inode /kobox-zero.txt)
-if [ -z "$inode" ] || [ -z "$large_inode" ] || [ -z "$zero_inode" ]; then
+if [ -z "$inode" ] || [ -z "$large_inode" ] || [ -z "$ldlike_inode" ] || [ -z "$zero_inode" ]; then
     echo "failed: could not resolve smoke inodes"
     exit 1
 fi
@@ -153,6 +155,7 @@ echo "ext4: $ext4_ko"
 echo "image: $image"
 echo "inode: $inode"
 echo "large inode: $large_inode"
+echo "ldlike inode: $ldlike_inode"
 echo "zero inode: $zero_inode"
 echo "large blocks: $initial_large_blocks"
 echo "zero blocks: $initial_zero_blocks"
@@ -165,6 +168,7 @@ KOBOX_TRACE_MODULES="${KOBOX_TRACE_MODULES:-0}" \
 KOBOX_EXT4_IMAGE_SMOKE="$image" \
 KOBOX_EXT4_IMAGE_SMOKE_INODE="$inode" \
 KOBOX_EXT4_IMAGE_SMOKE_LARGE_INODE="$large_inode" \
+KOBOX_EXT4_IMAGE_SMOKE_LDLIKE_INODE="$ldlike_inode" \
 KOBOX_EXT4_IMAGE_SMOKE_ZERO_INODE="$zero_inode" \
 "$runner" $args run "$ext4_ko"
 
