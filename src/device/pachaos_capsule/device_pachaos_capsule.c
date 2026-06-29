@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
 
 typedef struct kb_pachaos_capsule_backend kb_pachaos_capsule_backend_t;
 typedef struct kb_pachaos_mmio_mapping kb_pachaos_mmio_mapping_t;
@@ -221,14 +224,25 @@ static void *alloc_aligned_zeroed(uint64_t size, uint64_t alignment, void **out_
         return NULL;
     }
 
+#if !defined(_WIN32)
+    void *raw = mmap(NULL, (size_t)raw_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        raw = NULL;
+    }
+#else
     void *raw = calloc(1, (size_t)raw_size);
+#endif
     if (raw == NULL) {
         return NULL;
     }
     const uintptr_t aligned = (uintptr_t)align_up_u64((uint64_t)(uintptr_t)raw, alignment);
     if ((uintptr_t)raw > aligned || (uint64_t)(aligned - (uintptr_t)raw) > raw_size ||
         size > raw_size - (uint64_t)(aligned - (uintptr_t)raw)) {
+#if !defined(_WIN32)
+        (void)munmap(raw, (size_t)raw_size);
+#else
         free(raw);
+#endif
         return NULL;
     }
 
@@ -239,6 +253,22 @@ static void *alloc_aligned_zeroed(uint64_t size, uint64_t alignment, void **out_
         *out_alloc_size = raw_size;
     }
     return (void *)aligned;
+}
+
+static void free_aligned_zeroed(void *alloc_addr, uint64_t alloc_size)
+{
+    if (alloc_addr == NULL) {
+        return;
+    }
+#if !defined(_WIN32)
+    if (alloc_size != 0) {
+        (void)munmap(alloc_addr, (size_t)alloc_size);
+        return;
+    }
+#else
+    (void)alloc_size;
+#endif
+    free(alloc_addr);
 }
 
 static uint64_t dma_dir_to_pacha(kb_dma_dir_t direction)
@@ -347,7 +377,7 @@ static void release_dma_mapping(kb_pachaos_dma_mapping_t *mapping, int copy_back
         (void)pacha_capsule_close(mapping->dma.fd);
     }
     if (mapping->alloc_addr != NULL) {
-        free(mapping->alloc_addr);
+        free_aligned_zeroed(mapping->alloc_addr, mapping->alloc_size);
     } else if (mapping->owns_cpu_addr) {
         free(mapping->cpu_addr);
     } else if (mapping->owns_mapped_cpu_addr) {
@@ -587,7 +617,7 @@ static kb_status_t pachaos_capsule_dma_alloc(
     struct pacha_capsule_dma dma = {0};
     const int status = pacha_capsule_device_derive_dma_buffer(device->device_fd, ptr, 0, (size_t)alloc_size, 0, &dma);
     if (status != 0) {
-        free(alloc_addr);
+        free_aligned_zeroed(alloc_addr, raw_size);
         return status_from_pacha(status);
     }
 
@@ -605,7 +635,7 @@ static kb_status_t pachaos_capsule_dma_alloc(
     kb_status_t remember_status = remember_dma_mapping(device->backend, &mapping);
     if (remember_status != KB_OK) {
         (void)pacha_capsule_close(dma.fd);
-        free(alloc_addr);
+        free_aligned_zeroed(alloc_addr, raw_size);
         return remember_status;
     }
 
@@ -677,7 +707,7 @@ static kb_status_t pachaos_capsule_dma_map(
         0);
     if (!pacha_capsule_is_fd(status)) {
         if (alloc_addr != NULL) {
-            free(alloc_addr);
+            free_aligned_zeroed(alloc_addr, raw_size);
         }
         return status_from_pacha(status);
     }
@@ -685,7 +715,7 @@ static kb_status_t pachaos_capsule_dma_map(
     if (read_status != 0) {
         (void)pacha_capsule_close(status);
         if (alloc_addr != NULL) {
-            free(alloc_addr);
+            free_aligned_zeroed(alloc_addr, raw_size);
         }
         return status_from_pacha(read_status);
     }
@@ -705,7 +735,7 @@ static kb_status_t pachaos_capsule_dma_map(
     if (remember_status != KB_OK) {
         (void)pacha_capsule_close(dma.fd);
         if (alloc_addr != NULL) {
-            free(alloc_addr);
+            free_aligned_zeroed(alloc_addr, raw_size);
         }
         return remember_status;
     }

@@ -28,12 +28,8 @@ static kb_device_t *dma_device(void *dev)
 
 static int trace_dma_enabled(void)
 {
-#if defined(__pachaos__)
-    return 0;
-#else
     const char *value = getenv("KOBOX_TRACE_DMA");
     return value != NULL && value[0] != '\0' && value[0] != '0';
-#endif
 }
 
 static int linux_page_to_cpu_addr(void *page, unsigned long offset, void **out_addr)
@@ -71,7 +67,15 @@ void *kb_dma_alloc_attrs(void *dev, size_t size, uint64_t *dma_handle, unsigned 
     }
 
     kb_device_backend_t *backend = kb_shim_current_device_backend();
-    return kb_subsystem_dma_alloc(backend, dma_device(dev), size, dma_handle);
+    void *ptr = kb_subsystem_dma_alloc(backend, dma_device(dev), size, dma_handle);
+    if (trace_dma_enabled()) {
+        fprintf(stderr,
+            "kobox dma: alloc size=0x%zx ptr=%p dma=0x%llx\n",
+            size,
+            ptr,
+            (unsigned long long)(ptr == NULL ? 0 : *dma_handle));
+    }
+    return ptr;
 }
 
 void kb_dma_free_attrs(void *dev, size_t size, void *cpu_addr, uint64_t dma_handle, unsigned long attrs)

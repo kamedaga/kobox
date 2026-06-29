@@ -46,7 +46,10 @@ enum {
     KB_FS_BDEV_STATS_OFFSET = 0x20,
     KB_FS_BDEV_QUEUE_OFFSET = 0x38,
     KB_FS_ADDRESS_SPACE_HOST_OFFSET = 0x0,
+    KB_FS_ADDRESS_SPACE_AOPS_OFFSET = 0x68,
     KB_FS_ADDRESS_SPACE_OFFSET = 0x40,
+    KB_FS_ADDRESS_SPACE_OP_WRITE_BEGIN_OFFSET = 0x28,
+    KB_FS_ADDRESS_SPACE_OP_WRITE_END_OFFSET = 0x30,
     KB_FS_BUFFER_HEAD_THIS_PAGE_OFFSET = 0x8,
     KB_FS_BUFFER_HEAD_FOLIO_OFFSET = 0x10,
     KB_FS_BUFFER_HEAD_BLOCKNR_OFFSET = 0x18,
@@ -146,7 +149,11 @@ enum {
     KB_FS_MODE_DIRECTORY_0755 = 0040000 | 0755,
     KB_FS_BIO_MAGIC = 0x6b62696f,
     KB_FS_BIO_OP_MASK = 0xff,
-    KB_FS_FGP_LOCK = 0x1,
+    KB_FS_FGP_LOCK = 0x2,
+    KB_FS_BH_UPTODATE = 1ull << 0,
+    KB_FS_BH_DIRTY = 1ull << 1,
+    KB_FS_BH_MAPPED = 1ull << 4,
+    KB_FS_BH_NEW = 1ull << 5,
 };
 
 typedef struct kb_fs_type_record {
@@ -2004,18 +2011,16 @@ static void *folio_page_payload(void *folio)
     return (void *)(page_offset_base + page_index * KB_FS_PAGE_SIZE);
 }
 
-static void filemap_folio_attach_buffers(void *mapping, void *folio)
+static void filemap_folio_attach_buffers_with_state(
+    void *mapping,
+    void *folio,
+    uint64_t block_size,
+    uint64_t state)
 {
     if (mapping == NULL || folio == NULL || read_pointer_field(folio, KB_FS_FOLIO_PRIVATE_OFFSET) != NULL) {
         return;
     }
 
-    void *inode = read_pointer_field(mapping, KB_FS_ADDRESS_SPACE_HOST_OFFSET);
-    void *super_block = inode != NULL ? read_pointer_field(inode, KB_FS_INODE_SB_OFFSET) : NULL;
-    uint64_t block_size = 0;
-    if (super_block != NULL) {
-        memcpy(&block_size, (const uint8_t *)super_block + KB_FS_SUPER_BLOCK_BLOCKSIZE_OFFSET, sizeof(block_size));
-    }
     if (block_size == 0 || block_size > KB_FS_PAGE_SIZE || (KB_FS_PAGE_SIZE % block_size) != 0) {
         block_size = KB_FS_PAGE_SIZE;
     }
@@ -2037,6 +2042,7 @@ static void filemap_folio_attach_buffers(void *mapping, void *folio)
             break;
         }
         uint32_t refcount = 1u;
+        write_u64_field(buffer_head, 0, state);
         write_pointer_field(buffer_head, KB_FS_BUFFER_HEAD_FOLIO_OFFSET, folio);
         write_u64_field(buffer_head, KB_FS_BUFFER_HEAD_SIZE_OFFSET, block_size);
         write_pointer_field(buffer_head, KB_FS_BUFFER_HEAD_DATA_OFFSET, (uint8_t *)payload + i * block_size);
@@ -2054,6 +2060,30 @@ static void filemap_folio_attach_buffers(void *mapping, void *folio)
     }
     write_pointer_field(previous, KB_FS_BUFFER_HEAD_THIS_PAGE_OFFSET, first);
     write_pointer_field(folio, KB_FS_FOLIO_PRIVATE_OFFSET, first);
+}
+
+static void filemap_folio_attach_buffers(void *mapping, void *folio)
+{
+    void *inode = read_pointer_field(mapping, KB_FS_ADDRESS_SPACE_HOST_OFFSET);
+    void *super_block = inode != NULL ? read_pointer_field(inode, KB_FS_INODE_SB_OFFSET) : NULL;
+    uint64_t block_size = 0;
+    if (super_block != NULL) {
+        memcpy(&block_size, (const uint8_t *)super_block + KB_FS_SUPER_BLOCK_BLOCKSIZE_OFFSET, sizeof(block_size));
+    }
+    filemap_folio_attach_buffers_with_state(mapping, folio, block_size, 0);
+}
+
+void *kb_fs_subsystem_create_empty_buffers(void *folio, unsigned long block_size, unsigned long state)
+{
+    if (folio == NULL) {
+        return NULL;
+    }
+    void *mapping = read_pointer_field(folio, KB_FS_FOLIO_MAPPING_OFFSET);
+    if (mapping == NULL) {
+        return NULL;
+    }
+    filemap_folio_attach_buffers_with_state(mapping, folio, block_size, state);
+    return read_pointer_field(folio, KB_FS_FOLIO_PRIVATE_OFFSET);
 }
 
 void *kb_fs_subsystem_filemap_get_folio(void *mapping, unsigned long index, unsigned int fgp_flags, unsigned int gfp)
@@ -2296,6 +2326,60 @@ int kb_fs_subsystem_sync_dirty_buffer(void *buffer_head)
 {
     kb_fs_subsystem_mark_buffer_dirty(buffer_head);
     return 0;
+}
+
+int kb_fs_subsystem_block_write_end(
+    void *file,
+    void *mapping,
+    int64_t pos,
+    unsigned int len,
+    unsigned int copied,
+    void *page,
+    void *fsdata)
+{
+    (void)file;
+    (void)mapping;
+    (void)fsdata;
+    if (page == NULL || pos < 0) {
+        return 0;
+    }
+    if (copied > len) {
+        copied = len;
+    }
+
+    void *head = read_pointer_field(page, KB_FS_FOLIO_PRIVATE_OFFSET);
+    if (head == NULL || copied == 0) {
+        return (int)copied;
+    }
+
+    uint64_t start = (uint64_t)pos & (KB_FS_PAGE_SIZE - 1u);
+    uint64_t end = start + copied;
+    if (end > KB_FS_PAGE_SIZE || end < start) {
+        end = KB_FS_PAGE_SIZE;
+    }
+
+    uint64_t block_start = 0;
+    void *bh = head;
+    do {
+        uint64_t block_size = 0;
+        memcpy(&block_size, (const uint8_t *)bh + KB_FS_BUFFER_HEAD_SIZE_OFFSET, sizeof(block_size));
+        if (block_size == 0 || block_size > KB_FS_PAGE_SIZE) {
+            break;
+        }
+        uint64_t block_end = block_start + block_size;
+        if (block_end > start && block_start < end) {
+            uint64_t state = 0;
+            memcpy(&state, bh, sizeof(state));
+            state |= KB_FS_BH_UPTODATE | KB_FS_BH_DIRTY;
+            state &= ~KB_FS_BH_NEW;
+            write_u64_field(bh, 0, state);
+            kb_fs_subsystem_mark_buffer_dirty(bh);
+        }
+        bh = read_pointer_field(bh, KB_FS_BUFFER_HEAD_THIS_PAGE_OFFSET);
+        block_start = block_end;
+    } while (bh != NULL && bh != head && block_start < KB_FS_PAGE_SIZE);
+
+    return (int)copied;
 }
 
 int kb_fs_subsystem_sb_min_blocksize(void *super_block, int size)
@@ -3585,94 +3669,101 @@ long kb_fs_subsystem_generic_perform_write(void *kiocb, void *iter)
         return -22;
     }
     void *file = NULL;
-    void *inode = NULL;
-    void *super_block = NULL;
+    void *mapping = NULL;
+    void *a_ops = NULL;
     void *buffer = NULL;
     uint64_t pos = 0;
-    uint64_t file_size = 0;
-    uint64_t block_size = 0;
     uint64_t count = 0;
     memcpy(&file, (const uint8_t *)kiocb + KB_FS_KIOCB_FILE_OFFSET, sizeof(file));
     if (file == NULL) {
         return -22;
     }
     memcpy(&pos, (const uint8_t *)kiocb + KB_FS_KIOCB_POS_OFFSET, sizeof(pos));
-    memcpy(&inode, (const uint8_t *)file + KB_FS_FILE_INODE_OFFSET, sizeof(inode));
-    if (inode == NULL) {
-        return -22;
-    }
-    memcpy(&super_block, (const uint8_t *)inode + KB_FS_INODE_SB_OFFSET, sizeof(super_block));
-    memcpy(&file_size, (const uint8_t *)inode + KB_FS_INODE_SIZE_OFFSET, sizeof(file_size));
-    memcpy(&block_size, (const uint8_t *)super_block + KB_FS_SUPER_BLOCK_BLOCKSIZE_OFFSET, sizeof(block_size));
+    memcpy(&mapping, (const uint8_t *)file + KB_FS_FILE_MAPPING_OFFSET, sizeof(mapping));
     memcpy(&count, (const uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, sizeof(count));
     memcpy(&buffer, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_OFFSET, sizeof(buffer));
-    if (buffer == NULL || block_size == 0 || active_bdev_binding.device == NULL || active_bdev_binding.device->write == NULL) {
-        return -5;
+    if (mapping == NULL || buffer == NULL) {
+        return -22;
     }
     if (count == 0) {
         return 0;
     }
-    uint64_t write_size = count;
-    if (write_size > SIZE_MAX) {
+    if (pos > (uint64_t)INT64_MAX || count > (uint64_t)LONG_MAX) {
         return -22;
     }
-    uint64_t total_written = 0;
-    while (total_written < write_size) {
-        uint64_t current_pos = pos + total_written;
-        uint64_t file_block = current_pos / block_size;
-        uint64_t block_offset = current_pos % block_size;
-        uint64_t block_available = block_size - block_offset;
-        uint64_t chunk = write_size - total_written;
-        if (chunk > block_available) {
-            chunk = block_available;
+    memcpy(&a_ops, (const uint8_t *)mapping + KB_FS_ADDRESS_SPACE_AOPS_OFFSET, sizeof(a_ops));
+    if (a_ops == NULL) {
+        return -95;
+    }
+
+    int (*write_begin_fn)(void *, void *, int64_t, unsigned int, void **, void **) = NULL;
+    int (*write_end_fn)(void *, void *, int64_t, unsigned int, unsigned int, void *, void *) = NULL;
+    memcpy(&write_begin_fn, (const uint8_t *)a_ops + KB_FS_ADDRESS_SPACE_OP_WRITE_BEGIN_OFFSET, sizeof(write_begin_fn));
+    memcpy(&write_end_fn, (const uint8_t *)a_ops + KB_FS_ADDRESS_SPACE_OP_WRITE_END_OFFSET, sizeof(write_end_fn));
+    if (write_begin_fn == NULL || write_end_fn == NULL) {
+        return -95;
+    }
+
+    uint64_t written = 0;
+    while (count != 0) {
+        const uint64_t page_offset = pos & (KB_FS_PAGE_SIZE - 1u);
+        uint64_t bytes64 = KB_FS_PAGE_SIZE - page_offset;
+        if (bytes64 > count) {
+            bytes64 = count;
         }
-        uint32_t disk_block = ext4_extent_block_number(inode, file_block);
-        if (disk_block == 0) {
-            int alloc_status = ext4_allocate_data_block_for_inode(inode, file_block, &disk_block);
-            if (alloc_status != 0 || disk_block == 0) {
-                break;
-            }
+        if (bytes64 > UINT_MAX || pos > (uint64_t)INT64_MAX) {
+            return written != 0 ? (long)written : -22;
         }
-        if (chunk > SIZE_MAX) {
+        const unsigned int bytes = (unsigned int)bytes64;
+        void *page = NULL;
+        void *fsdata = NULL;
+
+        unsigned long old_gs = 0;
+        int has_gs = kb_fs_enter_ext4_call((void *)write_begin_fn, &old_gs);
+        int status = write_begin_fn(file, mapping, (int64_t)pos, bytes, &page, &fsdata);
+        if (has_gs) {
+            kb_shim_leave_kernel_gs(old_gs);
+        }
+        if (status < 0) {
+            return written != 0 ? (long)written : status;
+        }
+
+        void *payload = folio_page_payload(page);
+        if (payload == NULL) {
+            return written != 0 ? (long)written : -12;
+        }
+        memcpy((uint8_t *)payload + page_offset, (const uint8_t *)buffer + written, bytes);
+
+        old_gs = 0;
+        has_gs = kb_fs_enter_ext4_call((void *)write_end_fn, &old_gs);
+        status = write_end_fn(file, mapping, (int64_t)pos, bytes, bytes, page, fsdata);
+        if (has_gs) {
+            kb_shim_leave_kernel_gs(old_gs);
+        }
+        if (status < 0) {
+            return written != 0 ? (long)written : status;
+        }
+        if (status == 0) {
             break;
         }
-        uint64_t disk_offset = ((uint64_t)disk_block * block_size) + block_offset;
-        if (active_bdev_binding.device->write(active_bdev_binding.device->ctx,
-                disk_offset,
-                (const uint8_t *)buffer + total_written,
-                (size_t)chunk) != 0)
-        {
-            break;
+        if ((uint64_t)status > count) {
+            status = (int)count;
         }
-        if (fs_trace_enabled()) {
-            fprintf(stderr,
-                "kobox-fs: generic_perform_write inode=%p file_block=%llu disk_block=%u offset=%llu bytes=%llu\n",
-                inode,
-                (unsigned long long)file_block,
-                disk_block,
-                (unsigned long long)disk_offset,
-                (unsigned long long)chunk);
+        if ((uint64_t)status > bytes64) {
+            status = (int)bytes64;
         }
-        total_written += chunk;
-    }
-    if (total_written == 0) {
-        return -5;
-    }
-    pos += total_written;
-    count -= total_written;
-    if (pos > file_size) {
-        write_u64_field(inode, KB_FS_INODE_SIZE_OFFSET, pos);
-        write_u64_field((uint8_t *)inode - KB_FS_INODE_EXT4_DISKSIZE_BACK_OFFSET, 0, pos);
-        if (fs_trace_enabled()) {
-            fprintf(stderr,
-                "kobox-fs: generic_perform_write extended inode=%p size=%llu\n",
-                inode,
-                (unsigned long long)pos);
+        uint64_t advanced = (uint64_t)status;
+        if (pos + advanced < pos || written + advanced < written) {
+            return written != 0 ? (long)written : -75;
         }
+        pos += advanced;
+        written += advanced;
+        count -= advanced;
     }
+
     memcpy((uint8_t *)kiocb + KB_FS_KIOCB_POS_OFFSET, &pos, sizeof(pos));
     memcpy((uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, &count, sizeof(count));
-    return (long)total_written;
+    return written != 0 ? (long)written : -5;
 }
 
 void kb_fs_subsystem_iget_failed(void *inode)

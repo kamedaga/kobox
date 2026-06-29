@@ -166,11 +166,14 @@ static void *kernel_heap_os_alloc(size_t size, size_t *allocated_size, int *mmap
             }
             cursor = &block->next;
         }
-        void *ptr = kernel_heap_arena_alloc(size, allocated_size);
-        if (ptr != NULL && arena_backed != NULL) {
-            *arena_backed = 1;
-        }
-        return ptr;
+    void *ptr = kernel_heap_arena_alloc(size, allocated_size);
+    if (ptr != NULL && arena_backed != NULL) {
+        *arena_backed = 1;
+    }
+    if (ptr == NULL) {
+        fprintf(stderr, "kobox-shim: arena alloc failed size=%zu\n", size);
+    }
+    return ptr;
     }
 #if !defined(_WIN32)
     if (kmalloc_mmap_enabled()) {
@@ -283,6 +286,7 @@ void *kb_kmalloc(size_t size, unsigned int flags)
     size_t allocated_size = raw_size;
     unsigned char *raw = kernel_heap_os_alloc(raw_size, &allocated_size, &mmap_backed, &arena_backed);
     if (raw == NULL) {
+        fprintf(stderr, "kobox-shim: kmalloc failed size=%zu raw_size=%zu flags=0x%x\n", size, raw_size, flags);
         return NULL;
     }
     kb_heap_allocation_t *record = (kb_heap_allocation_t *)raw;
@@ -324,6 +328,7 @@ void *kb_kzalloc(size_t size, unsigned int flags)
     size_t allocated_size = raw_size;
     unsigned char *raw = kernel_heap_os_alloc(raw_size, &allocated_size, &mmap_backed, &arena_backed);
     if (raw == NULL) {
+        fprintf(stderr, "kobox-shim: kzalloc failed size=%zu raw_size=%zu flags=0x%x\n", size, raw_size, flags);
         return NULL;
     }
     kb_heap_allocation_t *record = (kb_heap_allocation_t *)raw;

@@ -1397,6 +1397,9 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
             (void *)pci_driver.probe);
     }
     int result = pci_driver.probe(binding.pci_dev_storage, matched_id);
+    if (trace_pci_enabled()) {
+        fprintf(stderr, "kobox pci: pci_register_driver probe result=%d\n", result);
+    }
     if (result != 0) {
         binding.driver = NULL;
         binding.device = NULL;

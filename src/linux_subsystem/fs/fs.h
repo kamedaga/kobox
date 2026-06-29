@@ -183,6 +183,15 @@ void kb_fs_subsystem_buffer_head_put(void *buffer_head);
 void kb_fs_subsystem_mark_buffer_dirty(void *buffer_head);
 int kb_fs_subsystem_jbd2_journal_dirty_metadata(void *handle, void *buffer_head);
 int kb_fs_subsystem_sync_dirty_buffer(void *buffer_head);
+void *kb_fs_subsystem_create_empty_buffers(void *folio, unsigned long block_size, unsigned long state);
+int kb_fs_subsystem_block_write_end(
+    void *file,
+    void *mapping,
+    int64_t pos,
+    unsigned int len,
+    unsigned int copied,
+    void *page,
+    void *fsdata);
 void *kb_fs_subsystem_bio_alloc_bioset(void *bdev, unsigned short nr_vecs, unsigned int opf, unsigned int gfp, void *bioset);
 int kb_fs_subsystem_bio_add_folio(void *bio, void *folio, size_t len, size_t offset);
 int kb_fs_subsystem_bio_add_page(void *bio, void *page, unsigned int len, unsigned int offset);
