@@ -5,7 +5,7 @@
 
 static const kb_linux_symbol_t block_symbols[] = {
     {"sg_init_one", (void *)(uintptr_t)&kb_sg_init_one},
-    {"sg_init_table", (void *)(uintptr_t)&kb_sg_init_one},
+    {"sg_init_table", (void *)(uintptr_t)&kb_sg_init_table},
     {"sg_alloc_table_chained", (void *)(uintptr_t)&kb_return_zero},
     {"sg_alloc_table_from_pages_segment", (void *)(uintptr_t)&kb_return_zero},
     {"sg_free_table_chained", (void *)(uintptr_t)&kb_noop_stub},

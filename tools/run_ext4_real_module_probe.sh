@@ -172,6 +172,11 @@ KOBOX_EXT4_IMAGE_SMOKE_LDLIKE_INODE="$ldlike_inode" \
 KOBOX_EXT4_IMAGE_SMOKE_ZERO_INODE="$zero_inode" \
 "$runner" $args run "$ext4_ko"
 
+if [ "${KOBOX_EXT4_IMAGE_SMOKE_READ_ONLY:-0}" != "0" ] && [ -n "${KOBOX_EXT4_IMAGE_SMOKE_READ_ONLY:-}" ]; then
+    echo "kobox-ext4-smoke: read-only persistence checks skipped"
+    exit 0
+fi
+
 persisted=$(
     debugfs -R 'cat /kobox-smoke.txt' "$image" 2>/dev/null || true
 )
@@ -189,6 +194,22 @@ if [ "$smoke_size" != "8" ]; then
     exit 1
 fi
 echo "kobox-ext4-smoke: truncate persistence ok size=$smoke_size"
+
+smoke_mode=$(
+    debugfs -R 'stat /kobox-smoke.txt' "$image" 2>/dev/null |
+    awk '/Mode:/ { for (i = 1; i <= NF; i++) if ($i == "Mode:") { print $(i + 1); exit } }'
+)
+if [ "$smoke_mode" != "0600" ]; then
+    echo "failed: chmod persistence mismatch mode=$smoke_mode"
+    debugfs -R 'stat /kobox-smoke.txt' "$image" 2>/dev/null || true
+    exit 1
+fi
+if ! debugfs -R 'stat /kobox-smoke.txt' "$image" 2>/dev/null | grep -q 'mtime: 0x00017ca5:00000000'; then
+    echo "failed: utimens persistence mismatch"
+    debugfs -R 'stat /kobox-smoke.txt' "$image" 2>/dev/null || true
+    exit 1
+fi
+echo "kobox-ext4-smoke: metadata persistence ok mode=$smoke_mode mtime=1970-01-02T03:04:05Z"
 
 large_size=$(
     debugfs -R 'stat /kobox-large.txt' "$image" 2>/dev/null |

@@ -24,6 +24,13 @@ uint64_t kb_subsystem_dma_map(
     size_t size,
     kb_dma_dir_t direction,
     kb_status_t *out_status);
+kb_status_t kb_subsystem_dma_map_fixed(
+    kb_device_backend_t *backend,
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
+    uint64_t dma_addr,
+    kb_dma_dir_t direction);
 void kb_subsystem_dma_unmap(
     kb_device_backend_t *backend,
     kb_device_t *device,

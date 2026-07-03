@@ -11,6 +11,35 @@ typedef struct kb_subsystem_dma_mapping {
 
 static kb_subsystem_dma_mapping_t *dma_mappings;
 
+static kb_status_t remember_dma_mapping(void *cpu_addr, uint64_t dma_addr, uint64_t size, kb_device_t *device)
+{
+    kb_subsystem_dma_mapping_t *entry = kb_kzalloc(sizeof(*entry), 0);
+    if (entry == NULL) {
+        return KB_ERR_NOMEM;
+    }
+    entry->cpu_addr = cpu_addr;
+    entry->dma_addr = dma_addr;
+    entry->size = size;
+    entry->device = device;
+    entry->next = dma_mappings;
+    dma_mappings = entry;
+    return KB_OK;
+}
+
+static void forget_dma_mapping(uint64_t dma_addr)
+{
+    kb_subsystem_dma_mapping_t **cursor = &dma_mappings;
+    while (*cursor != NULL) {
+        kb_subsystem_dma_mapping_t *entry = *cursor;
+        if (entry->dma_addr == dma_addr) {
+            *cursor = entry->next;
+            kb_kfree(entry);
+            return;
+        }
+        cursor = &entry->next;
+    }
+}
+
 kb_device_t *kb_subsystem_dma_default_device(kb_device_backend_t *backend)
 {
     const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
@@ -46,19 +75,12 @@ void *kb_subsystem_dma_alloc(
         return NULL;
     }
 
-    kb_subsystem_dma_mapping_t *entry = kb_kzalloc(sizeof(*entry), 0);
-    if (entry == NULL) {
+    if (remember_dma_mapping(buffer.cpu_addr, buffer.dma_addr, buffer.size, device) != KB_OK) {
         if (ops->dma_free != NULL) {
             ops->dma_free(device, &buffer);
         }
         return NULL;
     }
-    entry->cpu_addr = buffer.cpu_addr;
-    entry->dma_addr = buffer.dma_addr;
-    entry->size = buffer.size;
-    entry->device = device;
-    entry->next = dma_mappings;
-    dma_mappings = entry;
 
     *dma_handle = buffer.dma_addr;
     return buffer.cpu_addr;
@@ -143,10 +165,55 @@ uint64_t kb_subsystem_dma_map(
 
     uint64_t dma_addr = 0;
     kb_status_t status = ops->dma_map(device, cpu_addr, size, direction, &dma_addr);
+    if (status == KB_OK) {
+        kb_status_t remember_status = remember_dma_mapping(cpu_addr, dma_addr, size, device);
+        if (remember_status != KB_OK) {
+            if (ops->dma_unmap != NULL) {
+                ops->dma_unmap(device, dma_addr, size, direction);
+            }
+            status = remember_status;
+        }
+    }
     if (out_status != NULL) {
         *out_status = status;
     }
     return status == KB_OK ? dma_addr : 0;
+}
+
+kb_status_t kb_subsystem_dma_map_fixed(
+    kb_device_backend_t *backend,
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
+    uint64_t dma_addr,
+    kb_dma_dir_t direction)
+{
+    if (backend == NULL || cpu_addr == NULL || size == 0) {
+        return KB_ERR_INVALID;
+    }
+    if (device == NULL) {
+        device = kb_subsystem_dma_default_device(backend);
+    }
+    if (device == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
+    if (ops == NULL || ops->dma_map_fixed == NULL) {
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    kb_status_t status = ops->dma_map_fixed(device, cpu_addr, size, dma_addr, direction);
+    if (status != KB_OK) {
+        return status;
+    }
+    status = remember_dma_mapping(cpu_addr, dma_addr, size, device);
+    if (status != KB_OK) {
+        if (ops->dma_unmap != NULL) {
+            ops->dma_unmap(device, dma_addr, size, direction);
+        }
+    }
+    return status;
 }
 
 void kb_subsystem_dma_unmap(
@@ -156,7 +223,7 @@ void kb_subsystem_dma_unmap(
     size_t size,
     kb_dma_dir_t direction)
 {
-    if (backend == NULL || dma_addr == 0 || size == 0) {
+    if (backend == NULL || size == 0) {
         return;
     }
     if (device == NULL) {
@@ -167,9 +234,15 @@ void kb_subsystem_dma_unmap(
     if (device != NULL && ops != NULL && ops->dma_unmap != NULL) {
         ops->dma_unmap(device, dma_addr, size, direction);
     }
+    forget_dma_mapping(dma_addr);
 }
 
 int kb_subsystem_dma_mapping_error(uint64_t dma_addr)
 {
+    for (kb_subsystem_dma_mapping_t *entry = dma_mappings; entry != NULL; entry = entry->next) {
+        if (dma_addr >= entry->dma_addr && dma_addr < entry->dma_addr + entry->size) {
+            return 0;
+        }
+    }
     return dma_addr == 0;
 }

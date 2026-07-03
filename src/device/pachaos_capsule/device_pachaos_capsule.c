@@ -101,14 +101,16 @@ static kb_status_t status_from_pacha(int status)
     }
 }
 
-static kb_status_t config_read_u8(kb_device_t *device, uint16_t offset, uint8_t *out)
+static kb_status_t config_read_chunk(kb_device_t *device, uint16_t offset, uint8_t *dst, unsigned width)
 {
     uint32_t value = 0;
-    const int status = pacha_capsule_pci_config_read(device->device_fd, offset, 1, &value);
+    const int status = pacha_capsule_pci_config_read(device->device_fd, offset, width, &value);
     if (status != 0) {
         return status_from_pacha(status);
     }
-    *out = (uint8_t)value;
+    for (unsigned i = 0; i < width; i++) {
+        dst[i] = (uint8_t)(value >> (i * 8u));
+    }
     return KB_OK;
 }
 
@@ -119,18 +121,31 @@ static kb_status_t config_read_le(kb_device_t *device, uint16_t offset, void *ds
     }
 
     uint8_t *bytes = dst;
-    for (size_t i = 0; i < len; i++) {
-        kb_status_t status = config_read_u8(device, (uint16_t)(offset + i), &bytes[i]);
+    size_t done = 0;
+    while (done < len) {
+        const uint16_t where = (uint16_t)(offset + done);
+        unsigned width = 1;
+        if ((len - done) >= 4u && (where & 3u) == 0) {
+            width = 4;
+        } else if ((len - done) >= 2u && (where & 1u) == 0) {
+            width = 2;
+        }
+        kb_status_t status = config_read_chunk(device, where, bytes + done, width);
         if (status != KB_OK) {
             return status;
         }
+        done += width;
     }
     return KB_OK;
 }
 
-static kb_status_t config_write_u8(kb_device_t *device, uint16_t offset, uint8_t value)
+static kb_status_t config_write_chunk(kb_device_t *device, uint16_t offset, const uint8_t *src, unsigned width)
 {
-    const int status = pacha_capsule_pci_config_write(device->device_fd, offset, 1, value);
+    uint32_t value = 0;
+    for (unsigned i = 0; i < width; i++) {
+        value |= (uint32_t)src[i] << (i * 8u);
+    }
+    const int status = pacha_capsule_pci_config_write(device->device_fd, offset, width, value);
     return status_from_pacha(status);
 }
 
@@ -141,11 +156,20 @@ static kb_status_t config_write_le(kb_device_t *device, uint16_t offset, const v
     }
 
     const uint8_t *bytes = src;
-    for (size_t i = 0; i < len; i++) {
-        kb_status_t status = config_write_u8(device, (uint16_t)(offset + i), bytes[i]);
+    size_t done = 0;
+    while (done < len) {
+        const uint16_t where = (uint16_t)(offset + done);
+        unsigned width = 1;
+        if ((len - done) >= 4u && (where & 3u) == 0) {
+            width = 4;
+        } else if ((len - done) >= 2u && (where & 1u) == 0) {
+            width = 2;
+        }
+        kb_status_t status = config_write_chunk(device, where, bytes + done, width);
         if (status != KB_OK) {
             return status;
         }
+        done += width;
     }
     return KB_OK;
 }
@@ -185,6 +209,12 @@ static kb_pachaos_capsule_backend_t *from_backend(kb_device_backend_t *backend)
 static uint64_t page_size_u64(void)
 {
     return 4096;
+}
+
+static int trace_pachaos_dma_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_PCI");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
 static uint64_t align_up_u64(uint64_t value, uint64_t alignment)
@@ -352,7 +382,15 @@ static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_pachaos_capsule_backend_t *
 
 static kb_status_t remember_dma_mapping(kb_pachaos_capsule_backend_t *backend, const kb_pachaos_dma_mapping_t *mapping)
 {
-    if (backend == NULL || mapping == NULL || !pacha_capsule_is_fd(mapping->dma.fd) || mapping->dma.iova == 0) {
+    if (backend == NULL || mapping == NULL || !pacha_capsule_is_fd(mapping->dma.fd)) {
+        if (trace_pachaos_dma_enabled()) {
+            fprintf(stderr,
+                "kobox pachaos_capsule: remember_dma_mapping reject backend=%p mapping=%p fd=%d iova=0x%llx\n",
+                (void *)backend,
+                (const void *)mapping,
+                mapping != NULL ? mapping->dma.fd : -1,
+                mapping != NULL ? (unsigned long long)mapping->dma.iova : 0ull);
+        }
         return KB_ERR_INVALID;
     }
     kb_pachaos_dma_mapping_t *entry = calloc(1, sizeof(*entry));
@@ -615,10 +653,34 @@ static kb_status_t pachaos_capsule_dma_alloc(
     }
 
     struct pacha_capsule_dma dma = {0};
-    const int status = pacha_capsule_device_derive_dma_buffer(device->device_fd, ptr, 0, (size_t)alloc_size, 0, &dma);
+    const int status = pacha_capsule_device_derive_dma_buffer(
+        device->device_fd,
+        ptr,
+        PACHA_CAPSULE_DMA_IOVA_KERNEL_CHOOSE,
+        (size_t)alloc_size,
+        0,
+        &dma);
     if (status != 0) {
+        if (trace_pachaos_dma_enabled()) {
+            fprintf(stderr,
+                "kobox pachaos_capsule: dma_alloc derive failed cpu=%p size=%llu align=%llu status=%d\n",
+                ptr,
+                (unsigned long long)alloc_size,
+                (unsigned long long)effective_alignment,
+                status);
+        }
         free_aligned_zeroed(alloc_addr, raw_size);
         return status_from_pacha(status);
+    }
+    if (trace_pachaos_dma_enabled()) {
+        fprintf(stderr,
+            "kobox pachaos_capsule: dma_alloc cpu=%p size=%llu align=%llu fd=%d iova=0x%llx len=%zu\n",
+            ptr,
+            (unsigned long long)alloc_size,
+            (unsigned long long)effective_alignment,
+            dma.fd,
+            (unsigned long long)dma.iova,
+            dma.len);
     }
 
     kb_pachaos_dma_mapping_t mapping = {
@@ -634,6 +696,13 @@ static kb_status_t pachaos_capsule_dma_alloc(
     };
     kb_status_t remember_status = remember_dma_mapping(device->backend, &mapping);
     if (remember_status != KB_OK) {
+        if (trace_pachaos_dma_enabled()) {
+            fprintf(stderr,
+                "kobox pachaos_capsule: dma_alloc remember failed cpu=%p iova=0x%llx status=%d\n",
+                ptr,
+                (unsigned long long)dma.iova,
+                remember_status);
+        }
         (void)pacha_capsule_close(dma.fd);
         free_aligned_zeroed(alloc_addr, raw_size);
         return remember_status;
@@ -658,16 +727,6 @@ static void pachaos_capsule_dma_free(kb_device_t *device, kb_dma_buffer_t *buffe
     memset(buffer, 0, sizeof(*buffer));
 }
 
-static int dma_range_crosses_page(const void *ptr, uint64_t size)
-{
-    if (ptr == NULL || size == 0) {
-        return 0;
-    }
-    const uint64_t page_size = page_size_u64();
-    const uint64_t offset = (uint64_t)((uintptr_t)ptr & (uintptr_t)(page_size - 1u));
-    return size > UINT64_MAX - offset || offset + size > page_size;
-}
-
 static kb_status_t pachaos_capsule_dma_map(
     kb_device_t *device,
     void *cpu_addr,
@@ -680,63 +739,69 @@ static kb_status_t pachaos_capsule_dma_map(
     }
     *out_dma_addr = 0;
 
-    const uint64_t page_size = page_size_u64();
-    const uint64_t map_size = align_up_u64(size, page_size);
     void *mapped = cpu_addr;
-    void *alloc_addr = NULL;
-    uint64_t raw_size = 0;
-    int owns_mapped = 0;
-    if (dma_range_crosses_page(cpu_addr, size)) {
-        mapped = alloc_aligned_zeroed(map_size, page_size, &alloc_addr, &raw_size);
-        if (mapped == NULL) {
-            return KB_ERR_NOMEM;
-        }
-        if (direction == KB_DMA_TO_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
-            memcpy(mapped, cpu_addr, (size_t)size);
-        }
-        owns_mapped = 1;
-    }
 
     struct pacha_capsule_dma dma = {0};
     const int status = pacha_capsule_derive_dma_mapping(
         device->device_fd,
         mapped,
-        0,
-        (size_t)(owns_mapped ? map_size : size),
+        PACHA_CAPSULE_DMA_IOVA_KERNEL_CHOOSE,
+        (size_t)size,
         (unsigned)dma_dir_to_pacha(direction),
         0);
     if (!pacha_capsule_is_fd(status)) {
-        if (alloc_addr != NULL) {
-            free_aligned_zeroed(alloc_addr, raw_size);
+        if (trace_pachaos_dma_enabled()) {
+            fprintf(stderr,
+                "kobox pachaos_capsule: dma_map derive failed cpu=%p mapped=%p size=%llu map_size=%llu owns_mapped=%d status=%d\n",
+                cpu_addr,
+                mapped,
+                (unsigned long long)size,
+                (unsigned long long)size,
+                0,
+                status);
         }
         return status_from_pacha(status);
     }
     const int read_status = pacha_capsule_dma_from_fd(status, &dma);
     if (read_status != 0) {
         (void)pacha_capsule_close(status);
-        if (alloc_addr != NULL) {
-            free_aligned_zeroed(alloc_addr, raw_size);
-        }
         return status_from_pacha(read_status);
+    }
+    if (trace_pachaos_dma_enabled()) {
+        fprintf(stderr,
+            "kobox pachaos_capsule: dma_map cpu=%p mapped=%p size=%llu map_size=%llu owns_mapped=%d fd=%d iova=0x%llx len=%zu dir=%d\n",
+            cpu_addr,
+            mapped,
+            (unsigned long long)size,
+            (unsigned long long)size,
+            0,
+            dma.fd,
+            (unsigned long long)dma.iova,
+            dma.len,
+            direction);
     }
 
     kb_pachaos_dma_mapping_t mapping = {
         .dma = dma,
         .cpu_addr = cpu_addr,
         .mapped_cpu_addr = mapped,
-        .alloc_addr = alloc_addr,
-        .alloc_size = raw_size,
+        .alloc_addr = NULL,
+        .alloc_size = 0,
         .size = size,
         .direction = direction,
         .owns_cpu_addr = 0,
-        .owns_mapped_cpu_addr = owns_mapped,
+        .owns_mapped_cpu_addr = 0,
     };
     kb_status_t remember_status = remember_dma_mapping(device->backend, &mapping);
     if (remember_status != KB_OK) {
-        (void)pacha_capsule_close(dma.fd);
-        if (alloc_addr != NULL) {
-            free_aligned_zeroed(alloc_addr, raw_size);
+        if (trace_pachaos_dma_enabled()) {
+            fprintf(stderr,
+                "kobox pachaos_capsule: dma_map remember failed cpu=%p iova=0x%llx status=%d\n",
+                cpu_addr,
+                (unsigned long long)dma.iova,
+                remember_status);
         }
+        (void)pacha_capsule_close(dma.fd);
         return remember_status;
     }
     *out_dma_addr = dma.iova;
@@ -755,6 +820,76 @@ static void pachaos_capsule_dma_unmap(kb_device_t *device, uint64_t dma_addr, ui
             mapping->direction == KB_DMA_FROM_DEVICE || mapping->direction == KB_DMA_BIDIRECTIONAL;
         release_dma_mapping(mapping, copy_back);
     }
+}
+
+static kb_status_t pachaos_capsule_dma_map_fixed(
+    kb_device_t *device,
+    void *cpu_addr,
+    uint64_t size,
+    uint64_t dma_addr,
+    kb_dma_dir_t direction)
+{
+    if (device == NULL || cpu_addr == NULL || size == 0 || size > (uint64_t)SIZE_MAX) {
+        return KB_ERR_INVALID;
+    }
+
+    struct pacha_capsule_dma dma = {0};
+    const int status = pacha_capsule_derive_dma_mapping(
+        device->device_fd,
+        cpu_addr,
+        dma_addr,
+        (size_t)size,
+        (unsigned)dma_dir_to_pacha(direction),
+        0);
+    if (!pacha_capsule_is_fd(status)) {
+        if (trace_pachaos_dma_enabled()) {
+            fprintf(stderr,
+                "kobox pachaos_capsule: dma_map_fixed derive failed cpu=%p size=%llu iova=0x%llx status=%d\n",
+                cpu_addr,
+                (unsigned long long)size,
+                (unsigned long long)dma_addr,
+                status);
+        }
+        return status_from_pacha(status);
+    }
+    const int read_status = pacha_capsule_dma_from_fd(status, &dma);
+    if (read_status != 0) {
+        (void)pacha_capsule_close(status);
+        return status_from_pacha(read_status);
+    }
+    if (trace_pachaos_dma_enabled()) {
+        fprintf(stderr,
+            "kobox pachaos_capsule: dma_map_fixed cpu=%p size=%llu requested=0x%llx fd=%d iova=0x%llx len=%zu dir=%d\n",
+            cpu_addr,
+            (unsigned long long)size,
+            (unsigned long long)dma_addr,
+            dma.fd,
+            (unsigned long long)dma.iova,
+            dma.len,
+            direction);
+    }
+    if (dma.iova != dma_addr) {
+        (void)pacha_capsule_close(dma.fd);
+        return KB_ERR_IO;
+    }
+
+    kb_pachaos_dma_mapping_t mapping = {
+        .dma = dma,
+        .cpu_addr = cpu_addr,
+        .mapped_cpu_addr = cpu_addr,
+        .alloc_addr = NULL,
+        .alloc_size = 0,
+        .size = size,
+        .direction = direction,
+        .owns_cpu_addr = 0,
+        .owns_mapped_cpu_addr = 0,
+    };
+    kb_status_t remember_status = remember_dma_mapping(device->backend, &mapping);
+    if (remember_status != KB_OK) {
+        (void)pacha_capsule_close(dma.fd);
+        return remember_status;
+    }
+    return KB_OK;
 }
 
 static kb_status_t pachaos_capsule_dma_set_mask(kb_device_t *device, uint64_t mask, int coherent)
@@ -887,6 +1022,7 @@ static const kb_device_backend_ops_t pachaos_capsule_ops = {
     .dma_alloc = pachaos_capsule_dma_alloc,
     .dma_free = pachaos_capsule_dma_free,
     .dma_map = pachaos_capsule_dma_map,
+    .dma_map_fixed = pachaos_capsule_dma_map_fixed,
     .dma_unmap = pachaos_capsule_dma_unmap,
     .dma_set_mask = pachaos_capsule_dma_set_mask,
     .irq_register = pachaos_capsule_irq_register,

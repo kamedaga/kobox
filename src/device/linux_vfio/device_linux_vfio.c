@@ -23,7 +23,7 @@
 enum {
     KB_VFIO_PATH_MAX = 4096,
     KB_VFIO_PCI_CONFIG_SIZE = 4096,
-    KB_VFIO_DMA_IOVA_BASE = 0x01000000,
+    KB_VFIO_DMA_IOVA_BASE = 0x02000000,
     KB_PCI_COMMAND_OFFSET = 0x04,
     KB_PCI_COMMAND_MEMORY = 0x0002,
     KB_PCI_STATUS_OFFSET = 0x06,
@@ -500,6 +500,7 @@ static kb_status_t vfio_map_bar(kb_device_t *device, unsigned bar_index, kb_mmio
     out_region->addr = addr;
     out_region->size = region.size;
     out_region->host_phys = info.start;
+    out_region->backend_offset = region.offset;
     out_region->flags = region.flags;
     return KB_OK;
 }
@@ -511,6 +512,22 @@ static void vfio_unmap_bar(kb_device_t *device, kb_mmio_region_t *region)
         munmap(region->addr, (size_t)region->size);
         memset(region, 0, sizeof(*region));
     }
+}
+
+static kb_status_t vfio_mmio_write32_region(
+    kb_device_t *device,
+    const kb_mmio_region_t *region,
+    uint64_t offset,
+    uint32_t value)
+{
+    if (device == NULL || region == NULL || offset + sizeof(value) > region->size) {
+        return KB_ERR_INVALID;
+    }
+    ssize_t write_size = pwrite(device->device_fd, &value, sizeof(value), (off_t)(region->backend_offset + offset));
+    if (write_size < 0) {
+        return errno_status();
+    }
+    return write_size == (ssize_t)sizeof(value) ? KB_OK : KB_ERR_IO;
 }
 
 static uint32_t vfio_mmio_read32(void *base, size_t offset)
@@ -570,6 +587,13 @@ static kb_status_t vfio_dma_map(
     uint64_t size,
     kb_dma_dir_t direction,
     uint64_t *out_dma_addr);
+
+static kb_status_t vfio_dma_map_fixed(
+    kb_device_t *device,
+    void *cpu_addr,
+    uint64_t size,
+    uint64_t dma_addr,
+    kb_dma_dir_t direction);
 
 static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction);
 
@@ -687,7 +711,7 @@ static kb_status_t vfio_dma_map(
         (void)ioctl(device->backend->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
         return status;
     }
-    backend->next_iova = iova + map_size + ps;
+    backend->next_iova = iova + map_size;
     *out_dma_addr = iova + offset;
     if (vfio_trace_dma_enabled()) {
         fprintf(stderr,
@@ -703,10 +727,87 @@ static kb_status_t vfio_dma_map(
     return KB_OK;
 }
 
+static kb_status_t vfio_dma_map_fixed(
+    kb_device_t *device,
+    void *cpu_addr,
+    uint64_t size,
+    uint64_t dma_addr,
+    kb_dma_dir_t direction)
+{
+    if (device == NULL || device->backend == NULL || cpu_addr == NULL || size == 0) {
+        return KB_ERR_INVALID;
+    }
+
+    const uint64_t ps = page_size();
+    const uint64_t start = (uint64_t)(uintptr_t)cpu_addr;
+    const uint64_t aligned_start = align_down_u64(start, ps);
+    const uint64_t offset = start - aligned_start;
+    const uint64_t map_size = align_up_u64(offset + size, ps);
+    const uint64_t iova = align_down_u64(dma_addr, ps);
+    if (dma_addr - iova != offset) {
+        return KB_ERR_INVALID;
+    }
+
+    struct vfio_iommu_type1_dma_map map;
+    memset(&map, 0, sizeof(map));
+    map.argsz = sizeof(map);
+    map.vaddr = aligned_start;
+    map.iova = iova;
+    map.size = map_size;
+    if (direction == KB_DMA_TO_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
+        map.flags |= VFIO_DMA_MAP_FLAG_READ;
+    }
+    if (direction == KB_DMA_FROM_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
+        map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
+    }
+    if (map.flags == 0) {
+        return KB_ERR_INVALID;
+    }
+
+    if (ioctl(device->backend->container_fd, VFIO_IOMMU_MAP_DMA, &map) != 0) {
+        if (vfio_trace_dma_enabled()) {
+            fprintf(stderr,
+                "kobox vfio: map_dma_fixed failed errno=%d vaddr=0x%llx iova=0x%llx size=0x%llx flags=0x%x cpu=%p len=0x%llx dma=0x%llx\n",
+                errno,
+                (unsigned long long)map.vaddr,
+                (unsigned long long)map.iova,
+                (unsigned long long)map.size,
+                map.flags,
+                cpu_addr,
+                (unsigned long long)size,
+                (unsigned long long)dma_addr);
+        }
+        return errno_status();
+    }
+
+    kb_status_t status = remember_dma_mapping(device->backend, iova, aligned_start, map_size);
+    if (status != KB_OK) {
+        struct vfio_iommu_type1_dma_unmap unmap;
+        memset(&unmap, 0, sizeof(unmap));
+        unmap.argsz = sizeof(unmap);
+        unmap.iova = iova;
+        unmap.size = map_size;
+        (void)ioctl(device->backend->container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
+        return status;
+    }
+    if (vfio_trace_dma_enabled()) {
+        fprintf(stderr,
+            "kobox vfio: map_dma_fixed ok vaddr=0x%llx iova=0x%llx size=0x%llx flags=0x%x cpu=%p len=0x%llx dma=0x%llx\n",
+            (unsigned long long)map.vaddr,
+            (unsigned long long)map.iova,
+            (unsigned long long)map.size,
+            map.flags,
+            cpu_addr,
+            (unsigned long long)size,
+            (unsigned long long)dma_addr);
+    }
+    return KB_OK;
+}
+
 static void vfio_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction)
 {
     (void)direction;
-    if (device == NULL || device->backend == NULL || dma_addr == 0 || size == 0) {
+    if (device == NULL || device->backend == NULL || size == 0) {
         return;
     }
 
@@ -1135,9 +1236,11 @@ static const kb_device_backend_ops_t vfio_ops = {
     .pci_bar_info = vfio_pci_bar_info,
     .map_bar = vfio_map_bar,
     .unmap_bar = vfio_unmap_bar,
+    .mmio_write32 = vfio_mmio_write32_region,
     .dma_alloc = vfio_dma_alloc,
     .dma_free = vfio_dma_free,
     .dma_map = vfio_dma_map,
+    .dma_map_fixed = vfio_dma_map_fixed,
     .dma_unmap = vfio_dma_unmap,
     .irq_register = vfio_irq_register,
     .irq_unregister = vfio_irq_unregister,

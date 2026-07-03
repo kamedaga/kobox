@@ -12,6 +12,9 @@ kb_device_backend_t *kb_shim_current_device_backend(void);
 
 static kb_status_t first_device(kb_device_backend_t *backend, kb_device_t **out_device);
 static int trace_pci_enabled(void);
+static int metric_pci_enabled(void);
+static uint64_t pci_read_tsc(void);
+static void pci_metric(const char *stage, uint64_t start_cycles);
 #define kb_pci_tracef(...) \
     do { \
         if (trace_pci_enabled()) { \
@@ -224,7 +227,11 @@ enum {
     KB_LINUX_6_6_PCI_RESOURCE0_START_OFFSET = 0x3a8,
     KB_LINUX_6_6_PCI_RESOURCE0_END_OFFSET = 0x3b0,
     KB_LINUX_6_6_PCI_RESOURCE0_FLAGS_OFFSET = 0x3c0,
+    KB_LINUX_3_10_PCI_RESOURCE0_START_OFFSET = 0x340,
+    KB_LINUX_3_10_PCI_RESOURCE0_END_OFFSET = 0x348,
+    KB_LINUX_3_10_PCI_RESOURCE0_FLAGS_OFFSET = 0x358,
     KB_LINUX_6_8_PCI_RESOURCE_SIZE = 0x40,
+    KB_LINUX_3_10_PCI_RESOURCE_SIZE = 0x38,
     KB_LINUX_6_8_PCI_BUS_DOMAIN_PTR_OFFSET = 0x0c8,
     KB_LINUX_6_8_PCI_BUS_NUMBER_OFFSET = 0x0d8,
     KB_LINUX_6_8_DEVICE_POWER_USAGE_COUNT_OFFSET = 0x1b0,
@@ -650,6 +657,17 @@ void kb_pci_release_selected_regions(void *dev, int bars)
     (void)bars;
 }
 
+int kb_pci_request_region(void *dev, int bar, const char *name)
+{
+    (void)name;
+    return kb_pci_request_selected_regions(dev, 1 << bar, name);
+}
+
+void kb_pci_release_region(void *dev, int bar)
+{
+    kb_pci_release_selected_regions(dev, 1 << bar);
+}
+
 int kb_pci_select_bars(void *dev, unsigned long flags)
 {
     (void)dev;
@@ -685,19 +703,50 @@ static kb_status_t update_pci_command(uint16_t set_bits, uint16_t clear_bits)
         return KB_ERR_UNSUPPORTED;
     }
 
-    uint16_t command = 0;
-    kb_status_t status = ops->pci_config_read(device, KB_PCI_COMMAND_OFFSET, &command, sizeof(command));
-    if (status != KB_OK) {
-        return status;
+    uint16_t command = binding.pci_command;
+    uint16_t next_command = (uint16_t)((command | set_bits) & (uint16_t)~clear_bits);
+    if (next_command == command) {
+        return KB_OK;
     }
-    command = (uint16_t)((command | set_bits) & (uint16_t)~clear_bits);
-    return ops->pci_config_write(device, KB_PCI_COMMAND_OFFSET, &command, sizeof(command));
+    kb_status_t status = ops->pci_config_write(device, KB_PCI_COMMAND_OFFSET, &next_command, sizeof(next_command));
+    if (status == KB_OK) {
+        binding.pci_command = next_command;
+    }
+    return status;
 }
 
 static int trace_pci_enabled(void)
 {
     const char *value = getenv("KOBOX_TRACE_PCI");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int metric_pci_enabled(void)
+{
+    const char *value = getenv("KOBOX_NET_METRIC");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static uint64_t pci_read_tsc(void)
+{
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void pci_metric(const char *stage, uint64_t start_cycles)
+{
+    if (!metric_pci_enabled() || stage == NULL || start_cycles == 0) {
+        return;
+    }
+    uint64_t end_cycles = pci_read_tsc();
+    if (end_cycles < start_cycles) {
+        return;
+    }
+    printf("[kobox-pci] metric stage=%s cycles=%llu\n",
+        stage,
+        (unsigned long long)(end_cycles - start_cycles));
 }
 
 static int remember_mmio_mapping(
@@ -944,6 +993,36 @@ static int cached_bar0_snapshot(volatile unsigned char **base_out, size_t *size_
     return 1;
 }
 
+int kb_pci_bar0_snapshot(volatile unsigned char **base_out, size_t *size_out)
+{
+    return cached_bar0_snapshot(base_out, size_out);
+}
+
+int kb_pci_bar_write32(unsigned int bar, size_t offset, uint32_t value)
+{
+    kb_device_backend_t *backend = kb_shim_current_device_backend();
+    kb_device_t *device = binding.device;
+    if (device == NULL && first_device(backend, &device) != KB_OK) {
+        return -19;
+    }
+
+    shim_mmio_mapping_t *mapping = find_mmio_mapping_for_bar(backend, device, (int)bar);
+    if (mapping == NULL || offset + sizeof(value) > mapping->region.size) {
+        return -22;
+    }
+
+    volatile uint32_t *shadow = (volatile uint32_t *)((unsigned char *)mapping->region.addr + offset);
+    *shadow = value;
+
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(mapping->backend);
+    if (ops == NULL || ops->mmio_write32 == NULL) {
+        return 0;
+    }
+
+    kb_status_t status = ops->mmio_write32(mapping->device, &mapping->region, offset, value);
+    return status == KB_OK ? 0 : -5;
+}
+
 static void write_u32(void *ptr, uint32_t value)
 {
     memcpy(ptr, &value, sizeof(value));
@@ -1048,6 +1127,7 @@ static int xhci_interrupter_snapshot(
 }
 
 static void write_pci_resource(
+    size_t resource_size,
     size_t resource0_start_offset,
     size_t resource0_end_offset,
     size_t resource0_flags_offset,
@@ -1056,7 +1136,7 @@ static void write_pci_resource(
     uint64_t end,
     uint64_t flags)
 {
-    const size_t resource_offset = resource0_start_offset + ((size_t)bar_index * KB_LINUX_6_8_PCI_RESOURCE_SIZE);
+    const size_t resource_offset = resource0_start_offset + ((size_t)bar_index * resource_size);
     memcpy(binding.pci_dev_storage + resource_offset, &start, sizeof(start));
     memcpy(
         binding.pci_dev_storage + resource_offset + (resource0_end_offset - resource0_start_offset),
@@ -1250,6 +1330,7 @@ static void quiesce_nvme_controller(void)
 
 int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
 {
+    const uint64_t total_start_cycles = pci_read_tsc();
     (void)owner;
     (void)mod_name;
     if (driver == NULL) {
@@ -1302,6 +1383,12 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
     memset(binding.pci_bus_storage, 0, sizeof(binding.pci_bus_storage));
     memset(binding.pci_dev_name, 0, sizeof(binding.pci_dev_name));
     memset(binding.pcim_iomap_table, 0, sizeof(binding.pcim_iomap_table));
+    uint16_t real_command = 0;
+    if (ops->pci_config_read != NULL &&
+        ops->pci_config_read(device, KB_PCI_COMMAND_OFFSET, &real_command, sizeof(real_command)) == KB_OK)
+    {
+        binding.pci_command = real_command;
+    }
     binding.dma_mask_storage = UINT64_MAX;
     uintptr_t dma_mask_ptr = (uintptr_t)&binding.dma_mask_storage;
     memcpy(
@@ -1353,15 +1440,26 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
                 continue;
             }
             uint64_t flags = bar.flags == 0 ? KB_LINUX_IORESOURCE_MEM : bar.flags;
-#if defined(__pachaos__)
-            kb_pci_tracef(
-                "kobox pci: resource bar=%u start=0x%llx end=0x%llx flags=0x%llx\n",
-                bar_index,
-                (unsigned long long)bar.start,
-                (unsigned long long)bar.end,
-                (unsigned long long)flags);
-#endif
+            if (trace_pci_enabled()) {
+                fprintf(
+                    stderr,
+                    "kobox pci: resource bar=%u start=0x%llx end=0x%llx flags=0x%llx\n",
+                    bar_index,
+                    (unsigned long long)bar.start,
+                    (unsigned long long)bar.end,
+                    (unsigned long long)flags);
+            }
             write_pci_resource(
+                KB_LINUX_3_10_PCI_RESOURCE_SIZE,
+                KB_LINUX_3_10_PCI_RESOURCE0_START_OFFSET,
+                KB_LINUX_3_10_PCI_RESOURCE0_END_OFFSET,
+                KB_LINUX_3_10_PCI_RESOURCE0_FLAGS_OFFSET,
+                bar_index,
+                bar.start,
+                bar.end,
+                flags);
+            write_pci_resource(
+                KB_LINUX_6_8_PCI_RESOURCE_SIZE,
                 KB_LINUX_6_8_PCI_RESOURCE0_START_OFFSET,
                 KB_LINUX_6_8_PCI_RESOURCE0_END_OFFSET,
                 KB_LINUX_6_8_PCI_RESOURCE0_FLAGS_OFFSET,
@@ -1370,6 +1468,7 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
                 bar.end,
                 flags);
             write_pci_resource(
+                KB_LINUX_6_8_PCI_RESOURCE_SIZE,
                 KB_LINUX_6_6_PCI_RESOURCE0_START_OFFSET,
                 KB_LINUX_6_6_PCI_RESOURCE0_END_OFFSET,
                 KB_LINUX_6_6_PCI_RESOURCE0_FLAGS_OFFSET,
@@ -1396,7 +1495,9 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
             device_id.prog_if,
             (void *)pci_driver.probe);
     }
+    uint64_t probe_start_cycles = pci_read_tsc();
     int result = pci_driver.probe(binding.pci_dev_storage, matched_id);
+    pci_metric("register_driver_probe", probe_start_cycles);
     if (trace_pci_enabled()) {
         fprintf(stderr, "kobox pci: pci_register_driver probe result=%d\n", result);
     }
@@ -1406,6 +1507,7 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
         return result;
     }
     binding.probed = 1;
+    pci_metric("register_driver_total", total_start_cycles);
     return 0;
 }
 
@@ -1435,6 +1537,7 @@ void kb_pci_unregister_driver(void *driver)
 
 int kb_pci_enable_device(void *dev)
 {
+    const uint64_t start_cycles = pci_read_tsc();
     (void)dev;
 #if defined(__pachaos__)
     kb_pci_tracef("kobox pci: enable_device enter\n");
@@ -1451,6 +1554,7 @@ int kb_pci_enable_device(void *dev)
     write_u32(
         binding.pci_dev_storage + KB_LINUX_6_8_PCI_DEV_DEVICE_OFFSET + KB_LINUX_6_8_DEVICE_POWER_USAGE_COUNT_OFFSET,
         1);
+    pci_metric("enable_device", start_cycles);
     return status == KB_OK ? 0 : -5;
 }
 
@@ -1476,6 +1580,7 @@ void kb_pci_disable_device(void *dev)
 
 void kb_pci_set_master(void *dev)
 {
+    const uint64_t start_cycles = pci_read_tsc();
     (void)dev;
 #if defined(__pachaos__)
     kb_pci_tracef("kobox pci: set_master enter\n");
@@ -1488,6 +1593,7 @@ void kb_pci_set_master(void *dev)
     kb_pci_tracef("kobox pci: set_master done\n");
 #endif
     binding.pci_command = (uint16_t)(binding.pci_command | KB_PCI_COMMAND_MASTER);
+    pci_metric("set_master", start_cycles);
 }
 
 void *kb_pci_dev_get(void *dev)
@@ -1559,11 +1665,7 @@ static int read_config_bytes(void *dev, int where, void *dst, size_t len)
 
     const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     if (ops != NULL && ops->pci_config_read != NULL) {
-        uint16_t real_vendor = 0;
-        if (ops->pci_config_read(device, 0, &real_vendor, sizeof(real_vendor)) == KB_OK &&
-            real_vendor != 0 && real_vendor != UINT16_MAX &&
-            ops->pci_config_read(device, (uint16_t)where, dst, len) == KB_OK)
-        {
+        if (ops->pci_config_read(device, (uint16_t)where, dst, len) == KB_OK) {
             if (trace_pci_enabled()) {
                 uint32_t value = 0;
                 memcpy(&value, dst, len < sizeof(value) ? len : sizeof(value));
@@ -1717,6 +1819,43 @@ int kb_pci_find_capability(void *dev, int cap)
     uint8_t offset = 0;
     if (kb_pci_read_config_byte(dev, KB_PCI_CAPABILITY_LIST_OFFSET, &offset) != 0) {
         return 0;
+    }
+    offset &= KB_PCI_CAP_NEXT_MASK;
+
+    for (unsigned depth = 0; depth < 48 && offset >= 0x40; depth++) {
+        uint8_t id = 0;
+        uint8_t next = 0;
+        if (kb_pci_read_config_byte(dev, offset, &id) != 0 ||
+            kb_pci_read_config_byte(dev, offset + 1, &next) != 0)
+        {
+            return 0;
+        }
+        if (id == (uint8_t)cap) {
+            return offset;
+        }
+        offset = next & KB_PCI_CAP_NEXT_MASK;
+    }
+    return 0;
+}
+
+int kb_pci_find_next_capability(void *dev, uint8_t pos, int cap)
+{
+    uint16_t status = 0;
+    if (kb_pci_read_config_word(dev, KB_PCI_STATUS_OFFSET, &status) != 0 ||
+        (status & KB_PCI_STATUS_CAP_LIST) == 0)
+    {
+        return 0;
+    }
+
+    uint8_t offset = 0;
+    if (pos == 0) {
+        if (kb_pci_read_config_byte(dev, KB_PCI_CAPABILITY_LIST_OFFSET, &offset) != 0) {
+            return 0;
+        }
+    } else {
+        if (pos < 0x40 || kb_pci_read_config_byte(dev, (int)pos + 1, &offset) != 0) {
+            return 0;
+        }
     }
     offset &= KB_PCI_CAP_NEXT_MASK;
 
@@ -1940,11 +2079,21 @@ void *kb_pci_iomap(void *dev, int bar, unsigned long max)
             (unsigned long long)region.size,
             (unsigned long long)region.host_phys);
     }
+    kb_virtio_modern_trace_bar((unsigned)bar, region.addr, (size_t)region.size);
     if (bar == 0) {
         mapped_bar0_addr = region.addr;
         mapped_bar0_size = (size_t)region.size;
     }
     return region.addr;
+}
+
+void *kb_pci_iomap_range(void *dev, int bar, unsigned long offset, unsigned long max)
+{
+    void *addr = kb_pci_iomap(dev, bar, max == 0 ? 0 : offset + max);
+    if (addr == NULL) {
+        return NULL;
+    }
+    return (unsigned char *)addr + offset;
 }
 
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max)
@@ -2849,6 +2998,11 @@ void *pci_get_class(unsigned int class, void *from)
 void *pci_iomap(void *dev, int bar, unsigned long max)
 {
     return kb_pci_iomap(dev, bar, max);
+}
+
+void *pci_iomap_range(void *dev, int bar, unsigned long offset, unsigned long max)
+{
+    return kb_pci_iomap_range(dev, bar, offset, max);
 }
 
 void *pcim_iomap(void *dev, int bar, unsigned long max)

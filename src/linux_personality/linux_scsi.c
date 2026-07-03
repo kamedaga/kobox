@@ -3,6 +3,8 @@
 #include "linux_subsystem/usb/storage.h"
 
 #include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
 void *kb_scsi_host_alloc(void *host_template, int private_size)
 {
@@ -127,6 +129,17 @@ int kb_sg_nents(void *sg)
 
 void *kb_sg_next(void *sg)
 {
-    (void)sg;
-    return NULL;
+    if (sg == NULL) {
+        return NULL;
+    }
+    uintptr_t page_link = 0;
+    memcpy(&page_link, sg, sizeof(page_link));
+    if ((page_link & 0x2u) != 0) {
+        return NULL;
+    }
+    if ((page_link & 0x1u) != 0) {
+        uintptr_t chain = page_link & ~(uintptr_t)0x3u;
+        return (void *)chain;
+    }
+    return (unsigned char *)sg + 32;
 }

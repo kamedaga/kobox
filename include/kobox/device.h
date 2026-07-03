@@ -50,6 +50,7 @@ typedef struct kb_mmio_region {
     void *addr;
     uint64_t size;
     uint64_t host_phys;
+    uint64_t backend_offset;
     uint32_t flags;
 } kb_mmio_region_t;
 
@@ -85,6 +86,7 @@ typedef struct kb_device_backend_ops {
 
     kb_status_t (*map_bar)(kb_device_t *device, unsigned bar_index, kb_mmio_region_t *out_region);
     void (*unmap_bar)(kb_device_t *device, kb_mmio_region_t *region);
+    kb_status_t (*mmio_write32)(kb_device_t *device, const kb_mmio_region_t *region, uint64_t offset, uint32_t value);
 
     kb_status_t (*dma_alloc)(
         kb_device_t *device,
@@ -100,6 +102,12 @@ typedef struct kb_device_backend_ops {
         uint64_t size,
         kb_dma_dir_t direction,
         uint64_t *out_dma_addr);
+    kb_status_t (*dma_map_fixed)(
+        kb_device_t *device,
+        void *cpu_addr,
+        uint64_t size,
+        uint64_t dma_addr,
+        kb_dma_dir_t direction);
     void (*dma_unmap)(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction);
     kb_status_t (*dma_set_mask)(kb_device_t *device, uint64_t mask, int coherent);
 

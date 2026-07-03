@@ -1,25 +1,11 @@
 #include "kobox/shim.h"
+#include "linux_subsystem/net/net_device.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-enum {
-    KB_NETDEV_TRACKED_MAX = 32,
-    KB_NETDEV_OPS_OFFSET = 0x8,
-    KB_NETDEV_ADDR_MAX = 32,
-};
-
-typedef int (*kb_netdev_ndo_init_t)(void *dev);
-
-typedef struct kb_netdev_record {
-    void *dev;
-    size_t size;
-    unsigned char dev_addr[KB_NETDEV_ADDR_MAX];
-    int registered;
-} kb_netdev_record_t;
 
 typedef struct kb_rwsem_record {
     void *sem;
@@ -33,7 +19,6 @@ unsigned long *__cpu_possible_mask = &possible_cpu_mask_storage;
 unsigned int nr_cpu_ids = 1;
 unsigned long this_cpu_off = 0;
 char pernet_ops_rwsem[64];
-static kb_netdev_record_t netdev_records[KB_NETDEV_TRACKED_MAX];
 typedef struct kb_percpu_alloc_record {
     void *base;
     void *relative;
@@ -90,43 +75,6 @@ static kb_rwsem_record_t *rwsem_record_get_locked(void *sem)
     record->next = rwsem_records;
     rwsem_records = record;
     return record;
-}
-
-static kb_netdev_record_t *find_netdev_record(void *dev)
-{
-    if (dev == NULL) {
-        return NULL;
-    }
-    for (size_t i = 0; i < KB_NETDEV_TRACKED_MAX; i++) {
-        if (netdev_records[i].dev == dev) {
-            return &netdev_records[i];
-        }
-    }
-    return NULL;
-}
-
-static void track_netdev(void *dev, size_t size)
-{
-    if (dev == NULL) {
-        return;
-    }
-    for (size_t i = 0; i < KB_NETDEV_TRACKED_MAX; i++) {
-        if (netdev_records[i].dev == NULL) {
-            netdev_records[i].dev = dev;
-            netdev_records[i].size = size;
-            memset(netdev_records[i].dev_addr, 0, sizeof(netdev_records[i].dev_addr));
-            netdev_records[i].registered = 0;
-            return;
-        }
-    }
-}
-
-static void untrack_netdev(void *dev)
-{
-    kb_netdev_record_t *record = find_netdev_record(dev);
-    if (record != NULL) {
-        memset(record, 0, sizeof(*record));
-    }
 }
 
 void kb_cond_resched(void)
@@ -206,28 +154,20 @@ void kb_rtnl_unlock(void)
 
 int kb_register_netdevice(void *dev)
 {
-    kb_netdev_record_t *record = find_netdev_record(dev);
-    if (record == NULL || record->size < KB_NETDEV_OPS_OFFSET + sizeof(void *)) {
-        return 0;
-    }
-
-    void *ops = NULL;
-    memcpy(&ops, (const unsigned char *)dev + KB_NETDEV_OPS_OFFSET, sizeof(ops));
-    if (ops != NULL) {
-        kb_netdev_ndo_init_t ndo_init = NULL;
-        memcpy(&ndo_init, ops, sizeof(ndo_init));
-        if (ndo_init != NULL) {
-            int result = ndo_init(dev);
-            if (result < 0) {
-                return result;
-            }
-        }
-    }
-    record->registered = 1;
-    return 0;
+    return kb_net_device_register(dev);
 }
 
 void *kb_alloc_netdev_mqs(
+    int sizeof_priv,
+    const char *name,
+    void (*setup)(void *),
+    unsigned int txqs,
+    unsigned int rxqs)
+{
+    return kb_net_device_alloc(sizeof_priv, name, 0, setup, txqs, rxqs);
+}
+
+void *kb_alloc_netdev_mqs_modern(
     int sizeof_priv,
     const char *name,
     unsigned char name_assign_type,
@@ -235,23 +175,17 @@ void *kb_alloc_netdev_mqs(
     unsigned int txqs,
     unsigned int rxqs)
 {
-    (void)name;
-    (void)name_assign_type;
-    (void)txqs;
-    (void)rxqs;
-    size_t size = sizeof_priv < 0 ? 65536 : (size_t)sizeof_priv + 65536;
-    void *dev = calloc(1, size);
-    track_netdev(dev, size);
-    if (dev != NULL && setup != NULL) {
-        setup(dev);
-    }
-    return dev;
+    return kb_net_device_alloc(sizeof_priv, name, name_assign_type, setup, txqs, rxqs);
+}
+
+void *kb_alloc_etherdev_mqs_rh(int sizeof_priv, unsigned int txqs, unsigned int rxqs)
+{
+    return kb_net_device_alloc(sizeof_priv, "eth%d", 0, kb_ether_setup, txqs, rxqs);
 }
 
 void kb_free_netdev(void *dev)
 {
-    untrack_netdev(dev);
-    free(dev);
+    kb_net_device_free(dev);
 }
 
 void kb_ether_setup(void *dev)
@@ -274,20 +208,48 @@ int kb_eth_validate_addr(void *dev)
 
 void kb_dev_addr_mod(void *dev, unsigned int offset, const void *addr, size_t len)
 {
-    kb_netdev_record_t *record = find_netdev_record(dev);
-    if (record != NULL && addr != NULL && offset < KB_NETDEV_ADDR_MAX && len <= KB_NETDEV_ADDR_MAX - offset) {
-        memcpy(record->dev_addr + offset, addr, len);
-    }
+    kb_net_device_addr_mod(dev, offset, addr, len);
 }
 
 void kb_netif_carrier_on(void *dev)
 {
-    (void)dev;
+    kb_net_device_set_carrier(dev, 1);
 }
 
 void kb_netif_carrier_off(void *dev)
 {
-    (void)dev;
+    kb_net_device_set_carrier(dev, 0);
+}
+
+int kb_dev_open(void *dev)
+{
+    return kb_net_device_open(dev);
+}
+
+int kb_dev_queue_xmit(void *skb)
+{
+    (void)skb;
+    return 0;
+}
+
+void *__netdev_alloc_skb(void *dev, unsigned int length, unsigned int gfp)
+{
+    return kb_netdev_alloc_skb(dev, length, gfp);
+}
+
+void *skb_put(void *skb, unsigned int len)
+{
+    return kb_skb_put(skb, len);
+}
+
+int skb_to_sgvec(void *skb, void *sg, int offset, int len)
+{
+    return kb_skb_to_sgvec(skb, sg, offset, len);
+}
+
+int napi_gro_receive(void *napi, void *skb)
+{
+    return kb_napi_gro_receive(napi, skb);
 }
 
 void kb_get_random_bytes(void *buf, int len)
@@ -529,7 +491,7 @@ void *alloc_netdev_mqs(
     unsigned int txqs,
     unsigned int rxqs)
 {
-    return kb_alloc_netdev_mqs(sizeof_priv, name, name_assign_type, setup, txqs, rxqs);
+    return kb_alloc_netdev_mqs_modern(sizeof_priv, name, name_assign_type, setup, txqs, rxqs);
 }
 
 void free_netdev(void *dev)
@@ -565,6 +527,31 @@ void netif_carrier_on(void *dev)
 void netif_carrier_off(void *dev)
 {
     kb_netif_carrier_off(dev);
+}
+
+void __netif_napi_add(void *dev, void *napi, void *poll, int weight)
+{
+    kb_netif_napi_add(dev, napi, poll, weight);
+}
+
+void napi_disable(void *napi)
+{
+    kb_napi_disable(napi);
+}
+
+int napi_schedule_prep(void *napi)
+{
+    return kb_napi_schedule_prep(napi);
+}
+
+int dev_open(void *dev)
+{
+    return kb_dev_open(dev);
+}
+
+int dev_queue_xmit(void *skb)
+{
+    return kb_dev_queue_xmit(skb);
 }
 
 void get_random_bytes(void *buf, int len)

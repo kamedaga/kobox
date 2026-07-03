@@ -53,7 +53,8 @@ typedef struct loaded_section {
 
 enum {
     KB_LOCAL_SHIM_STUB_SIZE = 48,
-    KB_LOCAL_SHIM_STUB_COUNT = 8192,
+    KB_LOCAL_SHIM_STUB_COUNT = 4096,
+    KB_LOCAL_SHIM_SYMBOL_HASH_SIZE = 16384,
     KB_LOCAL_SHIM_DATA_SIZE = 32768,
     KB_LOCAL_SHIM_REGION_SIZE = (KB_LOCAL_SHIM_STUB_SIZE * KB_LOCAL_SHIM_STUB_COUNT) + KB_LOCAL_SHIM_DATA_SIZE,
     KB_LOCAL_SHIM_DATA_OFFSET = KB_LOCAL_SHIM_STUB_SIZE * KB_LOCAL_SHIM_STUB_COUNT,
@@ -63,6 +64,7 @@ enum {
     KB_LOCAL_PAGE_OFFSET_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7168,
     KB_LOCAL_VMEMMAP_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7176,
     KB_LOCAL_PHYS_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7184,
+    KB_LOCAL_DMA_OPS_PTR_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7192,
     KB_LOCAL_CURRENT_CRED_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7680,
     KB_LOCAL_CURRENT_MM_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4608,
     KB_LOCAL_CURRENT_TASK_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 8192,
@@ -162,6 +164,8 @@ struct kb_module {
     void *shim_param_ops_ulong;
     void *shim_cpu_possible_mask;
     void *shim_cpu_online_mask;
+    void *shim_cpu_possible_mask_ptr;
+    void *shim_cpu_online_mask_ptr;
     void *shim_nr_cpu_ids;
     void *shim_percpu_counter_batch;
     void *shim_const_pcpu_hot;
@@ -954,6 +958,24 @@ static void *kb_safe_memcpy(void *dst, const void *src, size_t n)
     if (n == 0 || kb_low_or_err_pointer(dst) || kb_low_or_err_pointer(src)) {
         return dst;
     }
+    const char *trace_memcpy = getenv("KOBOX_TRACE_NET_MEMCPY");
+    if (trace_memcpy != NULL && trace_memcpy[0] != '\0' && strcmp(trace_memcpy, "0") != 0 && n <= 2048) {
+        const unsigned char *bytes = (const unsigned char *)src;
+        fprintf(stderr,
+            "kobox memcpy: dst=%p src=%p n=%zu target=%p bytes=",
+            dst,
+            src,
+            n,
+            (void *)kb_current_external_call_target);
+        size_t dump_len = n < 32 ? n : 32;
+        for (size_t i = 0; i < dump_len; i++) {
+            fprintf(stderr, "%02x", bytes[i]);
+            if (i + 1 < dump_len) {
+                fprintf(stderr, ":");
+            }
+        }
+        fprintf(stderr, "\n");
+    }
     return memcpy(dst, src, n);
 }
 
@@ -1274,134 +1296,153 @@ _Static_assert(
     sizeof(shim_symbols) / sizeof(shim_symbols[0]) <= KB_LOCAL_SHIM_STUB_COUNT,
     "increase KB_LOCAL_SHIM_STUB_COUNT");
 
+static const kb_linux_symbol_t *shim_symbol_cache[KB_LOCAL_SHIM_STUB_COUNT];
+static uint16_t shim_symbol_hash_index[KB_LOCAL_SHIM_SYMBOL_HASH_SIZE];
+static size_t shim_symbol_cache_count;
+static int shim_symbol_cache_ready;
+static int shim_symbol_cache_overflow;
+
+static uint64_t shim_symbol_name_hash(const char *name)
+{
+    uint64_t hash = 1469598103934665603ull;
+    if (name == NULL) {
+        return 0;
+    }
+    while (*name != '\0') {
+        hash ^= (unsigned char)*name++;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static void shim_symbol_hash_insert_first(const kb_linux_symbol_t *symbol, size_t index)
+{
+    if (symbol == NULL || symbol->name == NULL || index >= UINT16_MAX) {
+        return;
+    }
+    size_t slot = (size_t)(shim_symbol_name_hash(symbol->name) & (KB_LOCAL_SHIM_SYMBOL_HASH_SIZE - 1u));
+    for (size_t probe = 0; probe < KB_LOCAL_SHIM_SYMBOL_HASH_SIZE; probe++) {
+        uint16_t stored = shim_symbol_hash_index[slot];
+        if (stored == 0) {
+            shim_symbol_hash_index[slot] = (uint16_t)(index + 1u);
+            return;
+        }
+        const kb_linux_symbol_t *existing = shim_symbol_cache[(size_t)stored - 1u];
+        if (existing != NULL && existing->name != NULL && strcmp(existing->name, symbol->name) == 0) {
+            return;
+        }
+        slot = (slot + 1u) & (KB_LOCAL_SHIM_SYMBOL_HASH_SIZE - 1u);
+    }
+}
+
+static void shim_symbol_append_provider(const kb_linux_symbol_t *symbols, size_t count)
+{
+    if (symbols == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (shim_symbol_cache_count >= KB_LOCAL_SHIM_STUB_COUNT) {
+            shim_symbol_cache_overflow = 1;
+            return;
+        }
+        const size_t index = shim_symbol_cache_count++;
+        shim_symbol_cache[index] = &symbols[i];
+        shim_symbol_hash_insert_first(&symbols[i], index);
+    }
+}
+
+static void shim_symbol_table_init(void)
+{
+    if (shim_symbol_cache_ready) {
+        return;
+    }
+
+    size_t count = 0;
+    shim_symbol_append_provider(shim_symbols, sizeof(shim_symbols) / sizeof(shim_symbols[0]));
+
+    const kb_linux_symbol_t *symbols = kb_linux_core_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_stub_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_pci_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_usb_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_ata_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_block_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_dma_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_fs_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_input_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_net_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_security_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_sound_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+    symbols = kb_linux_kvm_symbols(&count);
+    shim_symbol_append_provider(symbols, count);
+
+    shim_symbol_cache_ready = 1;
+}
+
+static size_t shim_symbol_table_count(void)
+{
+    shim_symbol_table_init();
+    return shim_symbol_cache_overflow ? KB_LOCAL_SHIM_STUB_COUNT + 1u : shim_symbol_cache_count;
+}
+
+static const kb_linux_symbol_t *shim_symbol_table_at(size_t index)
+{
+    shim_symbol_table_init();
+    return index < shim_symbol_cache_count ? shim_symbol_cache[index] : NULL;
+}
+
+static int shim_symbol_find_index(const char *name, size_t *out_index)
+{
+    if (name == NULL || out_index == NULL) {
+        return 0;
+    }
+    shim_symbol_table_init();
+    size_t slot = (size_t)(shim_symbol_name_hash(name) & (KB_LOCAL_SHIM_SYMBOL_HASH_SIZE - 1u));
+    for (size_t probe = 0; probe < KB_LOCAL_SHIM_SYMBOL_HASH_SIZE; probe++) {
+        uint16_t stored = shim_symbol_hash_index[slot];
+        if (stored == 0) {
+            return 0;
+        }
+        size_t index = (size_t)stored - 1u;
+        const kb_linux_symbol_t *symbol = shim_symbol_cache[index];
+        if (symbol != NULL && symbol->name != NULL && strcmp(symbol->name, name) == 0) {
+            *out_index = index;
+            return 1;
+        }
+        slot = (slot + 1u) & (KB_LOCAL_SHIM_SYMBOL_HASH_SIZE - 1u);
+    }
+    return 0;
+}
+
+static void *shim_symbol_find_address(const char *name)
+{
+    size_t index = 0;
+    if (!shim_symbol_find_index(name, &index)) {
+        return NULL;
+    }
+    const kb_linux_symbol_t *symbol = shim_symbol_table_at(index);
+    return symbol == NULL ? NULL : symbol->address;
+}
+
 static size_t shim_symbol_count(void)
 {
-    size_t block_count = 0;
-    size_t ata_count = 0;
-    size_t core_count = 0;
-    size_t dma_count = 0;
-    size_t fs_count = 0;
-    size_t input_count = 0;
-    size_t kvm_count = 0;
-    size_t net_count = 0;
-    size_t pci_count = 0;
-    size_t security_count = 0;
-    size_t sound_count = 0;
-    size_t stub_count = 0;
-    size_t usb_count = 0;
-    (void)kb_linux_ata_symbols(&ata_count);
-    (void)kb_linux_block_symbols(&block_count);
-    (void)kb_linux_core_symbols(&core_count);
-    (void)kb_linux_dma_symbols(&dma_count);
-    (void)kb_linux_fs_symbols(&fs_count);
-    (void)kb_linux_input_symbols(&input_count);
-    (void)kb_linux_kvm_symbols(&kvm_count);
-    (void)kb_linux_net_symbols(&net_count);
-    (void)kb_linux_pci_symbols(&pci_count);
-    (void)kb_linux_security_symbols(&security_count);
-    (void)kb_linux_sound_symbols(&sound_count);
-    (void)kb_linux_stub_symbols(&stub_count);
-    (void)kb_linux_usb_symbols(&usb_count);
-    return (sizeof(shim_symbols) / sizeof(shim_symbols[0])) +
-        core_count + stub_count + pci_count + usb_count + ata_count + block_count + dma_count + fs_count + input_count +
-        net_count + security_count + sound_count + kvm_count;
+    return shim_symbol_table_count();
 }
 
 static const kb_linux_symbol_t *shim_symbol_at(size_t index)
 {
-    const size_t core_count = sizeof(shim_symbols) / sizeof(shim_symbols[0]);
-    if (index < core_count) {
-        return &shim_symbols[index];
-    }
-
-    size_t core_provider_count = 0;
-    const kb_linux_symbol_t *core_symbols = kb_linux_core_symbols(&core_provider_count);
-    index -= core_count;
-    if (index < core_provider_count) {
-        return &core_symbols[index];
-    }
-
-    size_t stub_count = 0;
-    const kb_linux_symbol_t *stub_symbols = kb_linux_stub_symbols(&stub_count);
-    index -= core_provider_count;
-    if (index < stub_count) {
-        return &stub_symbols[index];
-    }
-
-    size_t pci_count = 0;
-    const kb_linux_symbol_t *pci_symbols = kb_linux_pci_symbols(&pci_count);
-    index -= stub_count;
-    if (index < pci_count) {
-        return &pci_symbols[index];
-    }
-
-    size_t usb_count = 0;
-    const kb_linux_symbol_t *usb_symbols = kb_linux_usb_symbols(&usb_count);
-    index -= pci_count;
-    if (index < usb_count) {
-        return &usb_symbols[index];
-    }
-
-    size_t ata_count = 0;
-    const kb_linux_symbol_t *ata_symbols = kb_linux_ata_symbols(&ata_count);
-    index -= usb_count;
-    if (index < ata_count) {
-        return &ata_symbols[index];
-    }
-
-    size_t block_count = 0;
-    const kb_linux_symbol_t *block_symbols = kb_linux_block_symbols(&block_count);
-    index -= ata_count;
-    if (index < block_count) {
-        return &block_symbols[index];
-    }
-
-    size_t dma_count = 0;
-    const kb_linux_symbol_t *dma_symbols = kb_linux_dma_symbols(&dma_count);
-    index -= block_count;
-    if (index < dma_count) {
-        return &dma_symbols[index];
-    }
-
-    size_t fs_count = 0;
-    const kb_linux_symbol_t *fs_symbols = kb_linux_fs_symbols(&fs_count);
-    index -= dma_count;
-    if (index < fs_count) {
-        return &fs_symbols[index];
-    }
-
-    size_t input_count = 0;
-    const kb_linux_symbol_t *input_symbols = kb_linux_input_symbols(&input_count);
-    index -= fs_count;
-    if (index < input_count) {
-        return &input_symbols[index];
-    }
-
-    size_t net_count = 0;
-    const kb_linux_symbol_t *net_symbols = kb_linux_net_symbols(&net_count);
-    index -= input_count;
-    if (index < net_count) {
-        return &net_symbols[index];
-    }
-
-    size_t security_count = 0;
-    const kb_linux_symbol_t *security_symbols = kb_linux_security_symbols(&security_count);
-    index -= net_count;
-    if (index < security_count) {
-        return &security_symbols[index];
-    }
-
-    size_t sound_count = 0;
-    const kb_linux_symbol_t *sound_symbols = kb_linux_sound_symbols(&sound_count);
-    index -= security_count;
-    if (index < sound_count) {
-        return &sound_symbols[index];
-    }
-
-    size_t kvm_count = 0;
-    const kb_linux_symbol_t *kvm_symbols = kb_linux_kvm_symbols(&kvm_count);
-    index -= sound_count;
-    return index < kvm_count ? &kvm_symbols[index] : NULL;
+    return shim_symbol_table_at(index);
 }
 
 static uint8_t *module_shim_stub_by_name(kb_module_t *module, const char *name)
@@ -1410,12 +1451,9 @@ static uint8_t *module_shim_stub_by_name(kb_module_t *module, const char *name)
         return NULL;
     }
 
-    const size_t symbol_count = shim_symbol_count();
-    for (size_t i = 0; i < symbol_count; i++) {
-        const kb_linux_symbol_t *symbol = shim_symbol_at(i);
-        if (symbol != NULL && strcmp(symbol->name, name) == 0) {
-            return module->shim_symbol_stubs + (i * KB_LOCAL_SHIM_STUB_SIZE);
-        }
+    size_t index = 0;
+    if (shim_symbol_find_index(name, &index)) {
+        return module->shim_symbol_stubs + (index * KB_LOCAL_SHIM_STUB_SIZE);
     }
     return NULL;
 }
@@ -1639,14 +1677,7 @@ static int range_fits(size_t size, uint64_t offset, uint64_t length)
 
 static void *lookup_shim_symbol(const char *name)
 {
-    const size_t symbol_count = shim_symbol_count();
-    for (size_t i = 0; i < symbol_count; i++) {
-        const kb_linux_symbol_t *symbol = shim_symbol_at(i);
-        if (symbol != NULL && strcmp(symbol->name, name) == 0) {
-            return symbol->address;
-        }
-    }
-    return 0;
+    return shim_symbol_find_address(name);
 }
 
 static int module_prefers_kvm_symbols(const kb_module_t *module)
@@ -1909,6 +1940,11 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     if (strcmp(name, "phys_base") == 0) {
         return module->shim_region + KB_LOCAL_PHYS_BASE_OFFSET;
     }
+    if (strcmp(name, "dma_ops") == 0) {
+        void **storage = (void **)(void *)(module->shim_region + KB_LOCAL_DMA_OPS_PTR_OFFSET);
+        *storage = *(void **)kb_linux_dma_ops_symbol();
+        return storage;
+    }
     if (module_prefers_kvm_symbols(module)) {
         uint8_t *kvm_stub = module_kvm_provider_stub_by_name(module, name);
         if (kvm_stub != NULL) {
@@ -2020,8 +2056,14 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     if (strcmp(name, "__cpu_possible_mask") == 0) {
         return module->shim_cpu_possible_mask;
     }
+    if (strcmp(name, "cpu_possible_mask") == 0) {
+        return module->shim_cpu_possible_mask_ptr;
+    }
     if (strcmp(name, "__cpu_online_mask") == 0) {
         return module->shim_cpu_online_mask;
+    }
+    if (strcmp(name, "cpu_online_mask") == 0) {
+        return module->shim_cpu_online_mask_ptr;
     }
     if (strcmp(name, "nr_cpu_ids") == 0) {
         return module->shim_nr_cpu_ids;
@@ -2047,7 +2089,10 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     if (strcmp(name, "panic_notifier_list") == 0) {
         return module->shim_panic_notifier_list;
     }
-    if (strcmp(name, "pv_ops") == 0) {
+    if (strcmp(name, "pv_ops") == 0 ||
+        strcmp(name, "pv_irq_ops") == 0 ||
+        strcmp(name, "pv_lock_ops") == 0)
+    {
         return module->shim_pv_ops;
     }
     if (strcmp(name, "node_data") == 0) {
@@ -2065,7 +2110,6 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
         strcmp(name, "cpu_bit_bitmap") == 0 ||
         strcmp(name, "debug_locks_silent") == 0 ||
         strcmp(name, "devmap_managed_key") == 0 ||
-        strcmp(name, "dma_ops") == 0 ||
         strcmp(name, "dotdot_name") == 0 ||
         strcmp(name, "efi") == 0 ||
         strcmp(name, "hugetlb_optimize_vmemmap_key") == 0 ||
@@ -2174,6 +2218,11 @@ static kb_status_t resolve_symbol(
             return KB_ERR_UNSUPPORTED;
         }
         *out_address = (uint64_t)(uintptr_t)address;
+        return KB_OK;
+    }
+
+    if (symbol.section_index == KB_ELF_SHN_ABS) {
+        *out_address = symbol.value;
         return KB_OK;
     }
 
@@ -2328,13 +2377,15 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_param_ops_ulong = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3328;
     module->shim_cpu_possible_mask = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3392;
     module->shim_cpu_online_mask = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3408;
-    module->shim_nr_cpu_ids = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3424;
-    module->shim_percpu_counter_batch = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3432;
-    module->shim_const_pcpu_hot = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3436;
-    module->shim_this_cpu_off = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3440;
+    module->shim_cpu_possible_mask_ptr = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3424;
+    module->shim_cpu_online_mask_ptr = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3432;
+    module->shim_nr_cpu_ids = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3440;
+    module->shim_percpu_counter_batch = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3448;
+    module->shim_const_pcpu_hot = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3452;
+    module->shim_this_cpu_off = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3456;
     module->shim_per_cpu_offset = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3568;
-    module->shim_var_waitqueue = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3448;
-    module->shim_pernet_ops_rwsem = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3456;
+    module->shim_var_waitqueue = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3464;
+    module->shim_pernet_ops_rwsem = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3472;
     module->shim_panic_notifier_list = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3520;
     module->shim_pv_ops = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3840;
     module->shim_misc_data = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3584;
@@ -2345,19 +2396,22 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_current_task = module->shim_region + KB_LOCAL_CURRENT_TASK_OFFSET;
     write_u64le((uint8_t *)module->shim_cpu_possible_mask, 1);
     write_u64le((uint8_t *)module->shim_cpu_online_mask, 1);
+    write_u64le((uint8_t *)module->shim_cpu_possible_mask_ptr, (uint64_t)(uintptr_t)module->shim_cpu_possible_mask);
+    write_u64le((uint8_t *)module->shim_cpu_online_mask_ptr, (uint64_t)(uintptr_t)module->shim_cpu_online_mask);
     write_u32le((uint8_t *)module->shim_nr_cpu_ids, 1);
     write_u32le((uint8_t *)module->shim_percpu_counter_batch, 32);
     write_u32le((uint8_t *)module->shim_const_pcpu_hot, 0);
     write_u64le((uint8_t *)module->shim_this_cpu_off, 0);
     write_u64le((uint8_t *)module->shim_per_cpu_offset, (uint64_t)(uintptr_t)module->kernel_gs);
+    write_u64le(module->kernel_gs, (uint64_t)(uintptr_t)module->kernel_gs);
     write_u64le((uint8_t *)module->shim_pv_ops + 0x98, (uint64_t)(uintptr_t)&kb_return_zero);
     write_u32le(module->shim_region + KB_LOCAL_USB_DATA_OFFSET + KB_LOCAL_USB_NUM_ONLINE_CPUS_OFFSET, 1);
     write_u64le(
         module->shim_region + KB_LOCAL_PAGE_OFFSET_BASE_OFFSET,
-        (uint64_t)kb_linux_kvm_page_offset_base());
+        (uint64_t)kb_linux_kvm_exported_page_offset_base());
     write_u64le(
         module->shim_region + KB_LOCAL_VMEMMAP_BASE_OFFSET,
-        (uint64_t)kb_linux_kvm_vmemmap_base());
+        (uint64_t)kb_linux_kvm_exported_vmemmap_base());
     write_u64le(
         module->shim_region + KB_LOCAL_PHYS_BASE_OFFSET,
         (uint64_t)kb_linux_kvm_phys_base());
@@ -2887,6 +2941,18 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
             }
         }
         symbol_address = (uint64_t)(uintptr_t)address;
+        if (strcmp(symbol.name, "this_cpu_off") == 0 &&
+            (relocation->type == KB_ELF_R_X86_64_PC32 || relocation->type == KB_ELF_R_X86_64_PLT32))
+        {
+            symbol_address = 0;
+        }
+        if (strcmp(symbol.name, "softnet_data") == 0 &&
+            (relocation->type == KB_ELF_R_X86_64_PC32 || relocation->type == KB_ELF_R_X86_64_PLT32))
+        {
+            symbol_address = KB_LOCAL_GS_PCPU_HOT_OFFSET;
+        }
+    } else if (symbol.section_index == KB_ELF_SHN_ABS) {
+        symbol_address = symbol.value;
     } else {
         if (symbol_is_percpu_offset(module, &symbol)) {
             symbol_address = symbol.value;

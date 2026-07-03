@@ -43,6 +43,7 @@ add_library(kobox_runtime STATIC
     src/linux_subsystem/input/input.c
     src/linux_subsystem/input/input_symbols.c
     src/linux_subsystem/kvm/kvm_symbols.c
+    src/linux_subsystem/net/net_device.c
     src/linux_subsystem/net/net_symbols.c
     src/linux_subsystem/nvme/nvme.c
     src/linux_subsystem/pci/pci.c

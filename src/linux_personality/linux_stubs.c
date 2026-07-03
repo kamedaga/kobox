@@ -1,4 +1,5 @@
 #include "kobox/shim.h"
+#include "linux_subsystem/kvm/kvm_symbols.h"
 
 #include <stdarg.h>
 #include <ctype.h>
@@ -9,6 +10,11 @@
 #if !defined(__pachaos__)
 #include <time.h>
 #endif
+
+enum {
+    KB_STUB_PAGE_SIZE = 4096,
+    KB_STUB_STRUCT_PAGE_SIZE = 64,
+};
 
 typedef struct kb_ida_record {
     void *ida;
@@ -38,6 +44,38 @@ static kb_kthread_record_t *kthread_records;
 static kb_jbd2_journal_record_t *jbd2_journal_records;
 
 static int crypto_trace_enabled(void);
+
+static int trace_dma_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_DMA");
+    return value != NULL && value[0] != '\0' && value[0] != '0';
+}
+
+static void *page_payload_from_struct_page(void *page)
+{
+    if (page == NULL) {
+        return NULL;
+    }
+    uintptr_t vmemmap = kb_linux_kvm_vmemmap_base();
+    uintptr_t page_offset = kb_linux_kvm_page_offset_base();
+    uintptr_t page_addr = (uintptr_t)page;
+    if (vmemmap == 0 || page_offset == 0 || page_addr < vmemmap) {
+        return NULL;
+    }
+    uintptr_t index = (page_addr - vmemmap) / KB_STUB_STRUCT_PAGE_SIZE;
+    return (void *)(page_offset + index * KB_STUB_PAGE_SIZE);
+}
+
+static uint64_t page_phys_from_struct_page(void *page)
+{
+    uintptr_t vmemmap = kb_linux_kvm_vmemmap_base();
+    uintptr_t page_addr = (uintptr_t)page;
+    if (vmemmap == 0 || page_addr < vmemmap) {
+        return 0;
+    }
+    uint64_t index = (uint64_t)((page_addr - vmemmap) / KB_STUB_STRUCT_PAGE_SIZE);
+    return (uint64_t)kb_linux_kvm_phys_base() + (index * KB_STUB_PAGE_SIZE);
+}
 
 enum {
     KB_JBD2_JOURNAL_SUPERBLOCK_OFFSET = 0x3b0,
@@ -124,6 +162,23 @@ char *kb_d_path(void *path, char *buffer, int buffer_length)
     }
     buffer[0] = '\0';
     return buffer;
+}
+
+size_t kb_strlcpy(char *dst, const char *src, size_t size)
+{
+    if (src == NULL) {
+        if (dst != NULL && size > 0) {
+            dst[0] = '\0';
+        }
+        return 0;
+    }
+    size_t len = strlen(src);
+    if (dst != NULL && size > 0) {
+        size_t copy = len >= size ? size - 1u : len;
+        memcpy(dst, src, copy);
+        dst[copy] = '\0';
+    }
+    return len;
 }
 
 void *kb_kmemdup_nul(const void *src, size_t len, unsigned int flags)
@@ -390,6 +445,35 @@ int kb_list_del_entry_valid_or_report(void *entry)
 
 out:
     return result;
+}
+
+void kb_list_add(void *new_entry, void *prev, void *next)
+{
+    if (low_or_error_ptr(new_entry) || low_or_error_ptr(prev) || low_or_error_ptr(next)) {
+        return;
+    }
+    memcpy(new_entry, &next, sizeof(next));
+    memcpy((unsigned char *)new_entry + sizeof(void *), &prev, sizeof(prev));
+    memcpy(prev, &new_entry, sizeof(new_entry));
+    memcpy((unsigned char *)next + sizeof(void *), &new_entry, sizeof(new_entry));
+}
+
+void kb_list_del(void *entry)
+{
+    if (low_or_error_ptr(entry)) {
+        return;
+    }
+    void *next = NULL;
+    void *prev = NULL;
+    memcpy(&next, entry, sizeof(next));
+    memcpy(&prev, (const unsigned char *)entry + sizeof(void *), sizeof(prev));
+    if (low_or_error_ptr(next) || low_or_error_ptr(prev)) {
+        return;
+    }
+    memcpy(prev, &next, sizeof(next));
+    memcpy((unsigned char *)next + sizeof(void *), &prev, sizeof(prev));
+    memcpy(entry, &entry, sizeof(entry));
+    memcpy((unsigned char *)entry + sizeof(void *), &entry, sizeof(entry));
 }
 
 void *kb_kthread_create_on_node(int (*threadfn)(void *data), void *data, int node, const char *namefmt, ...)
@@ -721,6 +805,78 @@ void kb_ida_destroy(void *ida)
         }
         cursor = &record->next;
     }
+}
+
+int kb_ida_simple_get(void *ida, unsigned int start, unsigned int end, unsigned int flags)
+{
+    const unsigned int max = end == 0 ? UINT32_MAX : end - 1u;
+    if (end != 0 && end <= start) {
+        return -28;
+    }
+    return kb_ida_alloc_range(ida, start, max, flags);
+}
+
+void kb_ida_simple_remove(void *ida, unsigned int id)
+{
+    kb_ida_free(ida, id);
+}
+
+void *kb_alloc_pages_exact(size_t size, unsigned int flags)
+{
+    if (size == 0) {
+        size = 1;
+    }
+
+    size_t page_count = (size + KB_STUB_PAGE_SIZE - 1u) / KB_STUB_PAGE_SIZE;
+    unsigned int order = 0;
+    size_t order_pages = 1;
+    while (order_pages < page_count) {
+        order_pages <<= 1u;
+        order++;
+    }
+
+    void *page = kb_kvm_alloc_pages_stub(flags, order);
+    void *payload = page_payload_from_struct_page(page);
+    if (page == NULL || payload == NULL) {
+        return NULL;
+    }
+
+    uint64_t expected = page_phys_from_struct_page(page);
+    if (trace_dma_enabled()) {
+        fprintf(stderr,
+            "kobox dma: alloc_pages_exact size=0x%zx order=%u page=%p payload=%p phys=0x%llx\n",
+            size,
+            order,
+            page,
+            payload,
+            (unsigned long long)expected);
+    }
+    return payload;
+}
+
+void kb_free_pages_exact(void *virt, size_t size)
+{
+    (void)size;
+    kb_kfree(virt);
+}
+
+int kb_alloc_cpumask_var(void *mask_out, unsigned int flags)
+{
+    if (mask_out == NULL) {
+        return 0;
+    }
+    unsigned long *mask = kb_kzalloc(sizeof(*mask), flags);
+    if (mask == NULL) {
+        return 0;
+    }
+    *mask = 1;
+    memcpy(mask_out, &mask, sizeof(mask));
+    return 1;
+}
+
+void kb_free_cpumask_var(void *mask)
+{
+    kb_kfree(mask);
 }
 
 void *kb_alloc_stub(void)

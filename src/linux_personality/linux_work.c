@@ -1185,6 +1185,12 @@ void kb_msleep(unsigned int msecs)
     sleep_ns((uint64_t)msecs * KB_NSEC_PER_MSEC);
 }
 
+unsigned long kb_msleep_interruptible(unsigned int msecs)
+{
+    kb_msleep(msecs);
+    return 0;
+}
+
 void kb_usleep_range_state(unsigned long min, unsigned long max, unsigned int state)
 {
     (void)max;

@@ -1,6 +1,7 @@
 #include "linux_subsystem/kvm/kvm_symbols.h"
 
 #include "kobox/shim.h"
+#include "linux_subsystem/dma/dma.h"
 #include "linux_subsystem/kvm/kvm.h"
 
 #include <stdint.h>
@@ -56,7 +57,7 @@ enum {
     KB_KVM_PAGE_SHIFT = 12,
     KB_KVM_PAGE_SIZE = 1u << KB_KVM_PAGE_SHIFT,
     KB_KVM_STRUCT_PAGE_SIZE = 64,
-    KB_KVM_PAGE_RECORD_MAX = 256,
+    KB_KVM_PAGE_RECORD_MAX = 4096,
 };
 
 static const unsigned int KB_KVM_GET_REGS_IOCTL = 0x8090ae81u;
@@ -153,6 +154,8 @@ static size_t kb_kvm_host_vcpu_mmap_size;
 static unsigned char kb_kvm_page_payloads[KB_KVM_PAGE_RECORD_MAX * KB_KVM_PAGE_SIZE] __attribute__((aligned(KB_KVM_PAGE_SIZE)));
 static unsigned char kb_kvm_page_records[KB_KVM_PAGE_RECORD_MAX * KB_KVM_STRUCT_PAGE_SIZE] __attribute__((aligned(KB_KVM_STRUCT_PAGE_SIZE)));
 static size_t kb_kvm_next_page_record;
+static kb_device_backend_t *kb_kvm_dma_arena_backend;
+static int kb_kvm_dma_arena_mapped;
 
 uint64_t kb_kvm_empty_zero_page[512];
 uint8_t kb_kvm_boot_cpu_data[1024] = {
@@ -180,6 +183,8 @@ uint64_t kb_kvm_page_offset_base;
 uint64_t kb_kvm_phys_base;
 uint64_t kb_kvm_physical_mask = UINT64_MAX;
 uint64_t kb_kvm_vmemmap_base;
+static uint64_t kb_kvm_page_payload_base;
+static uint64_t kb_kvm_vmemmap_record_base;
 uint64_t kb_kvm_pgdir_shift = 39;
 uint64_t kb_kvm_ptrs_per_p4d = 512;
 uint64_t kb_kvm_tsc_khz = 1000000;
@@ -327,18 +332,35 @@ static int init_host_vcpu_record(kb_kvm_fd_record_t *record, const char *name, v
 
 static void kb_kvm_sync_page_model(void)
 {
-    kb_kvm_page_offset_base = (uint64_t)(uintptr_t)kb_kvm_page_payloads;
-    kb_kvm_vmemmap_base = (uint64_t)(uintptr_t)kb_kvm_page_records;
-    kb_kvm_phys_base = 0;
+    kb_kvm_page_payload_base = (uint64_t)(uintptr_t)kb_kvm_page_payloads;
+    kb_kvm_page_offset_base =
+        kb_kvm_phys_base <= kb_kvm_page_payload_base ? kb_kvm_page_payload_base - kb_kvm_phys_base : kb_kvm_page_payload_base;
+    kb_kvm_vmemmap_record_base = (uint64_t)(uintptr_t)kb_kvm_page_records;
+    uint64_t phys_pfn = kb_kvm_phys_base >> KB_KVM_PAGE_SHIFT;
+    uint64_t adjust = phys_pfn * KB_KVM_STRUCT_PAGE_SIZE;
+    kb_kvm_vmemmap_base =
+        adjust <= kb_kvm_vmemmap_record_base ? kb_kvm_vmemmap_record_base - adjust : kb_kvm_vmemmap_record_base;
 }
 
 uintptr_t kb_linux_kvm_page_offset_base(void)
+{
+    kb_kvm_sync_page_model();
+    return (uintptr_t)kb_kvm_page_payload_base;
+}
+
+uintptr_t kb_linux_kvm_exported_page_offset_base(void)
 {
     kb_kvm_sync_page_model();
     return (uintptr_t)kb_kvm_page_offset_base;
 }
 
 uintptr_t kb_linux_kvm_vmemmap_base(void)
+{
+    kb_kvm_sync_page_model();
+    return (uintptr_t)kb_kvm_vmemmap_record_base;
+}
+
+uintptr_t kb_linux_kvm_exported_vmemmap_base(void)
 {
     kb_kvm_sync_page_model();
     return (uintptr_t)kb_kvm_vmemmap_base;
@@ -956,6 +978,51 @@ void *kb_kvm_alloc_stub(void)
     return kb_kzalloc(4096, 0);
 }
 
+static kb_status_t kb_kvm_ensure_dma_arena_mapped(kb_device_backend_t *backend)
+{
+    if (backend == NULL) {
+        return KB_OK;
+    }
+    if (kb_kvm_dma_arena_mapped && kb_kvm_dma_arena_backend == backend) {
+        return KB_OK;
+    }
+    if (kb_kvm_dma_arena_mapped) {
+        return KB_OK;
+    }
+
+    kb_status_t dma_status = KB_OK;
+    uint64_t dma_addr = kb_subsystem_dma_map(
+        backend,
+        NULL,
+        kb_kvm_page_payloads,
+        sizeof(kb_kvm_page_payloads),
+        KB_DMA_BIDIRECTIONAL,
+        &dma_status);
+    if (dma_status == KB_ERR_UNSUPPORTED) {
+        return KB_OK;
+    }
+    if (dma_status != KB_OK) {
+        return dma_status;
+    }
+    kb_kvm_phys_base = dma_addr;
+    kb_kvm_dma_arena_backend = backend;
+    kb_kvm_dma_arena_mapped = 1;
+    if (trace_kvm_enabled()) {
+        fprintf(stderr,
+            "kobox-kvm: dma arena mapped cpu=%p size=%zu dma=0x%llx\n",
+            (void *)kb_kvm_page_payloads,
+            sizeof(kb_kvm_page_payloads),
+            (unsigned long long)kb_kvm_phys_base);
+    }
+    return KB_OK;
+}
+
+int kb_kvm_prepare_dma_arena(kb_device_backend_t *backend)
+{
+    kb_status_t status = kb_kvm_ensure_dma_arena_mapped(backend);
+    return status == KB_OK ? 0 : -(int)status;
+}
+
 void *kb_kvm_alloc_pages_stub(unsigned int flags, unsigned int order)
 {
     (void)flags;
@@ -966,6 +1033,12 @@ void *kb_kvm_alloc_pages_stub(unsigned int flags, unsigned int order)
     if (page_count == 0 || page_count > KB_KVM_PAGE_RECORD_MAX - kb_kvm_next_page_record) {
         return NULL;
     }
+    kb_device_backend_t *backend = kb_shim_current_device_backend();
+    kb_status_t dma_status = kb_kvm_ensure_dma_arena_mapped(backend);
+    if (dma_status != KB_OK) {
+        return NULL;
+    }
+
     size_t index = kb_kvm_next_page_record;
     kb_kvm_next_page_record += page_count;
     memset(kb_kvm_page_records + (index * KB_KVM_STRUCT_PAGE_SIZE), 0, page_count * KB_KVM_STRUCT_PAGE_SIZE);

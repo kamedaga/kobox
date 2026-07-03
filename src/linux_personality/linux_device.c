@@ -1,4 +1,5 @@
 #include "kobox/shim.h"
+#include "linux_subsystem/net/net_device.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -13,12 +14,16 @@ enum {
     KB_LINUX_6_8_DEVICE_BUS_OFFSET = 0x60,
     KB_LINUX_6_8_DEVICE_DRIVER_OFFSET = 0x68,
     KB_LINUX_6_8_DEVICE_DRIVER_DATA_OFFSET = 0x78,
+    KB_LINUX_3_10_DEVICE_BUS_OFFSET = 0x88,
+    KB_LINUX_3_10_DEVICE_DRIVER_OFFSET = 0x90,
     KB_LINUX_6_8_DEVICE_DRIVER_NAME_OFFSET = 0x00,
     KB_LINUX_6_8_DEVICE_DRIVER_BUS_OFFSET = 0x08,
     KB_LINUX_6_8_DEVICE_DRIVER_PROBE_OFFSET = 0x38,
     KB_LINUX_6_8_BUS_NAME_OFFSET = 0x00,
     KB_LINUX_6_8_BUS_MATCH_OFFSET = 0x28,
     KB_LINUX_6_8_BUS_PROBE_OFFSET = 0x38,
+    KB_LINUX_3_10_BUS_MATCH_OFFSET = 0x48,
+    KB_LINUX_3_10_BUS_PROBE_OFFSET = 0x58,
     KB_DRIVER_CORE_RECORD_MAX = 256,
     KB_SYSFS_DIRENT_MAX = 256,
 };
@@ -114,6 +119,48 @@ static const char *bus_name(void *bus)
     return read_string_ptr(bus, KB_LINUX_6_8_BUS_NAME_OFFSET);
 }
 
+static void *device_bus_ptr(void *dev)
+{
+    void *bus = read_ptr(dev, KB_LINUX_6_8_DEVICE_BUS_OFFSET);
+    if (bus == NULL) {
+        bus = read_ptr(dev, KB_LINUX_3_10_DEVICE_BUS_OFFSET);
+    }
+    return bus;
+}
+
+static void *device_driver_ptr(void *dev)
+{
+    void *driver = read_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET);
+    if (driver == NULL) {
+        driver = read_ptr(dev, KB_LINUX_3_10_DEVICE_DRIVER_OFFSET);
+    }
+    return driver;
+}
+
+static void set_device_driver_ptr(void *dev, void *driver)
+{
+    write_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET, driver);
+    write_ptr(dev, KB_LINUX_3_10_DEVICE_DRIVER_OFFSET, driver);
+}
+
+static int (*bus_match_ptr(void *bus))(void *, void *)
+{
+    int (*match)(void *, void *) = (int (*)(void *, void *))read_ptr(bus, KB_LINUX_6_8_BUS_MATCH_OFFSET);
+    if (match == NULL) {
+        match = (int (*)(void *, void *))read_ptr(bus, KB_LINUX_3_10_BUS_MATCH_OFFSET);
+    }
+    return match;
+}
+
+static int (*bus_probe_ptr(void *bus))(void *)
+{
+    int (*probe)(void *) = (int (*)(void *))read_ptr(bus, KB_LINUX_6_8_BUS_PROBE_OFFSET);
+    if (probe == NULL) {
+        probe = (int (*)(void *))read_ptr(bus, KB_LINUX_3_10_BUS_PROBE_OFFSET);
+    }
+    return probe;
+}
+
 static int enter_function_gs(const void *function, unsigned long *old_gs)
 {
     unsigned long kernel_gs = kb_module_kernel_gs_for_address(function);
@@ -169,7 +216,7 @@ static kb_device_record_t *record_device(void *dev)
     if (dev == NULL) {
         return NULL;
     }
-    void *bus = read_ptr(dev, KB_LINUX_6_8_DEVICE_BUS_OFFSET);
+    void *bus = device_bus_ptr(dev);
     for (size_t i = 0; i < KB_DRIVER_CORE_RECORD_MAX; i++) {
         if (device_records[i].active && device_records[i].dev == dev) {
             device_records[i].bus = bus;
@@ -212,7 +259,7 @@ static kb_driver_record_t *record_driver(void *driver)
 
 static int device_matches_driver(void *dev, void *driver)
 {
-    void *dev_bus = read_ptr(dev, KB_LINUX_6_8_DEVICE_BUS_OFFSET);
+    void *dev_bus = device_bus_ptr(dev);
     void *driver_bus = read_ptr(driver, KB_LINUX_6_8_DEVICE_DRIVER_BUS_OFFSET);
     if (dev_bus == NULL || dev_bus != driver_bus) {
         if (trace_device_enabled()) {
@@ -231,7 +278,7 @@ static int device_matches_driver(void *dev, void *driver)
         return 0;
     }
 
-    int (*match)(void *, void *) = (int (*)(void *, void *))read_ptr(dev_bus, KB_LINUX_6_8_BUS_MATCH_OFFSET);
+    int (*match)(void *, void *) = bus_match_ptr(dev_bus);
     if (match == NULL) {
         if (trace_device_enabled()) {
             fprintf(stderr,
@@ -265,14 +312,14 @@ static int probe_device_with_driver(void *dev, void *driver)
     if (!device_matches_driver(dev, driver)) {
         return 0;
     }
-    if (read_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET) != NULL) {
+    if (device_driver_ptr(dev) != NULL) {
         return 0;
     }
 
-    void *bus = read_ptr(dev, KB_LINUX_6_8_DEVICE_BUS_OFFSET);
-    int (*probe)(void *) = (int (*)(void *))read_ptr(bus, KB_LINUX_6_8_BUS_PROBE_OFFSET);
+    void *bus = device_bus_ptr(dev);
+    int (*probe)(void *) = bus_probe_ptr(bus);
     int (*driver_probe)(void *) = (int (*)(void *))read_ptr(driver, KB_LINUX_6_8_DEVICE_DRIVER_PROBE_OFFSET);
-    write_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET, driver);
+    set_device_driver_ptr(dev, driver);
     int result = probe != NULL ?
         call_module_int_ptr(probe, dev) :
         (driver_probe != NULL ? call_module_int_ptr(driver_probe, dev) : 0);
@@ -286,9 +333,10 @@ static int probe_device_with_driver(void *dev, void *driver)
             result);
     }
     if (result != 0) {
-        write_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET, NULL);
+        set_device_driver_ptr(dev, NULL);
     } else {
         kb_usb_observe_linux_device(dev);
+        kb_net_device_run_pending_smokes();
     }
     return result;
 }
@@ -347,7 +395,7 @@ int kb_device_add(void *dev)
         return -12;
     }
     if (trace_device_enabled()) {
-        void *bus = read_ptr(dev, KB_LINUX_6_8_DEVICE_BUS_OFFSET);
+        void *bus = device_bus_ptr(dev);
         fprintf(stderr,
             "kobox device: add dev=%p name=%s parent=%p type=%p bus=%p/%s driver=%p\n",
             dev,
@@ -356,7 +404,7 @@ int kb_device_add(void *dev)
             read_ptr(dev, KB_LINUX_6_8_DEVICE_TYPE_OFFSET),
             bus,
             trace_name_or_null(bus_name(bus)),
-            read_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_OFFSET));
+            device_driver_ptr(dev));
     }
     if (trace_device_enabled()) {
         fprintf(stderr, "kobox device: observe begin dev=%p\n", dev);

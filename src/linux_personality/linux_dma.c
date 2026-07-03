@@ -1,9 +1,15 @@
 #include "kobox/shim.h"
 #include "linux_subsystem/dma/dma.h"
+#include "linux_subsystem/kvm/kvm_symbols.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+
+enum {
+    KB_LINUX_DMA_PAGE_SIZE = 4096,
+    KB_LINUX_DMA_STRUCT_PAGE_SIZE = 64,
+};
 
 kb_device_backend_t *kb_shim_current_device_backend(void);
 
@@ -37,6 +43,28 @@ static int linux_page_to_cpu_addr(void *page, unsigned long offset, void **out_a
     if (page == NULL || out_addr == NULL) {
         return 0;
     }
+    if (offset > 0xffful) {
+        return 0;
+    }
+
+    uintptr_t vmemmap = kb_linux_kvm_vmemmap_base();
+    uintptr_t page_offset_base = kb_linux_kvm_page_offset_base();
+    uintptr_t phys_base = kb_linux_kvm_phys_base();
+    uintptr_t page_addr = (uintptr_t)page;
+    if (vmemmap != 0 && page_addr >= vmemmap) {
+        uint64_t page_index = (uint64_t)((page_addr - vmemmap) / KB_LINUX_DMA_STRUCT_PAGE_SIZE);
+        uint64_t dma_addr = (uint64_t)phys_base + (page_index * KB_LINUX_DMA_PAGE_SIZE) + (uint64_t)offset;
+        size_t available = 0;
+        void *mapped = kb_subsystem_dma_cpu_addr(dma_addr, &available);
+        if (mapped != NULL && available != 0) {
+            *out_addr = mapped;
+            return 1;
+        }
+        if (page_offset_base != 0) {
+            *out_addr = (void *)(page_offset_base + (uintptr_t)(page_index * KB_LINUX_DMA_PAGE_SIZE) + offset);
+            return 1;
+        }
+    }
 
     /*
      * The 6.8 modules inline virt_to_page(). With the loader's zero-valued
@@ -47,9 +75,6 @@ static int linux_page_to_cpu_addr(void *page, unsigned long offset, void **out_a
      */
     const uintptr_t encoded = (uintptr_t)page;
     if ((encoded & 0x3fu) != 0) {
-        return 0;
-    }
-    if (offset > 0xffful) {
         return 0;
     }
     const uint64_t page_base = ((uint64_t)encoded >> 6) << 12;
@@ -193,6 +218,28 @@ size_t kb_dma_max_mapping_size(void *dev)
 {
     (void)dev;
     return (size_t)1 << 30;
+}
+
+int kb_arch_dma_alloc_attrs(void *dev_ptr, void *gfp_ptr)
+{
+    (void)dev_ptr;
+    (void)gfp_ptr;
+    return 1;
+}
+
+static uintptr_t kb_linux_dma_map_ops[13] = {
+    [0] = (uintptr_t)&kb_dma_alloc_attrs,
+    [1] = (uintptr_t)&kb_dma_free_attrs,
+    [4] = (uintptr_t)&kb_dma_map_page_attrs,
+    [5] = (uintptr_t)&kb_dma_unmap_page_attrs,
+    [12] = (uintptr_t)&kb_dma_mapping_error,
+};
+
+static void *kb_linux_dma_ops = kb_linux_dma_map_ops;
+
+void *kb_linux_dma_ops_symbol(void)
+{
+    return &kb_linux_dma_ops;
 }
 
 void *dma_alloc_attrs(void *dev, size_t size, uint64_t *dma_handle, unsigned int flags, unsigned long attrs)

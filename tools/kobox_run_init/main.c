@@ -11,6 +11,7 @@
 #include "linux_subsystem/ata/ata.h"
 #include "linux_subsystem/fs/fs.h"
 #include "linux_subsystem/input/input.h"
+#include "linux_subsystem/net/net_device.h"
 #include "linux_subsystem/usb/storage.h"
 #include "linux_subsystem/usb/usb.h"
 #include "loader/module_context.h"
@@ -52,6 +53,14 @@ static void signal_diagnostics_handler(int signal_number, siginfo_t *info, void 
     void *rsi = (void *)context->uc_mcontext.gregs[REG_RSI];
     void *rdx = (void *)context->uc_mcontext.gregs[REG_RDX];
     void *rcx = (void *)context->uc_mcontext.gregs[REG_RCX];
+    void *r8 = (void *)context->uc_mcontext.gregs[REG_R8];
+    void *r9 = (void *)context->uc_mcontext.gregs[REG_R9];
+    void *r10 = (void *)context->uc_mcontext.gregs[REG_R10];
+    void *r11 = (void *)context->uc_mcontext.gregs[REG_R11];
+    void *r12 = (void *)context->uc_mcontext.gregs[REG_R12];
+    void *r13 = (void *)context->uc_mcontext.gregs[REG_R13];
+    void *r14 = (void *)context->uc_mcontext.gregs[REG_R14];
+    void *r15 = (void *)context->uc_mcontext.gregs[REG_R15];
     const uint8_t *insn = (const uint8_t *)rip;
     fprintf(stderr,
         "kobox-run: signal=%d rip=%p rsp=%p fault=%p external_target=%p caller_gs=0x%lx callee_gs=0x%lx rdi=%p rsi=%p rdx=%p rcx=%p\n",
@@ -66,6 +75,20 @@ static void signal_diagnostics_handler(int signal_number, siginfo_t *info, void 
         rsi,
         rdx,
         rcx);
+    fprintf(stderr,
+        "kobox-run: regs r8=%p r9=%p r10=%p r11=%p r12=%p r13=%p r14=%p r15=%p\n",
+        r8,
+        r9,
+        r10,
+        r11,
+        r12,
+        r13,
+        r14,
+        r15);
+    kb_module_debug_describe_address(rip);
+    if (kb_module_current_external_call_target() != NULL) {
+        kb_module_debug_describe_address(kb_module_current_external_call_target());
+    }
     if (insn != NULL && insn[0] == 0xff && insn[1] == 0x15) {
         int32_t displacement = 0;
         uintptr_t slot = 0;
@@ -626,8 +649,8 @@ int main(int argc, char **argv)
     unsigned long drain_ms = 0;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-') {
-        if (strncmp(argv[argi], "--device=", 10) == 0) {
-            device_backend_name = argv[argi] + 10;
+        if (strncmp(argv[argi], "--device=", 9) == 0) {
+            device_backend_name = argv[argi] + 9;
             argi++;
             continue;
         }
@@ -804,6 +827,9 @@ int main(int argc, char **argv)
         return 0;
     }
     kb_usb_set_event_injection_runtime_allowed(1);
+    kb_shim_set_device_backend(backend);
+    kb_net_device_run_pending_smokes();
+    kb_shim_set_device_backend(NULL);
     if (getenv("KOBOX_NVME_IO_SMOKE") != NULL) {
         kb_shim_set_device_backend(backend);
         int io_result = kb_nvme_io_smoke();

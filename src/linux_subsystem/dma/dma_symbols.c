@@ -5,6 +5,7 @@
 
 static const kb_linux_symbol_t dma_symbols[] = {
     {"dma_alloc_attrs", (void *)(uintptr_t)&kb_dma_alloc_attrs},
+    {"arch_dma_alloc_attrs", (void *)(uintptr_t)&kb_arch_dma_alloc_attrs},
     {"dma_free_attrs", (void *)(uintptr_t)&kb_dma_free_attrs},
     {"dma_map_page_attrs", (void *)(uintptr_t)&kb_dma_map_page_attrs},
     {"dma_map_resource", (void *)(uintptr_t)&kb_return_zero},
@@ -24,6 +25,7 @@ static const kb_linux_symbol_t dma_symbols[] = {
     {"dma_resv_reserve_fences", (void *)(uintptr_t)&kb_return_zero},
     {"dma_set_coherent_mask", (void *)(uintptr_t)&kb_dma_set_coherent_mask},
     {"dma_set_mask", (void *)(uintptr_t)&kb_dma_set_mask},
+    {"dma_supported", (void *)(uintptr_t)&kb_return_one},
     {"dma_unmap_page_attrs", (void *)(uintptr_t)&kb_dma_unmap_page_attrs},
     {"dma_unmap_single_attrs", (void *)(uintptr_t)&kb_dma_unmap_single_attrs},
     {"dma_mmap_attrs", (void *)(uintptr_t)&kb_return_zero},

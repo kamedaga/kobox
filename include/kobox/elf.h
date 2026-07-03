@@ -30,6 +30,7 @@ enum {
     KB_ELF_SHF_EXECINSTR = 4,
 
     KB_ELF_SHN_UNDEF = 0,
+    KB_ELF_SHN_ABS = 0xfff1,
 
     KB_ELF_STB_LOCAL = 0,
     KB_ELF_STB_GLOBAL = 1,
