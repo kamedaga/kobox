@@ -21,6 +21,8 @@ enum {
     KB_INPUT_SG_END = 0x2,
 };
 
+static const uintptr_t KB_INPUT_ENCODED_PAGE_TAG = (uintptr_t)1ull << 63;
+
 static void write_ptr_at(void *base, size_t offset, const void *ptr)
 {
     memcpy((unsigned char *)base + offset, &ptr, sizeof(ptr));
@@ -29,16 +31,6 @@ static void write_ptr_at(void *base, size_t offset, const void *ptr)
 static void write_u32_at(void *base, size_t offset, uint32_t value)
 {
     memcpy((unsigned char *)base + offset, &value, sizeof(value));
-}
-
-static void *page_for_dma_addr(uint64_t dma_addr)
-{
-    uintptr_t phys_base = kb_linux_kvm_phys_base();
-    if (dma_addr < phys_base) {
-        return NULL;
-    }
-    uint64_t offset = dma_addr - (uint64_t)phys_base;
-    return (void *)(kb_linux_kvm_vmemmap_base() + ((offset >> KB_INPUT_PAGE_SHIFT) * KB_INPUT_STRUCT_PAGE_SIZE));
 }
 
 static int page_for_buffer(const void *buf, unsigned int buflen, void **out_page, uint32_t *out_offset)
@@ -55,6 +47,20 @@ static int page_for_buffer(const void *buf, unsigned int buflen, void **out_page
     }
     *out_page = (void *)(kb_linux_kvm_vmemmap_base() + ((offset >> KB_INPUT_PAGE_SHIFT) * KB_INPUT_STRUCT_PAGE_SIZE));
     *out_offset = (uint32_t)(offset & KB_INPUT_PAGE_MASK);
+    return 1;
+}
+
+static int encoded_page_for_buffer(const void *buf, unsigned int buflen, void **out_page, uint32_t *out_offset)
+{
+    if (buf == NULL || buflen == 0 || out_page == NULL || out_offset == NULL) {
+        return 0;
+    }
+    uintptr_t addr = (uintptr_t)buf;
+    uint32_t offset = (uint32_t)(addr & KB_INPUT_PAGE_MASK);
+    uintptr_t page_base = addr & ~(uintptr_t)KB_INPUT_PAGE_MASK;
+    *out_page = (void *)(KB_INPUT_ENCODED_PAGE_TAG |
+                         (((uint64_t)page_base >> KB_INPUT_PAGE_SHIFT) * KB_INPUT_STRUCT_PAGE_SIZE));
+    *out_offset = offset;
     return 1;
 }
 
@@ -92,14 +98,9 @@ void kb_sg_init_one(void *sg, const void *buf, unsigned int buflen)
     void *page = NULL;
     uint32_t offset = 0;
     if (!page_for_buffer(buf, buflen, &page, &offset)) {
-        uint64_t dma_addr = 0;
-        void *bounce = kb_dma_alloc_attrs(NULL, buflen, &dma_addr, 0, 0);
-        if (bounce == NULL) {
+        if (!encoded_page_for_buffer(buf, buflen, &page, &offset)) {
             return;
         }
-        memcpy(bounce, buf, buflen);
-        page = page_for_dma_addr(dma_addr);
-        offset = (uint32_t)(dma_addr & KB_INPUT_PAGE_MASK);
     }
     uintptr_t page_link = ((uintptr_t)page) | KB_INPUT_SG_END;
     write_ptr_at(sg, KB_INPUT_SG_PAGE_LINK_OFFSET, (void *)page_link);

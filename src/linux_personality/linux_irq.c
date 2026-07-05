@@ -9,12 +9,8 @@ kb_device_backend_t *kb_shim_current_device_backend(void);
 
 static int trace_irq_enabled(void)
 {
-#if defined(__pachaos__)
-    return 0;
-#else
     const char *value = getenv("KOBOX_TRACE_IRQ");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
-#endif
 }
 
 typedef struct shim_irq {
@@ -22,6 +18,7 @@ typedef struct shim_irq {
     void *dev_id;
     int (*handler)(int, void *);
     int (*thread_fn)(int, void *);
+    kb_device_backend_t *backend;
     kb_device_t *device;
     kb_device_irq_t *backend_irq;
     unsigned long kernel_gs;
@@ -109,6 +106,8 @@ static void irq_trampoline(void *ctx)
 {
     shim_irq_t *irq = ctx;
     unsigned long old_gs = 0;
+    kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+    kb_shim_set_device_backend(irq->backend);
     unsigned long handler_gs = irq->handler == NULL ? 0 : kb_module_kernel_gs_for_address((const void *)irq->handler);
     unsigned long thread_gs = irq->thread_fn == NULL ? 0 : kb_module_kernel_gs_for_address((const void *)irq->thread_fn);
     unsigned long kernel_gs = handler_gs != 0 ? handler_gs : thread_gs;
@@ -130,6 +129,7 @@ static void irq_trampoline(void *ctx)
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
+    kb_shim_set_device_backend(old_backend);
 }
 
 static void poll_root_hub_for_irq(const shim_irq_t *irq)
@@ -137,12 +137,15 @@ static void poll_root_hub_for_irq(const shim_irq_t *irq)
     if (!kb_usb_root_hub_poll_needed()) {
         return;
     }
+    kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+    kb_shim_set_device_backend(irq->backend);
     unsigned long old_gs = 0;
     int has_gs = irq->kernel_gs != 0 && kb_shim_enter_kernel_gs(irq->kernel_gs, &old_gs) == 0;
     (void)kb_usb_poll_root_hub(irq->dev_id);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
+    kb_shim_set_device_backend(old_backend);
 }
 
 int kb_request_threaded_irq(
@@ -174,6 +177,7 @@ int kb_request_threaded_irq(
     entry->dev_id = dev_id;
     entry->handler = handler;
     entry->thread_fn = thread_fn;
+    entry->backend = backend;
     entry->device = device;
     entry->kernel_gs = kb_shim_current_kernel_gs();
 
@@ -184,6 +188,14 @@ int kb_request_threaded_irq(
     }
     unsigned int backend_vector = kb_irq_backend_vector(irq);
     if (trace_irq_enabled()) {
+        fprintf(
+            stderr,
+            "kobox irq: request begin irq=%u backend_vector=0x%x handler=%p thread=%p dev_id=%p\n",
+            irq,
+            backend_vector,
+            (void *)handler,
+            (void *)thread_fn,
+            dev_id);
         void *device_backend = device == NULL ? NULL : *(void **)device;
         fprintf(
             stderr,
@@ -211,6 +223,15 @@ int kb_request_threaded_irq(
         kb_kfree(entry);
         return -5;
     }
+    if (trace_irq_enabled()) {
+        fprintf(
+            stderr,
+            "kobox irq: request ready irq=%u backend_vector=0x%x dev_id=%p backend_irq=%p\n",
+            irq,
+            backend_vector,
+            dev_id,
+            (void *)entry->backend_irq);
+    }
 
     entry->next = irq_list;
     irq_list = entry;
@@ -219,6 +240,16 @@ int kb_request_threaded_irq(
         fprintf(stderr, "kobox irq: request irq=%u dev_id=%p\n", irq, dev_id);
     }
     return 0;
+}
+
+int kb_request_irq(
+    unsigned int irq,
+    int (*handler)(int, void *),
+    unsigned long flags,
+    const char *name,
+    void *dev_id)
+{
+    return kb_request_threaded_irq(irq, handler, NULL, flags, name, dev_id);
 }
 
 int kb_devm_request_threaded_irq(
@@ -244,7 +275,7 @@ void kb_free_irq(unsigned int irq, void *dev_id)
             if (trace_irq_enabled()) {
                 fprintf(stderr, "kobox irq: free irq=%u dev_id=%p\n", irq, dev_id);
             }
-            const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(kb_shim_current_device_backend());
+            const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(entry->backend);
             if (ops != NULL && ops->irq_unregister != NULL) {
                 ops->irq_unregister(entry->device, entry->backend_irq);
             }
@@ -253,6 +284,14 @@ void kb_free_irq(unsigned int irq, void *dev_id)
         }
         cursor = &entry->next;
     }
+}
+
+int kb_irq_apply_affinity_hint(unsigned int irq, const void *mask, bool setaffinity)
+{
+    (void)irq;
+    (void)mask;
+    (void)setaffinity;
+    return 0;
 }
 
 void kb_free_all_irqs(void)
@@ -278,7 +317,7 @@ int kb_wait_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
             continue;
         }
 
-        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(kb_shim_current_device_backend());
+        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(entry->backend);
         if (ops == NULL || ops->irq_wait == NULL) {
             return -95;
         }
@@ -320,7 +359,7 @@ int kb_wait_irq_signal_for_dev_id(void *dev_id, uint64_t timeout_ns)
             continue;
         }
 
-        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(kb_shim_current_device_backend());
+        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(entry->backend);
         if (ops == NULL || ops->irq_wait == NULL) {
             return -95;
         }
@@ -347,7 +386,7 @@ int kb_handle_irq_for_dev_id(void *dev_id, uint64_t timeout_ns)
             continue;
         }
 
-        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(kb_shim_current_device_backend());
+        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(entry->backend);
         if (ops == NULL || ops->irq_wait == NULL) {
             return -95;
         }
@@ -400,13 +439,15 @@ int kb_trigger_irq_for_dev_id(void *dev_id)
 
 static int handle_any_irq(uint64_t timeout_ns, int run_work)
 {
-    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(kb_shim_current_device_backend());
-    if (ops == NULL || ops->irq_wait == NULL) {
-        return -95;
-    }
     int handled = 0;
     int saw_xhci_pending = 0;
+    unsigned trace_index = 0;
     for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
+        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(entry->backend);
+        if (ops == NULL || ops->irq_wait == NULL) {
+            trace_index++;
+            continue;
+        }
         int (*handler)(int, void *) = entry->handler;
         int (*thread_fn)(int, void *) = entry->thread_fn;
         entry->handler = NULL;
@@ -416,6 +457,16 @@ static int handle_any_irq(uint64_t timeout_ns, int run_work)
         int usb_hcd_irq = irq_entry_is_usb_hcd(entry);
         entry->handler = handler;
         entry->thread_fn = thread_fn;
+        if (trace_irq_enabled()) {
+            fprintf(
+                stderr,
+                "kobox irq: handle-any entry=%u irq=%u dev_id=%p status=%d timeout_ns=%llu\n",
+                trace_index,
+                entry->irq,
+                entry->dev_id,
+                status,
+                (unsigned long long)(handled ? 0 : timeout_ns));
+        }
         if (status == KB_OK) {
             irq_trampoline(entry);
             handled = 1;
@@ -428,9 +479,7 @@ static int handle_any_irq(uint64_t timeout_ns, int run_work)
             saw_xhci_pending = 1;
             handled = 1;
         }
-        if (trace_irq_enabled()) {
-            fprintf(stderr, "kobox irq: handle-any irq=%u dev_id=%p status=%d\n", entry->irq, entry->dev_id, status);
-        }
+        trace_index++;
     }
     if (saw_xhci_pending) {
         (void)kb_usb_synthesize_connected_storage();
@@ -472,6 +521,16 @@ int request_threaded_irq(
     void *dev_id)
 {
     return kb_request_threaded_irq(irq, handler, thread_fn, flags, name, dev_id);
+}
+
+int request_irq(
+    unsigned int irq,
+    int (*handler)(int, void *),
+    unsigned long flags,
+    const char *name,
+    void *dev_id)
+{
+    return kb_request_irq(irq, handler, flags, name, dev_id);
 }
 
 void free_irq(unsigned int irq, void *dev_id)

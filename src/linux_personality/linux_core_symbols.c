@@ -9,6 +9,24 @@ static unsigned long kb_identity_ulong(unsigned long value)
     return value;
 }
 
+static int kb_xen_domain_type;
+
+static void *kb_serdev_tty_port_register(void *port, void *host, void *parent, void *driver, unsigned int index)
+{
+    (void)port;
+    (void)host;
+    (void)parent;
+    (void)driver;
+    (void)index;
+    return (void *)(uintptr_t)(-19);
+}
+
+static int kb_serdev_tty_port_unregister(void *port)
+{
+    (void)port;
+    return -19;
+}
+
 static const kb_linux_symbol_t symbols[] = {
     {"BUG_func", (void *)(uintptr_t)&kb_stack_chk_fail},
     {"_printk", (void *)(uintptr_t)&kb_printk},
@@ -17,6 +35,7 @@ static const kb_linux_symbol_t symbols[] = {
     {"kmalloc", (void *)(uintptr_t)&kb_kmalloc},
     {"kzalloc", (void *)(uintptr_t)&kb_kzalloc},
     {"kmalloc_trace", (void *)(uintptr_t)&kb_kmalloc_trace},
+    {"request_irq", (void *)(uintptr_t)&kb_request_irq},
     {"request_threaded_irq", (void *)(uintptr_t)&kb_request_threaded_irq},
     {"free_irq", (void *)(uintptr_t)&kb_free_irq},
     {"round_jiffies", (void *)(uintptr_t)&kb_identity_ulong},
@@ -28,12 +47,14 @@ static const kb_linux_symbol_t symbols[] = {
     {"__cpu_possible_mask", (void *)(uintptr_t)&kb_cpu_possible_mask},
     {"__cpu_present_mask", (void *)(uintptr_t)&kb_cpu_present_mask},
     {"USER_PTR_MAX", (void *)(uintptr_t)&kb_user_ptr_max},
+    {"xen_domain_type", (void *)(uintptr_t)&kb_xen_domain_type},
     {"cpu_number", (void *)(uintptr_t)&kb_cpu_number},
     {"disable_hardirq", (void *)(uintptr_t)&kb_return_zero},
     {"disable_irq_nosync", (void *)(uintptr_t)&kb_disable_irq_nosync},
     {"enable_irq", (void *)(uintptr_t)&kb_enable_irq},
     {"irq_get_irq_data", (void *)(uintptr_t)&kb_irq_get_irq_data},
     {"irq_modify_status", (void *)(uintptr_t)&kb_irq_modify_status},
+    {"__irq_apply_affinity_hint", (void *)(uintptr_t)&kb_irq_apply_affinity_hint},
     {"irq_set_affinity_hint", (void *)(uintptr_t)&kb_return_zero},
     {"_raw_spin_lock", (void *)(uintptr_t)&kb_raw_spin_lock},
     {"_raw_spin_trylock", (void *)(uintptr_t)&kb_raw_spin_trylock},
@@ -77,6 +98,9 @@ static const kb_linux_symbol_t symbols[] = {
     {"__rcu_read_unlock", (void *)(uintptr_t)&kb_noop_stub},
     {"__smp_mb__before_atomic", (void *)(uintptr_t)&kb_noop_stub},
     {"__get_random_u32_below", (void *)(uintptr_t)&kb_get_random_u32_below},
+    {"__get_task_comm", (void *)(uintptr_t)&kb_get_task_comm},
+    {"__register_sysctl_init", (void *)(uintptr_t)&kb_register_sysctl_init},
+    {"kill_pgrp", (void *)(uintptr_t)&kb_kill_pgrp},
     {"alloc_cpumask_var", (void *)(uintptr_t)&kb_alloc_cpumask_var},
     {"alloc_cpumask_var_node", (void *)(uintptr_t)&kb_alloc_cpumask_var},
     {"free_percpu", (void *)(uintptr_t)&kb_free_percpu},
@@ -85,7 +109,9 @@ static const kb_linux_symbol_t symbols[] = {
     {"generate_random_uuid", (void *)(uintptr_t)&kb_generate_random_uuid},
     {"get_random_bytes", (void *)(uintptr_t)&kb_get_random_bytes},
     {"get_random_u16", (void *)(uintptr_t)&kb_get_random_u16},
+    {"get_zeroed_page", (void *)(uintptr_t)&kb_alloc_stub},
     {"get_zeroed_page_noprof", (void *)(uintptr_t)&kb_alloc_stub},
+    {"group_send_sig_info", (void *)(uintptr_t)&kb_group_send_sig_info},
     {"down_write", (void *)(uintptr_t)&kb_down_write},
     {"up_write", (void *)(uintptr_t)&kb_up_write},
     {"_find_next_bit", (void *)(uintptr_t)&kb_find_next_bit},
@@ -108,11 +134,26 @@ static const kb_linux_symbol_t symbols[] = {
     {"_raw_spin_unlock_bh", (void *)(uintptr_t)&kb_raw_spin_unlock},
     {"complete", (void *)(uintptr_t)&kb_complete},
     {"complete_all", (void *)(uintptr_t)&kb_complete_all},
+    {"class_find_device", (void *)(uintptr_t)&kb_class_find_device},
     {"down_read", (void *)(uintptr_t)&kb_down_read},
-    {"finish_wait", (void *)(uintptr_t)&kb_noop_stub},
+    {"device_create", (void *)(uintptr_t)&kb_device_create},
+    {"device_create_with_groups", (void *)(uintptr_t)&kb_device_create_with_groups},
+    {"device_del", (void *)(uintptr_t)&kb_device_del},
+    {"device_destroy", (void *)(uintptr_t)&kb_device_destroy},
+    {"device_match_devt", (void *)(uintptr_t)&kb_device_match_devt},
+    {"device_register", (void *)(uintptr_t)&kb_device_register},
+    {"finish_wait", (void *)(uintptr_t)&kb_finish_wait},
+    {"find_vpid", (void *)(uintptr_t)&kb_find_vpid},
     {"flush_work", (void *)(uintptr_t)&kb_flush_work},
     {"alloc_workqueue_noprof", (void *)(uintptr_t)&kb_alloc_stub},
     {"alloc_pages_exact", (void *)(uintptr_t)&kb_alloc_pages_exact},
+    {"proc_dobool", (void *)(uintptr_t)&kb_proc_dobool},
+    {"proc_dointvec", (void *)(uintptr_t)&kb_proc_dointvec},
+    {"proc_dointvec_minmax", (void *)(uintptr_t)&kb_proc_dointvec_minmax},
+    {"put_device", (void *)(uintptr_t)&kb_put_device},
+    {"register_sysctl_sz", (void *)(uintptr_t)&kb_register_sysctl_sz},
+    {"sysctl_vals", (void *)(uintptr_t)kb_sysctl_vals},
+    {"unregister_sysctl_table", (void *)(uintptr_t)&kb_unregister_sysctl_table},
     {"__fortify_panic", (void *)(uintptr_t)&kb_stack_chk_fail},
     {"fortify_panic", (void *)(uintptr_t)&kb_stack_chk_fail},
     {"from_kgid", (void *)(uintptr_t)&kb_return_zero},
@@ -135,6 +176,9 @@ static const kb_linux_symbol_t symbols[] = {
     {"memweight", (void *)(uintptr_t)&kb_memweight},
     {"mutex_lock", (void *)(uintptr_t)&kb_mutex_lock},
     {"mutex_lock_io", (void *)(uintptr_t)&kb_mutex_lock},
+    {"mutex_lock_interruptible", (void *)(uintptr_t)&kb_mutex_lock_interruptible},
+    {"mutex_lock_killable", (void *)(uintptr_t)&kb_mutex_lock_killable},
+    {"mutex_is_locked", (void *)(uintptr_t)&kb_mutex_is_locked},
     {"mutex_trylock", (void *)(uintptr_t)&kb_mutex_trylock},
     {"mutex_unlock", (void *)(uintptr_t)&kb_mutex_unlock},
     {"wait_for_completion", (void *)(uintptr_t)&kb_wait_for_completion},
@@ -164,6 +208,7 @@ static const kb_linux_symbol_t symbols[] = {
     {"kfree_const", (void *)(uintptr_t)&kb_kfree},
     {"in_group_p", (void *)(uintptr_t)&kb_return_zero},
     {"iov_iter_alignment", (void *)(uintptr_t)&kb_return_zero},
+    {"is_current_pgrp_orphaned", (void *)(uintptr_t)&kb_return_zero},
     {"kmem_cache_create", (void *)(uintptr_t)&kb_kmem_cache_create},
     {"__kmem_cache_create_args", (void *)(uintptr_t)&kb_kmem_cache_create_args},
     {"kmem_cache_alloc_noprof", (void *)(uintptr_t)&kb_kmem_cache_alloc},
@@ -183,6 +228,8 @@ static const kb_linux_symbol_t symbols[] = {
     {"kvmalloc_node", (void *)(uintptr_t)&kb_kzalloc},
     {"krealloc_noprof", (void *)(uintptr_t)&kb_krealloc_managed},
     {"list_sort", (void *)(uintptr_t)&kb_noop_stub},
+    {"llist_add_batch", (void *)(uintptr_t)&kb_llist_add_batch},
+    {"llist_del_first", (void *)(uintptr_t)&kb_llist_del_first},
     {"local_bh_disable", (void *)(uintptr_t)&kb_noop_stub},
     {"local_bh_enable", (void *)(uintptr_t)&kb_noop_stub},
     {"make_kgid", (void *)(uintptr_t)&kb_return_zero},
@@ -190,6 +237,9 @@ static const kb_linux_symbol_t symbols[] = {
     {"make_kuid", (void *)(uintptr_t)&kb_return_zero},
     {"make_vfsgid", (void *)(uintptr_t)&kb_return_zero},
     {"make_vfsuid", (void *)(uintptr_t)&kb_return_zero},
+    {"match_int", (void *)(uintptr_t)&kb_match_int},
+    {"match_octal", (void *)(uintptr_t)&kb_match_octal},
+    {"match_token", (void *)(uintptr_t)&kb_match_token},
     {"mod_timer", (void *)(uintptr_t)&kb_mod_timer},
     {"msleep", (void *)(uintptr_t)&kb_msleep},
     {"msleep_interruptible", (void *)(uintptr_t)&kb_msleep_interruptible},
@@ -197,7 +247,10 @@ static const kb_linux_symbol_t symbols[] = {
     {"mempool_create_node_noprof", (void *)(uintptr_t)&kb_alloc_stub},
     {"ndelay", (void *)(uintptr_t)&kb_ndelay},
     {"nsecs_to_jiffies", (void *)(uintptr_t)&kb_return_zero},
+    {"ns_capable", (void *)(uintptr_t)&kb_return_zero},
     {"panic", (void *)(uintptr_t)&kb_stack_chk_fail},
+    {"pid_task", (void *)(uintptr_t)&kb_pid_task},
+    {"pid_vnr", (void *)(uintptr_t)&kb_pid_vnr},
     {"queue_delayed_work_on", (void *)(uintptr_t)&kb_queue_delayed_work_on},
     {"queue_work_on", (void *)(uintptr_t)&kb_queue_work_on},
     {"rcuwait_wake_up", (void *)(uintptr_t)&kb_noop_stub},
@@ -207,6 +260,10 @@ static const kb_linux_symbol_t symbols[] = {
     {"io_schedule_timeout", (void *)(uintptr_t)&kb_schedule_timeout},
     {"schedule_timeout", (void *)(uintptr_t)&kb_schedule_timeout},
     {"schedule_timeout_interruptible", (void *)(uintptr_t)&kb_schedule_timeout},
+    {"schedule_timeout_killable", (void *)(uintptr_t)&kb_schedule_timeout},
+    {"send_signal_locked", (void *)(uintptr_t)&kb_send_signal_locked},
+    {"serdev_tty_port_register", (void *)(uintptr_t)&kb_serdev_tty_port_register},
+    {"serdev_tty_port_unregister", (void *)(uintptr_t)&kb_serdev_tty_port_unregister},
     {"timer_delete_sync", (void *)(uintptr_t)&kb_timer_delete},
     {"timer_shutdown_sync", (void *)(uintptr_t)&kb_timer_delete},
     {"up_read", (void *)(uintptr_t)&kb_up_read},

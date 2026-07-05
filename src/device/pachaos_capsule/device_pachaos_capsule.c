@@ -370,7 +370,7 @@ static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_pachaos_capsule_backend_t *
     kb_pachaos_dma_mapping_t **cursor = backend != NULL ? &backend->dma_mappings : NULL;
     while (cursor != NULL && *cursor != NULL) {
         kb_pachaos_dma_mapping_t *mapping = *cursor;
-        if (mapping->dma.iova == iova) {
+        if (iova >= mapping->dma.iova && iova - mapping->dma.iova < mapping->dma.len) {
             *cursor = mapping->next;
             mapping->next = NULL;
             return mapping;
@@ -382,14 +382,16 @@ static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_pachaos_capsule_backend_t *
 
 static kb_status_t remember_dma_mapping(kb_pachaos_capsule_backend_t *backend, const kb_pachaos_dma_mapping_t *mapping)
 {
-    if (backend == NULL || mapping == NULL || !pacha_capsule_is_fd(mapping->dma.fd)) {
+    if (backend == NULL || mapping == NULL || !pacha_capsule_is_fd(mapping->dma.fd) || mapping->dma.len == 0)
+    {
         if (trace_pachaos_dma_enabled()) {
             fprintf(stderr,
-                "kobox pachaos_capsule: remember_dma_mapping reject backend=%p mapping=%p fd=%d iova=0x%llx\n",
+                "kobox pachaos_capsule: remember_dma_mapping reject backend=%p mapping=%p fd=%d iova=0x%llx len=%zu\n",
                 (void *)backend,
                 (const void *)mapping,
                 mapping != NULL ? mapping->dma.fd : -1,
-                mapping != NULL ? (unsigned long long)mapping->dma.iova : 0ull);
+                mapping != NULL ? (unsigned long long)mapping->dma.iova : 0ull,
+                mapping != NULL ? mapping->dma.len : 0u);
         }
         return KB_ERR_INVALID;
     }
@@ -739,14 +741,26 @@ static kb_status_t pachaos_capsule_dma_map(
     }
     *out_dma_addr = 0;
 
-    void *mapped = cpu_addr;
+    const uint64_t page_size = page_size_u64();
+    if (page_size == 0 || !is_power_of_two_u64(page_size)) {
+        return KB_ERR_INVALID;
+    }
+    const uint64_t page_offset = (uint64_t)((uintptr_t)cpu_addr & (uintptr_t)(page_size - 1u));
+    if (size > UINT64_MAX - page_offset) {
+        return KB_ERR_INVALID;
+    }
+    const uint64_t map_size = align_up_u64(page_offset + size, page_size);
+    if (map_size == 0 || map_size > (uint64_t)SIZE_MAX) {
+        return KB_ERR_INVALID;
+    }
+    void *mapped = (void *)((uintptr_t)cpu_addr - (uintptr_t)page_offset);
 
     struct pacha_capsule_dma dma = {0};
     const int status = pacha_capsule_derive_dma_mapping(
         device->device_fd,
         mapped,
         PACHA_CAPSULE_DMA_IOVA_KERNEL_CHOOSE,
-        (size_t)size,
+        (size_t)map_size,
         (unsigned)dma_dir_to_pacha(direction),
         0);
     if (!pacha_capsule_is_fd(status)) {
@@ -756,7 +770,7 @@ static kb_status_t pachaos_capsule_dma_map(
                 cpu_addr,
                 mapped,
                 (unsigned long long)size,
-                (unsigned long long)size,
+                (unsigned long long)map_size,
                 0,
                 status);
         }
@@ -773,7 +787,7 @@ static kb_status_t pachaos_capsule_dma_map(
             cpu_addr,
             mapped,
             (unsigned long long)size,
-            (unsigned long long)size,
+            (unsigned long long)map_size,
             0,
             dma.fd,
             (unsigned long long)dma.iova,
@@ -804,7 +818,7 @@ static kb_status_t pachaos_capsule_dma_map(
         (void)pacha_capsule_close(dma.fd);
         return remember_status;
     }
-    *out_dma_addr = dma.iova;
+    *out_dma_addr = dma.iova + page_offset;
     return KB_OK;
 }
 
@@ -917,8 +931,16 @@ static kb_status_t pachaos_capsule_irq_register(
     }
     *out_irq = NULL;
 
+    /*
+     * PachaOS currently publishes PCI device interrupts through one generic
+     * vector. The Linux personality still tracks MSI/MSI-X entries internally,
+     * but the capsule IRQ fd must subscribe to the generic device source.
+     */
+    unsigned irq_kind = PACHA_CAPSULE_IRQ_AUTO;
+    unsigned irq_vector = 0;
+
     struct pacha_capsule_irq irq_fd = {0};
-    const int status = pacha_capsule_device_derive_irq(device->device_fd, PACHA_CAPSULE_IRQ_AUTO, vector, 0, &irq_fd);
+    const int status = pacha_capsule_device_derive_irq(device->device_fd, irq_kind, irq_vector, 0, &irq_fd);
     if (status != 0) {
         return status_from_pacha(status);
     }

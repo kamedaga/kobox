@@ -13,6 +13,7 @@ kb_device_backend_t *kb_shim_current_device_backend(void);
 static kb_status_t first_device(kb_device_backend_t *backend, kb_device_t **out_device);
 static int trace_pci_enabled(void);
 static int metric_pci_enabled(void);
+static int arch68_pci_layout_enabled(void);
 static uint64_t pci_read_tsc(void);
 static void pci_metric(const char *stage, uint64_t start_cycles);
 #define kb_pci_tracef(...) \
@@ -68,6 +69,11 @@ typedef struct shim_pci_binding {
     unsigned char pci_bus_storage[512];
     char pci_dev_name[32];
     uint64_t dma_mask_storage;
+    struct {
+        uint32_t max_segment_size;
+        uint32_t min_align_mask;
+        uint64_t segment_boundary_mask;
+    } dma_parms_storage;
     uint32_t pci_domain_storage;
     uint16_t pci_command;
     void *pcim_iomap_table[6];
@@ -163,7 +169,7 @@ static int pci_device_is_xhci(void *dev)
     return ((revision_class >> 8) & UINT32_C(0x00ffffff)) == KB_PCI_CLASS_XHCI;
 }
 
-static int pachaos_xhci_uses_legacy_irq(void *dev)
+static int pachaos_device_uses_legacy_irq(void *dev)
 {
     /*
      * PachaOS does not yet deliver PCI MSI/MSI-X to kobox correctly. qemu-xhci
@@ -178,7 +184,7 @@ static int pachaos_xhci_uses_legacy_irq(void *dev)
 
 static int pachaos_backend_programs_msix_table(void)
 {
-    return pachaos_backend_active();
+    return 0;
 }
 
 enum {
@@ -198,6 +204,9 @@ enum {
     KB_PCI_MSIX_CONTROL_ENABLE = 0x8000,
     KB_PCI_MSIX_TABLE_BIR_MASK = 0x00000007,
     KB_PCI_MSIX_ENTRY_SIZE = 16,
+    KB_PCI_MSIX_ENTRY_ADDR_LO = 0,
+    KB_PCI_MSIX_ENTRY_ADDR_HI = 4,
+    KB_PCI_MSIX_ENTRY_DATA = 8,
     KB_PCI_MSIX_ENTRY_VECTOR_CTRL = 12,
     KB_PCI_MSIX_ENTRY_CTRL_MASKED = 0x00000001,
     KB_PCI_CLASS_STORAGE = 0x01,
@@ -219,14 +228,19 @@ enum {
     KB_LINUX_6_6_DEVICE_DRIVER_OFFSET = 0x068,
     KB_LINUX_6_6_PCI_DRIVER_DEVICE_DRIVER_OFFSET = 0x078,
     KB_LINUX_6_8_PCI_DEV_ENABLE_CNT_OFFSET = 0x85c,
-    KB_LINUX_6_8_PCI_DEV_DMA_MASK_OFFSET = 0x328,
+    KB_LINUX_6_8_PCI_DEV_DMA_MASK_OFFSET = 0x2e8,
+    KB_LINUX_6_8_PCI_DEV_DMA_PARMS_OFFSET = 0x328,
     KB_LINUX_6_8_PCI_DEV_IRQ_OFFSET = 0x3cc,
+    KB_LINUX_ARCH_6_8_PCI_DEV_IRQ_OFFSET = 0x3b4,
     KB_LINUX_6_8_PCI_RESOURCE0_START_OFFSET = 0x3d0,
     KB_LINUX_6_8_PCI_RESOURCE0_END_OFFSET = 0x3d8,
     KB_LINUX_6_8_PCI_RESOURCE0_FLAGS_OFFSET = 0x3e8,
     KB_LINUX_6_6_PCI_RESOURCE0_START_OFFSET = 0x3a8,
     KB_LINUX_6_6_PCI_RESOURCE0_END_OFFSET = 0x3b0,
     KB_LINUX_6_6_PCI_RESOURCE0_FLAGS_OFFSET = 0x3c0,
+    KB_LINUX_ARCH_6_8_PCI_RESOURCE0_START_OFFSET = 0x3b8,
+    KB_LINUX_ARCH_6_8_PCI_RESOURCE0_END_OFFSET = 0x3c0,
+    KB_LINUX_ARCH_6_8_PCI_RESOURCE0_FLAGS_OFFSET = 0x3d0,
     KB_LINUX_3_10_PCI_RESOURCE0_START_OFFSET = 0x340,
     KB_LINUX_3_10_PCI_RESOURCE0_END_OFFSET = 0x348,
     KB_LINUX_3_10_PCI_RESOURCE0_FLAGS_OFFSET = 0x358,
@@ -284,11 +298,28 @@ int kb_pci_msix_unmask_entries(void *dev, const uint16_t *entries, unsigned int 
 
     int result = 0;
     for (unsigned int i = 0; i < count; i++) {
-        uint64_t ctrl_offset =
-            (uint64_t)table_offset + ((uint64_t)entries[i] * KB_PCI_MSIX_ENTRY_SIZE) + KB_PCI_MSIX_ENTRY_VECTOR_CTRL;
+        enum {
+            PACHAOS_GENERIC_DEVICE_INTERRUPT_VECTOR = 0x41,
+            X86_MSI_ADDRESS_BASE = 0xfee00000,
+        };
+        uint64_t entry_offset = (uint64_t)table_offset + ((uint64_t)entries[i] * KB_PCI_MSIX_ENTRY_SIZE);
+        uint64_t ctrl_offset = entry_offset + KB_PCI_MSIX_ENTRY_VECTOR_CTRL;
         if (ctrl_offset + sizeof(uint32_t) > region.size) {
             result = -22;
             break;
+        }
+        if (pachaos_backend_active() &&
+            entry_offset + KB_PCI_MSIX_ENTRY_SIZE <= region.size)
+        {
+            volatile uint32_t *addr_lo =
+                (volatile uint32_t *)((unsigned char *)region.addr + entry_offset + KB_PCI_MSIX_ENTRY_ADDR_LO);
+            volatile uint32_t *addr_hi =
+                (volatile uint32_t *)((unsigned char *)region.addr + entry_offset + KB_PCI_MSIX_ENTRY_ADDR_HI);
+            volatile uint32_t *data =
+                (volatile uint32_t *)((unsigned char *)region.addr + entry_offset + KB_PCI_MSIX_ENTRY_DATA);
+            *addr_lo = X86_MSI_ADDRESS_BASE;
+            *addr_hi = 0;
+            *data = PACHAOS_GENERIC_DEVICE_INTERRUPT_VECTOR;
         }
         volatile uint32_t *ctrl = (volatile uint32_t *)((unsigned char *)region.addr + ctrl_offset);
         *ctrl &= ~((uint32_t)KB_PCI_MSIX_ENTRY_CTRL_MASKED);
@@ -330,10 +361,10 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
 #if defined(__pachaos__)
     kb_pci_tracef("kobox pci: alloc_irq_vectors before xhci legacy check\n");
 #endif
-    if (pachaos_xhci_uses_legacy_irq(dev)) {
+    if (pachaos_device_uses_legacy_irq(dev)) {
         if (min_vecs > 1) {
             if (trace_pci_enabled()) {
-                fprintf(stderr, "kobox pci: alloc_irq_vectors pachaos-xhci-legacy insufficient min=%u\n", min_vecs);
+                fprintf(stderr, "kobox pci: alloc_irq_vectors pachaos-legacy insufficient min=%u\n", min_vecs);
             }
             return -28;
         }
@@ -344,7 +375,7 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
         if (trace_pci_enabled()) {
             fprintf(
                 stderr,
-                "kobox pci: alloc_irq_vectors pachaos-xhci-legacy flags=0x%x max=%u\n",
+                "kobox pci: alloc_irq_vectors pachaos-legacy flags=0x%x max=%u\n",
                 flags,
                 max_vecs);
         }
@@ -588,6 +619,13 @@ int kb_pci_irq_vector(void *dev, unsigned int nr)
     return (int)nr;
 }
 
+void *kb_pci_irq_get_affinity(void *dev, unsigned int nr)
+{
+    (void)dev;
+    (void)nr;
+    return NULL;
+}
+
 static int kb_pci_request_irq_impl(
     void *dev,
     unsigned int nr,
@@ -681,6 +719,19 @@ int kb_pci_device_is_present(void *dev)
     return 1;
 }
 
+void *kb_pci_iov_get_pf_drvdata(void *dev, void *driver)
+{
+    (void)dev;
+    (void)driver;
+    return NULL;
+}
+
+int kb_pci_iov_vf_id(void *dev)
+{
+    (void)dev;
+    return -22;
+}
+
 static kb_status_t first_device(kb_device_backend_t *backend, kb_device_t **out_device)
 {
     const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
@@ -719,6 +770,12 @@ static int trace_pci_enabled(void)
 {
     const char *value = getenv("KOBOX_TRACE_PCI");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int arch68_pci_layout_enabled(void)
+{
+    const char *value = getenv("KOBOX_PCI_LAYOUT");
+    return value != NULL && strcmp(value, "arch68") == 0;
 }
 
 static int metric_pci_enabled(void)
@@ -1383,6 +1440,7 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
     memset(binding.pci_bus_storage, 0, sizeof(binding.pci_bus_storage));
     memset(binding.pci_dev_name, 0, sizeof(binding.pci_dev_name));
     memset(binding.pcim_iomap_table, 0, sizeof(binding.pcim_iomap_table));
+    memset(&binding.dma_parms_storage, 0, sizeof(binding.dma_parms_storage));
     uint16_t real_command = 0;
     if (ops->pci_config_read != NULL &&
         ops->pci_config_read(device, KB_PCI_COMMAND_OFFSET, &real_command, sizeof(real_command)) == KB_OK)
@@ -1395,6 +1453,12 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
         binding.pci_dev_storage + KB_LINUX_6_8_PCI_DEV_DMA_MASK_OFFSET,
         &dma_mask_ptr,
         sizeof(dma_mask_ptr));
+    uintptr_t dma_parms_ptr = (uintptr_t)&binding.dma_parms_storage;
+    memcpy(
+        binding.pci_dev_storage + KB_LINUX_6_8_PCI_DEV_DMA_PARMS_OFFSET,
+        &dma_parms_ptr,
+        sizeof(dma_parms_ptr));
+    const int arch68_layout = arch68_pci_layout_enabled();
     kb_pci_location_t location;
     memset(&location, 0, sizeof(location));
     if (ops != NULL && ops->device_pci_location != NULL) {
@@ -1433,6 +1497,9 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
     binding.pci_dev_storage[KB_LINUX_6_8_PCI_DEV_REVISION_OFFSET] = device_id.revision;
 
     write_u32(binding.pci_dev_storage + KB_LINUX_6_8_PCI_DEV_IRQ_OFFSET, 16);
+    if (arch68_layout) {
+        write_u32(binding.pci_dev_storage + KB_LINUX_ARCH_6_8_PCI_DEV_IRQ_OFFSET, 16);
+    }
     if (ops != NULL && ops->pci_bar_info != NULL) {
         for (unsigned bar_index = 0; bar_index < 6; bar_index++) {
             kb_pci_bar_info_t bar;
@@ -1476,6 +1543,17 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
                 bar.start,
                 bar.end,
                 flags);
+            if (arch68_layout) {
+                write_pci_resource(
+                    KB_LINUX_6_8_PCI_RESOURCE_SIZE,
+                    KB_LINUX_ARCH_6_8_PCI_RESOURCE0_START_OFFSET,
+                    KB_LINUX_ARCH_6_8_PCI_RESOURCE0_END_OFFSET,
+                    KB_LINUX_ARCH_6_8_PCI_RESOURCE0_FLAGS_OFFSET,
+                    bar_index,
+                    bar.start,
+                    bar.end,
+                    flags);
+            }
         }
     }
 

@@ -57,6 +57,7 @@ typedef struct kb_deferred_item {
     kb_deferred_kind_t kind;
     void *object;
     uint64_t due_ns;
+    kb_device_backend_t *backend;
     unsigned long kernel_gs;
     struct kb_deferred_item *next;
 } kb_deferred_item_t;
@@ -488,6 +489,7 @@ static int queue_deferred(kb_deferred_kind_t kind, void *object, uint64_t due_ns
     item->kind = kind;
     item->object = object;
     item->due_ns = due_ns;
+    item->backend = kb_shim_current_device_backend();
     item->kernel_gs = kb_shim_current_kernel_gs();
     refresh_deferred_tail();
     if (deferred_tail != NULL) {
@@ -848,6 +850,8 @@ static void run_deferred_items(int include_work)
             break;
         }
 
+        kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+        kb_shim_set_device_backend(item->backend);
         refresh_linux_jiffies();
         switch (item->kind) {
         case KB_DEFERRED_WORK:
@@ -861,6 +865,7 @@ static void run_deferred_items(int include_work)
             break;
         }
         refresh_linux_jiffies();
+        kb_shim_set_device_backend(old_backend);
         release_deferred_item(item);
     }
     draining_deferred_depth--;
@@ -1069,6 +1074,7 @@ int kb_mod_timer(void *timer, unsigned long expires)
     kb_deferred_item_t *item = find_deferred(KB_DEFERRED_TIMER, timer);
     if (item != NULL) {
         item->due_ns = due_ns;
+        item->backend = kb_shim_current_device_backend();
         item->kernel_gs = kb_shim_current_kernel_gs();
         return 1;
     }

@@ -23,6 +23,10 @@
 #include "linux_subsystem/sound/sound_symbols.h"
 #include "linux_subsystem/usb/usb_symbols.h"
 
+#if defined(__pachaos__)
+#include "pacha/abi.h"
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -65,11 +69,28 @@ enum {
     KB_LOCAL_VMEMMAP_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7176,
     KB_LOCAL_PHYS_BASE_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7184,
     KB_LOCAL_DMA_OPS_PTR_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7192,
+    KB_LOCAL_INIT_USER_NS_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7200,
+    KB_LOCAL_CURRENT_NSPROXY_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7296,
+    KB_LOCAL_CURRENT_MNT_NS_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7360,
     KB_LOCAL_CURRENT_CRED_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7680,
     KB_LOCAL_CURRENT_MM_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4608,
     KB_LOCAL_CURRENT_TASK_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 8192,
-    KB_LOCAL_CURRENT_TASK_REAL_CRED_OFFSET = 0x7e8,
-    KB_LOCAL_CURRENT_TASK_CRED_OFFSET = 0x7f0,
+    KB_LOCAL_CURRENT_TASK_NSPROXY_OFFSET = 0x750,
+    KB_LOCAL_ARCH_6_8_CURRENT_TASK_NSPROXY_OFFSET = 0x840,
+    KB_LOCAL_CURRENT_TASK_REAL_CRED_OFFSET = 0x6f0,
+    KB_LOCAL_CURRENT_TASK_CRED_OFFSET = 0x6f8,
+    KB_LOCAL_ARCH_6_8_CURRENT_TASK_MM_OFFSET = 0x548,
+    KB_LOCAL_ARCH_6_8_CURRENT_TASK_REAL_CRED_OFFSET = 0x7d0,
+    KB_LOCAL_ARCH_6_8_CURRENT_TASK_CRED_OFFSET = 0x7d8,
+    KB_LOCAL_ARCH_6_8_CURRENT_TASK_COMM_OFFSET = 0x7e8,
+    KB_LOCAL_ARCH_6_8_CURRENT_TASK_SIGNAL_OFFSET = 0x848,
+    KB_LOCAL_ARCH_6_8_CURRENT_TASK_SIGHAND_OFFSET = 0x850,
+    KB_LOCAL_NSPROXY_MNT_NS_OFFSET = 0x18,
+    KB_LOCAL_CRED_UID_OFFSET = 0x08,
+    KB_LOCAL_CRED_GID_OFFSET = 0x0c,
+    KB_LOCAL_CRED_FSUID_OFFSET = 0x20,
+    KB_LOCAL_CRED_FSGID_OFFSET = 0x24,
+    KB_LOCAL_CRED_USER_NS_OFFSET = 0x90,
     KB_LOCAL_USB_DATA_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 11264,
     KB_LOCAL_JIFFIES_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4096,
     KB_LOCAL_GS_SIZE = 4096,
@@ -87,10 +108,15 @@ enum {
     KB_LOCAL_USB_MISC_DATA_OFFSET = 1024,
     KB_LOCAL_USB_MISC_DATA_STRIDE = 128,
     KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET = KB_LOCAL_USB_DATA_OFFSET + KB_LOCAL_USB_MISC_DATA_OFFSET,
-};
-
-enum {
-    KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE = 12,
+    KB_LOCAL_CURRENT_SIGNAL_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 13312,
+    KB_LOCAL_CURRENT_SIGHAND_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 15360,
+    KB_LOCAL_LINUX_TASK_SIGNAL_OFFSET = 0x758,
+    KB_LOCAL_LINUX_TASK_SIGHAND_OFFSET = 0x760,
+    KB_LOCAL_LINUX_SIGNAL_LEADER_OFFSET = 0x190,
+    KB_LOCAL_LINUX_SIGNAL_TTY_OFFSET = 0x198,
+    KB_LOCAL_ARCH_6_8_SIGNAL_TTY_OLD_PGRP_OFFSET = 0x190,
+    KB_LOCAL_ARCH_6_8_SIGNAL_LEADER_OFFSET = 0x198,
+    KB_LOCAL_ARCH_6_8_SIGNAL_TTY_OFFSET = 0x1a0,
 };
 
 #if defined(__pachaos__) && defined(__x86_64__)
@@ -107,7 +133,7 @@ static long kb_pachaos_syscall1(uint64_t nr, uint64_t a0)
 
 static long kb_pachaos_set_gs_base(uint64_t gs_base)
 {
-    return kb_pachaos_syscall1(KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE, gs_base);
+    return kb_pachaos_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, gs_base);
 }
 #endif
 
@@ -182,6 +208,8 @@ struct kb_module {
     void *shim_node0;
     void *shim_current_mm;
     void *shim_current_task;
+    void *shim_current_signal;
+    void *shim_current_sighand;
     char *module_name;
     loaded_section_t *sections;
     size_t section_count;
@@ -213,6 +241,11 @@ void kb_loader_set_active_module(kb_module_t *module)
 void *kb_loader_module_current_mm(const kb_module_t *module)
 {
     return module == NULL ? NULL : module->shim_current_mm;
+}
+
+void *kb_loader_module_current_task(const kb_module_t *module)
+{
+    return module == NULL ? NULL : module->shim_current_task;
 }
 
 static unsigned long kb_copy_from_user(void *to, const void *from, unsigned long n)
@@ -629,7 +662,7 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "mov 648(%rsp), %rdi\n\t"
         "test %rdi, %rdi\n\t"
         "jz 1f\n\t"
-        "mov $12, %eax\n\t"
+        "mov $16, %eax\n\t"
         "syscall\n\t"
         "1:\n\t"
         "mov 528(%rsp), %rdi\n\t"
@@ -649,7 +682,7 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "mov %rax, 632(%rsp)\n\t"
         "mov %rdx, 640(%rsp)\n\t"
         "mov 624(%rsp), %rdi\n\t"
-        "mov $12, %eax\n\t"
+        "mov $16, %eax\n\t"
         "syscall\n\t"
         "movq $0, kb_current_external_call_target(%rip)\n\t"
         "mov 632(%rsp), %rax\n\t"
@@ -1569,18 +1602,30 @@ static void write_abs_jump_raw_stub(uint8_t *p, void *target)
 {
     memset(p, 0x90, KB_LOCAL_SHIM_STUB_SIZE);
     size_t i = 0;
-    p[i++] = 0x48;
-    p[i++] = 0xb8;
+    p[i++] = 0x49;
+    p[i++] = 0xbb;
     write_u64le(p + i, (uint64_t)(uintptr_t)target);
     i += 8;
+    p[i++] = 0x41;
     p[i++] = 0xff;
-    p[i++] = 0xe0;
+    p[i++] = 0xe3;
 }
 
 static void write_ret_stub(uint8_t *p)
 {
     memset(p, 0x90, KB_LOCAL_SHIM_STUB_SIZE);
     p[0] = 0xc3;
+}
+
+static int symbol_uses_linux_user_access_abi(const char *name)
+{
+    return name != NULL &&
+        (strcmp(name, "__get_user_1") == 0 ||
+            strcmp(name, "__get_user_2") == 0 ||
+            strcmp(name, "__get_user_4") == 0 ||
+            strcmp(name, "__get_user_8") == 0 ||
+            strcmp(name, "__put_user_4") == 0 ||
+            strcmp(name, "__put_user_8") == 0);
 }
 
 static uint64_t page_size(void)
@@ -1790,6 +1835,11 @@ static kb_module_t *module_for_address(const void *address)
     return NULL;
 }
 
+kb_module_t *kb_module_find_owner_for_address(const void *address)
+{
+    return module_for_address(address);
+}
+
 int kb_module_is_executable_address(const void *address)
 {
     const uintptr_t value = (uintptr_t)address;
@@ -1939,6 +1989,12 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     }
     if (strcmp(name, "phys_base") == 0) {
         return module->shim_region + KB_LOCAL_PHYS_BASE_OFFSET;
+    }
+    if (strcmp(name, "init_task") == 0) {
+        return module->shim_current_task;
+    }
+    if (strcmp(name, "init_user_ns") == 0) {
+        return module->shim_region + KB_LOCAL_INIT_USER_NS_OFFSET;
     }
     if (strcmp(name, "dma_ops") == 0) {
         void **storage = (void **)(void *)(module->shim_region + KB_LOCAL_DMA_OPS_PTR_OFFSET);
@@ -2116,7 +2172,6 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
         strcmp(name, "iomem_resource") == 0 ||
         strcmp(name, "ioport_resource") == 0 ||
         strcmp(name, "init_uts_ns") == 0 ||
-        strcmp(name, "init_user_ns") == 0 ||
         strcmp(name, "hv_vp_assist_page") == 0 ||
         strcmp(name, "fs_overflowgid") == 0 ||
         strcmp(name, "fs_overflowuid") == 0 ||
@@ -2394,6 +2449,8 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_boot_cpu_data = module->shim_region + KB_LOCAL_BOOT_CPU_DATA_OFFSET;
     module->shim_current_mm = module->shim_region + KB_LOCAL_CURRENT_MM_OFFSET;
     module->shim_current_task = module->shim_region + KB_LOCAL_CURRENT_TASK_OFFSET;
+    module->shim_current_signal = module->shim_region + KB_LOCAL_CURRENT_SIGNAL_OFFSET;
+    module->shim_current_sighand = module->shim_region + KB_LOCAL_CURRENT_SIGHAND_OFFSET;
     write_u64le((uint8_t *)module->shim_cpu_possible_mask, 1);
     write_u64le((uint8_t *)module->shim_cpu_online_mask, 1);
     write_u64le((uint8_t *)module->shim_cpu_possible_mask_ptr, (uint64_t)(uintptr_t)module->shim_cpu_possible_mask);
@@ -2427,6 +2484,12 @@ static kb_status_t load_sections(kb_module_t *module)
         }
         if (strcmp(symbol->name, "stackleak_track_stack") == 0) {
             write_ret_stub(module->shim_symbol_stubs + (i * KB_LOCAL_SHIM_STUB_SIZE));
+            continue;
+        }
+        if (symbol_uses_linux_user_access_abi(symbol->name)) {
+            write_abs_jump_raw_stub(
+                module->shim_symbol_stubs + (i * KB_LOCAL_SHIM_STUB_SIZE),
+                symbol->address);
             continue;
         }
         write_abs_jump_stub(
@@ -2471,18 +2534,63 @@ static kb_status_t load_sections(kb_module_t *module)
     module->kernel_gs[KB_LOCAL_GS_CPU_INFO_OFFSET + 2] = 2; /* X86_VENDOR_AMD */
     ((uint8_t *)module->shim_boot_cpu_data)[2] = 2; /* X86_VENDOR_AMD */
     write_u64le(module->kernel_gs + KB_LOCAL_GS_CPU_INFO_OFFSET + 0x48, 1ull << 2); /* X86_FEATURE_SVM */
+    memset(module->shim_current_signal, 0, 2048);
+    memset(module->shim_current_sighand, 0, 4096);
     write_u64le((uint8_t *)module->shim_current_task + 0xe8, (uint64_t)(uintptr_t)module->shim_current_mm);
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_MM_OFFSET,
+        (uint64_t)(uintptr_t)module->shim_current_mm);
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_LINUX_TASK_SIGNAL_OFFSET,
+        (uint64_t)(uintptr_t)module->shim_current_signal);
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_LINUX_TASK_SIGHAND_OFFSET,
+        (uint64_t)(uintptr_t)module->shim_current_sighand);
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_SIGNAL_OFFSET,
+        (uint64_t)(uintptr_t)module->shim_current_signal);
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_SIGHAND_OFFSET,
+        (uint64_t)(uintptr_t)module->shim_current_sighand);
+    write_u32le((uint8_t *)module->shim_current_signal + KB_LOCAL_LINUX_SIGNAL_LEADER_OFFSET, 0);
+    write_u64le((uint8_t *)module->shim_current_signal + KB_LOCAL_LINUX_SIGNAL_TTY_OFFSET, 0);
+    write_u64le((uint8_t *)module->shim_current_signal + KB_LOCAL_ARCH_6_8_SIGNAL_TTY_OLD_PGRP_OFFSET, 0);
+    write_u32le((uint8_t *)module->shim_current_signal + KB_LOCAL_ARCH_6_8_SIGNAL_LEADER_OFFSET, 0);
+    write_u64le((uint8_t *)module->shim_current_signal + KB_LOCAL_ARCH_6_8_SIGNAL_TTY_OFFSET, 0);
+    write_u32le(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET + KB_LOCAL_CRED_UID_OFFSET, 0);
+    write_u32le(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET + KB_LOCAL_CRED_GID_OFFSET, 0);
+    write_u32le(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET + KB_LOCAL_CRED_FSUID_OFFSET, 0);
+    write_u32le(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET + KB_LOCAL_CRED_FSGID_OFFSET, 0);
+    write_u64le(
+        module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET + KB_LOCAL_CRED_USER_NS_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_INIT_USER_NS_OFFSET));
     write_u64le(
         (uint8_t *)module->shim_current_task + KB_LOCAL_CURRENT_TASK_REAL_CRED_OFFSET,
         (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
     write_u64le(
         (uint8_t *)module->shim_current_task + KB_LOCAL_CURRENT_TASK_CRED_OFFSET,
         (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_REAL_CRED_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_CRED_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
+    write_u64le(
+        module->shim_region + KB_LOCAL_CURRENT_NSPROXY_OFFSET + KB_LOCAL_NSPROXY_MNT_NS_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_MNT_NS_OFFSET));
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_CURRENT_TASK_NSPROXY_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_NSPROXY_OFFSET));
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_NSPROXY_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_NSPROXY_OFFSET));
     write_u64le((uint8_t *)module->shim_current_task + 0x938, (uint64_t)(uintptr_t)module->shim_current_mm);
     write_u64le(
         (uint8_t *)module->shim_current_task + 0x950,
         (uint64_t)(uintptr_t)((uint8_t *)module->shim_current_task + 0x9b8));
     write_u32le((uint8_t *)module->shim_current_task + 0x9b8, 1);
+    memcpy((uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_COMM_OFFSET, "kobox-run", sizeof("kobox-run"));
     memcpy((uint8_t *)module->shim_current_task + 0xbd8, "kobox-run", sizeof("kobox-run"));
     write_u64le((uint8_t *)module->shim_node_data, (uint64_t)(uintptr_t)module->shim_node0);
     write_u64le((uint8_t *)module->shim_node_states + 0x80, 1);

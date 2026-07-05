@@ -14,6 +14,10 @@ enum {
     KB_LINUX_6_8_DEVICE_BUS_OFFSET = 0x60,
     KB_LINUX_6_8_DEVICE_DRIVER_OFFSET = 0x68,
     KB_LINUX_6_8_DEVICE_DRIVER_DATA_OFFSET = 0x78,
+    KB_LINUX_6_8_DEVICE_DEVT_OFFSET = 0x284,
+    KB_LINUX_6_8_DEVICE_CLASS_OFFSET = 0x2a0,
+    KB_LINUX_6_8_DEVICE_GROUPS_OFFSET = 0x2a8,
+    KB_LINUX_6_8_DEVICE_RELEASE_OFFSET = 0x2b0,
     KB_LINUX_3_10_DEVICE_BUS_OFFSET = 0x88,
     KB_LINUX_3_10_DEVICE_DRIVER_OFFSET = 0x90,
     KB_LINUX_6_8_DEVICE_DRIVER_NAME_OFFSET = 0x00,
@@ -25,13 +29,18 @@ enum {
     KB_LINUX_3_10_BUS_MATCH_OFFSET = 0x48,
     KB_LINUX_3_10_BUS_PROBE_OFFSET = 0x58,
     KB_DRIVER_CORE_RECORD_MAX = 256,
+    KB_CREATED_DEVICE_BYTES = 0x2d8,
     KB_SYSFS_DIRENT_MAX = 256,
 };
 
 typedef struct kb_device_record {
     int active;
+    int allocated;
     void *dev;
     void *bus;
+    void *class_ptr;
+    uint64_t devt;
+    char name[96];
 } kb_device_record_t;
 
 typedef struct kb_driver_record {
@@ -81,6 +90,22 @@ static void write_ptr(void *base, size_t offset, void *value)
     }
 }
 
+static uint64_t read_u64(const void *base, size_t offset)
+{
+    uint64_t value = 0;
+    if (base != NULL) {
+        memcpy(&value, (const unsigned char *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static void write_u64(void *base, size_t offset, uint64_t value)
+{
+    if (base != NULL) {
+        memcpy((unsigned char *)base + offset, &value, sizeof(value));
+    }
+}
+
 static int pointer_is_error_or_low(const void *ptr)
 {
     uintptr_t value = (uintptr_t)ptr;
@@ -104,9 +129,31 @@ static const char *trace_name_or_null(const char *value)
     return value != NULL ? value : "(null)";
 }
 
+static size_t bounded_strlen(const char *value, size_t max_len)
+{
+    size_t len = 0;
+    if (value == NULL) {
+        return 0;
+    }
+    while (len < max_len && value[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
 static const char *device_name(void *dev)
 {
     return read_string_ptr(dev, KB_LINUX_DEVICE_KOBJ_NAME_OFFSET);
+}
+
+static void *device_class_ptr(void *dev)
+{
+    return read_ptr(dev, KB_LINUX_6_8_DEVICE_CLASS_OFFSET);
+}
+
+static uint64_t device_devt(void *dev)
+{
+    return read_u64(dev, KB_LINUX_6_8_DEVICE_DEVT_OFFSET);
 }
 
 static const char *driver_name(void *driver)
@@ -217,9 +264,17 @@ static kb_device_record_t *record_device(void *dev)
         return NULL;
     }
     void *bus = device_bus_ptr(dev);
+    void *class_ptr = device_class_ptr(dev);
+    uint64_t devt = device_devt(dev);
     for (size_t i = 0; i < KB_DRIVER_CORE_RECORD_MAX; i++) {
         if (device_records[i].active && device_records[i].dev == dev) {
             device_records[i].bus = bus;
+            device_records[i].class_ptr = class_ptr;
+            device_records[i].devt = devt;
+            const char *name = device_name(dev);
+            if (name != NULL) {
+                snprintf(device_records[i].name, sizeof(device_records[i].name), "%s", name);
+            }
             return &device_records[i];
         }
     }
@@ -228,6 +283,12 @@ static kb_device_record_t *record_device(void *dev)
             device_records[i].active = 1;
             device_records[i].dev = dev;
             device_records[i].bus = bus;
+            device_records[i].class_ptr = class_ptr;
+            device_records[i].devt = devt;
+            const char *name = device_name(dev);
+            if (name != NULL) {
+                snprintf(device_records[i].name, sizeof(device_records[i].name), "%s", name);
+            }
             return &device_records[i];
         }
     }
@@ -424,6 +485,190 @@ int kb_device_add(void *dev)
 int kb_device_register(void *dev)
 {
     return kb_device_add(dev);
+}
+
+static kb_device_record_t *find_device_record(void *dev)
+{
+    if (dev == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < KB_DRIVER_CORE_RECORD_MAX; i++) {
+        if (device_records[i].active && device_records[i].dev == dev) {
+            return &device_records[i];
+        }
+    }
+    return NULL;
+}
+
+static kb_device_record_t *find_device_record_by_class_devt(void *class_ptr, uint64_t devt)
+{
+    for (size_t i = 0; i < KB_DRIVER_CORE_RECORD_MAX; i++) {
+        if (device_records[i].active && device_records[i].class_ptr == class_ptr && device_records[i].devt == devt) {
+            return &device_records[i];
+        }
+    }
+    return NULL;
+}
+
+static void *device_create_common(
+    void *class_ptr,
+    void *parent,
+    uint64_t devt,
+    void *drvdata,
+    const void *groups,
+    const char *name)
+{
+    uint8_t *dev = calloc(1, KB_CREATED_DEVICE_BYTES);
+    if (dev == NULL) {
+        return (void *)(intptr_t)-12;
+    }
+
+    char *stored_name = NULL;
+    if (name != NULL) {
+        const size_t len = bounded_strlen(name, 95);
+        stored_name = malloc(len + 1u);
+        if (stored_name == NULL) {
+            free(dev);
+            return (void *)(intptr_t)-12;
+        }
+        memcpy(stored_name, name, len);
+        stored_name[len] = '\0';
+    }
+
+    write_ptr(dev, KB_LINUX_DEVICE_KOBJ_NAME_OFFSET, stored_name);
+    write_ptr(dev, KB_LINUX_6_8_DEVICE_PARENT_OFFSET, parent);
+    write_ptr(dev, KB_LINUX_6_8_DEVICE_DRIVER_DATA_OFFSET, drvdata);
+    write_u64(dev, KB_LINUX_6_8_DEVICE_DEVT_OFFSET, devt);
+    write_ptr(dev, KB_LINUX_6_8_DEVICE_CLASS_OFFSET, class_ptr);
+    write_ptr(dev, KB_LINUX_6_8_DEVICE_GROUPS_OFFSET, (void *)groups);
+
+    kb_device_record_t *record = record_device(dev);
+    if (record == NULL) {
+        free(stored_name);
+        free(dev);
+        return (void *)(intptr_t)-12;
+    }
+    record->allocated = 1;
+    if (stored_name != NULL) {
+        snprintf(record->name, sizeof(record->name), "%s", stored_name);
+    }
+
+    if (trace_device_enabled()) {
+        fprintf(stderr,
+            "kobox device: create dev=%p class=%p devt=0x%llx name=%s groups=%p\n",
+            (void *)dev,
+            class_ptr,
+            (unsigned long long)devt,
+            stored_name != NULL ? stored_name : "(null)",
+            groups);
+    }
+    return dev;
+}
+
+void *kb_device_create_with_groups(
+    void *class_ptr,
+    void *parent,
+    uint64_t devt,
+    void *drvdata,
+    const void *groups,
+    const char *fmt,
+    ...)
+{
+    char name[96];
+    name[0] = '\0';
+    if (fmt != NULL) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(name, sizeof(name), fmt, ap);
+        va_end(ap);
+    }
+    return device_create_common(class_ptr, parent, devt, drvdata, groups, name[0] != '\0' ? name : NULL);
+}
+
+void *kb_device_create(void *class_ptr, void *parent, uint64_t devt, void *drvdata, const char *fmt, ...)
+{
+    char name[96];
+    name[0] = '\0';
+    if (fmt != NULL) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(name, sizeof(name), fmt, ap);
+        va_end(ap);
+    }
+    return device_create_common(class_ptr, parent, devt, drvdata, NULL, name[0] != '\0' ? name : NULL);
+}
+
+void kb_device_del(void *dev)
+{
+    kb_device_record_t *record = find_device_record(dev);
+    if (record != NULL) {
+        record->active = 0;
+    }
+    if (trace_device_enabled()) {
+        fprintf(stderr, "kobox device: del dev=%p\n", dev);
+    }
+}
+
+void kb_device_destroy(void *class_ptr, uint64_t devt)
+{
+    kb_device_record_t *record = find_device_record_by_class_devt(class_ptr, devt);
+    if (record == NULL) {
+        return;
+    }
+    void *dev = record->dev;
+    void *name = read_ptr(dev, KB_LINUX_DEVICE_KOBJ_NAME_OFFSET);
+    if (record->allocated) {
+        free(name);
+        free(dev);
+    }
+    memset(record, 0, sizeof(*record));
+    if (trace_device_enabled()) {
+        fprintf(stderr, "kobox device: destroy class=%p devt=0x%llx\n", class_ptr, (unsigned long long)devt);
+    }
+}
+
+int kb_device_match_devt(void *dev, const void *data)
+{
+    uint32_t wanted32 = 0;
+    uint64_t wanted = 0;
+    if (data != NULL) {
+        memcpy(&wanted32, data, sizeof(wanted32));
+        wanted = wanted32;
+    }
+    return device_devt(dev) == wanted;
+}
+
+void *kb_class_find_device(void *class_ptr, void *start, const void *data, int (*match)(void *, const void *))
+{
+    int after_start = start == NULL;
+    for (size_t i = 0; i < KB_DRIVER_CORE_RECORD_MAX; i++) {
+        if (!device_records[i].active || device_records[i].class_ptr != class_ptr) {
+            continue;
+        }
+        if (!after_start) {
+            if (device_records[i].dev == start) {
+                after_start = 1;
+            }
+            continue;
+        }
+        if (match == NULL || match(device_records[i].dev, data)) {
+            if (trace_device_enabled()) {
+                fprintf(stderr,
+                    "kobox device: class_find_device class=%p dev=%p devt=0x%llx name=%s\n",
+                    class_ptr,
+                    device_records[i].dev,
+                    (unsigned long long)device_records[i].devt,
+                    device_records[i].name);
+            }
+            return device_records[i].dev;
+        }
+    }
+    return NULL;
+}
+
+void kb_put_device(void *dev)
+{
+    (void)dev;
 }
 
 int kb_driver_register(void *driver)

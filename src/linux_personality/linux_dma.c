@@ -11,6 +11,8 @@ enum {
     KB_LINUX_DMA_STRUCT_PAGE_SIZE = 64,
 };
 
+static const uintptr_t KB_LINUX_DMA_ENCODED_PAGE_TAG = (uintptr_t)1ull << 63;
+
 kb_device_backend_t *kb_shim_current_device_backend(void);
 
 static kb_dma_dir_t linux_dma_dir(int dir)
@@ -38,6 +40,70 @@ static int trace_dma_enabled(void)
     return value != NULL && value[0] != '\0' && value[0] != '0';
 }
 
+static int trace_dma_small_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_DMA_SMALL");
+    return value != NULL && value[0] != '\0' && value[0] != '0';
+}
+
+static void trace_dma_small_bytes(const char *op, const void *cpu_addr, size_t size, int dir, uint64_t dma_addr)
+{
+    if (!trace_dma_small_enabled() || cpu_addr == NULL || size == 0 || size > 16) {
+        return;
+    }
+    const uint8_t *bytes = (const uint8_t *)cpu_addr;
+    fprintf(stderr,
+        "kobox dma: %s small cpu=%p size=0x%zx dir=%d dma=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+        op,
+        cpu_addr,
+        size,
+        dir,
+        (unsigned long long)dma_addr,
+        size > 0 ? bytes[0] : 0,
+        size > 1 ? bytes[1] : 0,
+        size > 2 ? bytes[2] : 0,
+        size > 3 ? bytes[3] : 0,
+        size > 4 ? bytes[4] : 0,
+        size > 5 ? bytes[5] : 0,
+        size > 6 ? bytes[6] : 0,
+        size > 7 ? bytes[7] : 0);
+}
+
+static void trace_dma_from_device_head(const char *op, uint64_t dma_addr, size_t size, int dir)
+{
+    if (!trace_dma_small_enabled() || dir != 2 || size < 8) {
+        return;
+    }
+    size_t available = 0;
+    void *cpu_addr = kb_subsystem_dma_cpu_addr(dma_addr, &available);
+    if (cpu_addr == NULL || available < 8) {
+        fprintf(stderr,
+            "kobox dma: %s fromdev cpu-missing size=0x%zx dir=%d dma=0x%llx available=0x%zx\n",
+            op,
+            size,
+            dir,
+            (unsigned long long)dma_addr,
+            available);
+        return;
+    }
+    const uint8_t *bytes = (const uint8_t *)cpu_addr;
+    fprintf(stderr,
+        "kobox dma: %s fromdev cpu=%p size=0x%zx dir=%d dma=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+        op,
+        cpu_addr,
+        size,
+        dir,
+        (unsigned long long)dma_addr,
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7]);
+}
+
 static int linux_page_to_cpu_addr(void *page, unsigned long offset, void **out_addr)
 {
     if (page == NULL || out_addr == NULL) {
@@ -47,33 +113,21 @@ static int linux_page_to_cpu_addr(void *page, unsigned long offset, void **out_a
         return 0;
     }
 
-    uintptr_t vmemmap = kb_linux_kvm_vmemmap_base();
-    uintptr_t page_offset_base = kb_linux_kvm_page_offset_base();
-    uintptr_t phys_base = kb_linux_kvm_phys_base();
-    uintptr_t page_addr = (uintptr_t)page;
-    if (vmemmap != 0 && page_addr >= vmemmap) {
-        uint64_t page_index = (uint64_t)((page_addr - vmemmap) / KB_LINUX_DMA_STRUCT_PAGE_SIZE);
-        uint64_t dma_addr = (uint64_t)phys_base + (page_index * KB_LINUX_DMA_PAGE_SIZE) + (uint64_t)offset;
-        size_t available = 0;
-        void *mapped = kb_subsystem_dma_cpu_addr(dma_addr, &available);
-        if (mapped != NULL && available != 0) {
-            *out_addr = mapped;
-            return 1;
-        }
-        if (page_offset_base != 0) {
-            *out_addr = (void *)(page_offset_base + (uintptr_t)(page_index * KB_LINUX_DMA_PAGE_SIZE) + offset);
-            return 1;
-        }
-    }
-
     /*
-     * The 6.8 modules inline virt_to_page(). With the loader's zero-valued
-     * page_offset_base/vmemmap_base shim storage, the non-canonical userspace
-     * pointers used here encode as:
-     *   page = (virt >> 12) << 6
+     * The 6.8 modules inline virt_to_page() for non-KVM-arena allocations.
+     * The SG shim records those userspace pointers as:
+     *   page = TAG | ((virt >> 12) << 6)
      * Reverse that representation before handing memory to the backend.
+     *
+     * Real KVM page-record addresses are handled before this helper by
+     * kb_linux_kvm_page_payload_dma_addr(); the tag avoids address-range
+     * collisions between encoded userspace pointers and the KVM page arena.
      */
-    const uintptr_t encoded = (uintptr_t)page;
+    uintptr_t encoded = (uintptr_t)page;
+    if ((encoded & KB_LINUX_DMA_ENCODED_PAGE_TAG) == 0) {
+        return 0;
+    }
+    encoded &= ~KB_LINUX_DMA_ENCODED_PAGE_TAG;
     if ((encoded & 0x3fu) != 0) {
         return 0;
     }
@@ -122,12 +176,31 @@ uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size
         return 0;
     }
 
+    void *cpu_addr = NULL;
+    uint64_t direct_dma_addr = 0;
+    if (kb_linux_kvm_page_payload_dma_addr(page, offset, size, &cpu_addr, &direct_dma_addr)) {
+        trace_dma_small_bytes("map_page", cpu_addr, size, dir, direct_dma_addr);
+        if (trace_dma_small_enabled() && dir == 2 && size == KB_LINUX_DMA_PAGE_SIZE) {
+            fprintf(stderr,
+                "kobox dma: map_page fromdev page=%p offset=0x%lx cpu=%p size=0x%zx dir=%d dma=0x%llx vmemmap=0x%llx page_offset=0x%llx phys=0x%llx\n",
+                page,
+                offset,
+                cpu_addr,
+                size,
+                dir,
+                (unsigned long long)direct_dma_addr,
+                (unsigned long long)kb_linux_kvm_vmemmap_base(),
+                (unsigned long long)kb_linux_kvm_page_offset_base(),
+                (unsigned long long)kb_linux_kvm_phys_base());
+        }
+        return direct_dma_addr;
+    }
+
     kb_device_t *device = dma_device(dev);
     if (device == NULL) {
         return 0;
     }
 
-    void *cpu_addr = NULL;
     if (!linux_page_to_cpu_addr(page, offset, &cpu_addr)) {
         if (trace_dma_enabled()) {
             fprintf(stderr,
@@ -158,6 +231,33 @@ uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size
             (int)status,
             (unsigned long long)dma_addr);
     }
+    if ((status != KB_OK || dma_addr == 0) && trace_dma_enabled()) {
+        fprintf(stderr,
+            "kobox dma: map_page failed-or-zero page=%p offset=0x%lx cpu=%p size=0x%zx dir=%d status=%d dma=0x%llx\n",
+            page,
+            offset,
+            cpu_addr,
+            size,
+            dir,
+            (int)status,
+            (unsigned long long)dma_addr);
+    }
+    if (status == KB_OK) {
+        trace_dma_small_bytes("map_page", cpu_addr, size, dir, dma_addr);
+        if (trace_dma_small_enabled() && dir == 2 && size == KB_LINUX_DMA_PAGE_SIZE) {
+            fprintf(stderr,
+                "kobox dma: map_page fromdev page=%p offset=0x%lx cpu=%p size=0x%zx dir=%d dma=0x%llx vmemmap=0x%llx page_offset=0x%llx phys=0x%llx\n",
+                page,
+                offset,
+                cpu_addr,
+                size,
+                dir,
+                (unsigned long long)dma_addr,
+                (unsigned long long)kb_linux_kvm_vmemmap_base(),
+                (unsigned long long)kb_linux_kvm_page_offset_base(),
+                (unsigned long long)kb_linux_kvm_phys_base());
+        }
+    }
     return status == KB_OK ? dma_addr : 0;
 }
 
@@ -166,6 +266,20 @@ uint64_t kb_dma_map_single_attrs(void *dev, void *ptr, size_t size, int dir, uns
     (void)attrs;
     if (ptr == NULL || size == 0) {
         return 0;
+    }
+
+    uint64_t direct_dma_addr = 0;
+    if (kb_linux_kvm_payload_dma_addr(ptr, size, &direct_dma_addr)) {
+        trace_dma_small_bytes("map_single", ptr, size, dir, direct_dma_addr);
+        if (trace_dma_small_enabled() && dir == 2 && size == KB_LINUX_DMA_PAGE_SIZE) {
+            fprintf(stderr,
+                "kobox dma: map_single fromdev cpu=%p size=0x%zx dir=%d dma=0x%llx\n",
+                ptr,
+                size,
+                dir,
+                (unsigned long long)direct_dma_addr);
+        }
+        return direct_dma_addr;
     }
 
     kb_device_t *device = dma_device(dev);
@@ -190,6 +304,17 @@ uint64_t kb_dma_map_single_attrs(void *dev, void *ptr, size_t size, int dir, uns
             (int)status,
             (unsigned long long)dma_addr);
     }
+    if (status == KB_OK) {
+        trace_dma_small_bytes("map_single", ptr, size, dir, dma_addr);
+        if (trace_dma_small_enabled() && dir == 2 && size == KB_LINUX_DMA_PAGE_SIZE) {
+            fprintf(stderr,
+                "kobox dma: map_single fromdev cpu=%p size=0x%zx dir=%d dma=0x%llx\n",
+                ptr,
+                size,
+                dir,
+                (unsigned long long)dma_addr);
+        }
+    }
     return status == KB_OK ? dma_addr : 0;
 }
 
@@ -200,6 +325,10 @@ void kb_dma_unmap_page_attrs(void *dev, uint64_t dma_addr, size_t size, int dir,
         return;
     }
 
+    trace_dma_from_device_head("unmap_page", dma_addr, size, dir);
+    if (kb_linux_kvm_dma_addr_in_payload_arena(dma_addr, size)) {
+        return;
+    }
     kb_subsystem_dma_unmap(kb_shim_current_device_backend(), dma_device(dev), dma_addr, size, linux_dma_dir(dir));
 }
 
@@ -211,7 +340,20 @@ void kb_dma_unmap_single_attrs(void *dev, uint64_t dma_addr, size_t size, int di
 int kb_dma_mapping_error(void *dev, uint64_t dma_addr)
 {
     (void)dev;
+    if (dma_addr == 0) {
+        return 1;
+    }
+    if (kb_linux_kvm_dma_addr_in_payload_arena(dma_addr, 1)) {
+        return 0;
+    }
     return kb_subsystem_dma_mapping_error(dma_addr);
+}
+
+int kb_dma_need_sync(void *dev, uint64_t dma_addr)
+{
+    (void)dev;
+    (void)dma_addr;
+    return 0;
 }
 
 size_t kb_dma_max_mapping_size(void *dev)

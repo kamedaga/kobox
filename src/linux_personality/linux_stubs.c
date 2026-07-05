@@ -1,4 +1,5 @@
 #include "kobox/shim.h"
+#include "loader/module_context.h"
 #include "linux_subsystem/kvm/kvm_symbols.h"
 
 #include <stdarg.h>
@@ -14,6 +15,10 @@
 enum {
     KB_STUB_PAGE_SIZE = 4096,
     KB_STUB_STRUCT_PAGE_SIZE = 64,
+    KB_STUB_TASK_FLAGS_OFFSET = 0x0,
+    KB_STUB_TASK_COMM_OFFSET = 0xbd8,
+    KB_STUB_TASK_COMM_LEN = 16,
+    KB_STUB_TIF_SIGPENDING_BIT = 2,
 };
 
 typedef struct kb_ida_record {
@@ -39,11 +44,85 @@ typedef struct kb_jbd2_journal_record {
     struct kb_jbd2_journal_record *next;
 } kb_jbd2_journal_record_t;
 
+typedef struct kb_pending_pgrp_signal {
+    void *pgrp;
+    int sig;
+    int priv;
+    uint64_t sequence;
+} kb_pending_pgrp_signal_t;
+
+typedef struct kb_pending_task_signal {
+    void *task;
+    void *info;
+    int sig;
+    int type;
+    uint64_t sequence;
+} kb_pending_task_signal_t;
+
+typedef struct kb_stub_pid {
+    int count;
+    unsigned int level;
+    int nr;
+    void *task;
+} kb_stub_pid_t;
+
+typedef struct kb_sysctl_registration {
+    char path[96];
+    const char *table_name;
+    void *table;
+    size_t table_size;
+    uint64_t sequence;
+    struct kb_sysctl_registration *next;
+} kb_sysctl_registration_t;
+
 static kb_ida_record_t *ida_records;
 static kb_kthread_record_t *kthread_records;
 static kb_jbd2_journal_record_t *jbd2_journal_records;
+static kb_sysctl_registration_t *sysctl_registrations;
+static kb_pending_pgrp_signal_t pending_pgrp_signals[64];
+static kb_pending_task_signal_t pending_task_signals[64];
+static kb_stub_pid_t stub_pids[64];
+static uint64_t sysctl_registration_sequence;
+static uint64_t pending_pgrp_signal_sequence;
+static uint64_t pending_task_signal_sequence;
+
+static size_t pending_pgrp_signal_count(void)
+{
+    return sizeof(pending_pgrp_signals) / sizeof(pending_pgrp_signals[0]);
+}
+
+static size_t pending_task_signal_count(void)
+{
+    return sizeof(pending_task_signals) / sizeof(pending_task_signals[0]);
+}
 
 static int crypto_trace_enabled(void);
+
+static void kb_mark_task_signal_pending(void *task)
+{
+    if (task == NULL) {
+        task = kb_loader_module_current_task(kb_loader_active_module());
+    }
+    if (task == NULL) {
+        return;
+    }
+    unsigned long flags = 0;
+    memcpy(&flags, (const uint8_t *)task + KB_STUB_TASK_FLAGS_OFFSET, sizeof(flags));
+    flags |= 1ul << KB_STUB_TIF_SIGPENDING_BIT;
+    memcpy((uint8_t *)task + KB_STUB_TASK_FLAGS_OFFSET, &flags, sizeof(flags));
+}
+
+void kb_clear_current_signal_pending(void)
+{
+    void *task = kb_loader_module_current_task(kb_loader_active_module());
+    if (task == NULL) {
+        return;
+    }
+    unsigned long flags = 0;
+    memcpy(&flags, (const uint8_t *)task + KB_STUB_TASK_FLAGS_OFFSET, sizeof(flags));
+    flags &= ~(1ul << KB_STUB_TIF_SIGPENDING_BIT);
+    memcpy((uint8_t *)task + KB_STUB_TASK_FLAGS_OFFSET, &flags, sizeof(flags));
+}
 
 static int trace_dma_enabled(void)
 {
@@ -84,10 +163,100 @@ enum {
     KB_JBD2_JOURNAL_TASK_OFFSET = 0x440,
     KB_PERCPU_COUNTER_STRIDE = 0x28,
     KB_PERCPU_COUNTER_COUNT_OFFSET = 0x8,
+    KB_KFIFO_IN_OFFSET = 0,
+    KB_KFIFO_OUT_OFFSET = 4,
+    KB_KFIFO_MASK_OFFSET = 8,
+    KB_KFIFO_ESIZE_OFFSET = 12,
+    KB_KFIFO_DATA_OFFSET = 16,
 };
 
 void kb_noop_stub(void)
 {
+}
+
+const int kb_sysctl_vals[] = {0, 1, 2, 3, 4, 100, 200, 1000, 3000, INT32_MAX, 65535, -1};
+
+static int sysctl_trace_enabled(void)
+{
+    const char *value = getenv("KOBOX_TRACE_SYSCTL");
+    return value != NULL && value[0] != '\0' && value[0] != '0';
+}
+
+static void *register_sysctl_common(const char *path, void *table, const char *table_name, size_t table_size)
+{
+    kb_sysctl_registration_t *registration = calloc(1, sizeof(*registration));
+    if (registration == NULL) {
+        return NULL;
+    }
+    if (path != NULL) {
+        snprintf(registration->path, sizeof(registration->path), "%s", path);
+    }
+    registration->table_name = table_name;
+    registration->table = table;
+    registration->table_size = table_size;
+    registration->sequence = ++sysctl_registration_sequence;
+    registration->next = sysctl_registrations;
+    sysctl_registrations = registration;
+    if (sysctl_trace_enabled()) {
+        fprintf(stderr,
+            "kobox-sysctl: register path=%s table=%p name=%s size=%zu seq=%llu\n",
+            registration->path,
+            table,
+            table_name != NULL ? table_name : "",
+            table_size,
+            (unsigned long long)registration->sequence);
+    }
+    return registration;
+}
+
+void *kb_register_sysctl_init(const char *path, void *table, const char *table_name, size_t table_size)
+{
+    return register_sysctl_common(path, table, table_name, table_size);
+}
+
+void *kb_register_sysctl_sz(const char *path, void *table, size_t table_size)
+{
+    return register_sysctl_common(path, table, NULL, table_size);
+}
+
+void kb_unregister_sysctl_table(void *header)
+{
+    kb_sysctl_registration_t **cursor = &sysctl_registrations;
+    while (*cursor != NULL) {
+        if (*cursor == header) {
+            kb_sysctl_registration_t *dead = *cursor;
+            *cursor = dead->next;
+            if (sysctl_trace_enabled()) {
+                fprintf(stderr,
+                    "kobox-sysctl: unregister path=%s seq=%llu\n",
+                    dead->path,
+                    (unsigned long long)dead->sequence);
+            }
+            free(dead);
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
+int kb_proc_dointvec(void *table, int write, void *buffer, size_t *lenp, long long *ppos)
+{
+    (void)table;
+    (void)write;
+    (void)buffer;
+    (void)lenp;
+    (void)ppos;
+    return 0;
+}
+
+int kb_proc_dointvec_minmax(void *table, int write, void *buffer, size_t *lenp, long long *ppos)
+{
+    return kb_proc_dointvec(table, write, buffer, lenp, ppos);
+}
+
+int kb_proc_dobool(void *table, int write, void *buffer, size_t *lenp, long long *ppos)
+{
+    return kb_proc_dointvec(table, write, buffer, lenp, ppos);
 }
 
 #if defined(__x86_64__) && !defined(_MSC_VER)
@@ -109,6 +278,355 @@ int kb_return_zero(void)
 int kb_return_one(void)
 {
     return 1;
+}
+
+char *kb_get_task_comm(char *buf, size_t buf_size, void *task)
+{
+    if (buf == NULL || buf_size == 0) {
+        return buf;
+    }
+
+    memset(buf, 0, buf_size);
+    if (task == NULL) {
+        task = kb_loader_module_current_task(kb_loader_active_module());
+    }
+
+    const char *comm = "kobox";
+    if (task != NULL) {
+        comm = (const char *)((const unsigned char *)task + KB_STUB_TASK_COMM_OFFSET);
+    }
+
+    size_t limit = buf_size - 1u;
+    if (limit > KB_STUB_TASK_COMM_LEN) {
+        limit = KB_STUB_TASK_COMM_LEN;
+    }
+    size_t i = 0;
+    while (i < limit && comm[i] != '\0') {
+        buf[i] = comm[i];
+        i++;
+    }
+    return buf;
+}
+
+int kb_kill_pgrp(void *pgrp, int sig, int priv)
+{
+    if (sig < 0 || sig > 64) {
+        return -22;
+    }
+
+    const uint64_t sequence = ++pending_pgrp_signal_sequence;
+    pending_pgrp_signals[sequence % pending_pgrp_signal_count()] =
+        (kb_pending_pgrp_signal_t){
+            .pgrp = pgrp,
+            .sig = sig,
+            .priv = priv,
+            .sequence = sequence,
+        };
+    kb_stub_pid_t *record = (kb_stub_pid_t *)pgrp;
+    kb_mark_task_signal_pending(record != NULL ? record->task : NULL);
+
+    const char *trace = getenv("KOBOX_TRACE_TTY_SIGNALS");
+    if (trace != NULL && trace[0] != '\0' && trace[0] != '0') {
+        fprintf(stderr,
+            "kobox tty: kill_pgrp pgrp=%p sig=%d priv=%d seq=%llu\n",
+            pgrp,
+            sig,
+            priv,
+            (unsigned long long)sequence);
+    }
+
+    return 0;
+}
+
+static int kb_record_task_signal(const char *source, int sig, void *info, void *task, int type)
+{
+    if (sig < 0 || sig > 64) {
+        return -22;
+    }
+
+    const uint64_t sequence = ++pending_task_signal_sequence;
+    pending_task_signals[sequence % pending_task_signal_count()] =
+        (kb_pending_task_signal_t){
+            .task = task,
+            .info = info,
+            .sig = sig,
+            .type = type,
+            .sequence = sequence,
+        };
+    kb_mark_task_signal_pending(task);
+
+    const char *trace = getenv("KOBOX_TRACE_TTY_SIGNALS");
+    if (trace != NULL && trace[0] != '\0' && trace[0] != '0') {
+        fprintf(stderr,
+            "kobox tty: %s task=%p sig=%d type=%d info=%p seq=%llu\n",
+            source,
+            task,
+            sig,
+            type,
+            info,
+            (unsigned long long)sequence);
+    }
+
+    return 0;
+}
+
+int kb_group_send_sig_info(int sig, void *info, void *task, int type)
+{
+    return kb_record_task_signal("group_send_sig_info", sig, info, task, type);
+}
+
+int kb_send_signal_locked(int sig, void *info, void *task, int type)
+{
+    return kb_record_task_signal("send_signal_locked", sig, info, task, type);
+}
+
+int kb_llist_add_batch(void *new_first, void *new_last, void *head)
+{
+    if (new_first == NULL || new_last == NULL || head == NULL) {
+        return 0;
+    }
+    void *old_first = NULL;
+    memcpy(&old_first, head, sizeof(old_first));
+    memcpy(new_last, &old_first, sizeof(old_first));
+    memcpy(head, &new_first, sizeof(new_first));
+    return old_first == NULL;
+}
+
+void *kb_llist_del_first(void *head)
+{
+    if (head == NULL) {
+        return NULL;
+    }
+    void *entry = NULL;
+    memcpy(&entry, head, sizeof(entry));
+    if (entry == NULL) {
+        return NULL;
+    }
+    void *next = NULL;
+    memcpy(&next, entry, sizeof(next));
+    memcpy(head, &next, sizeof(next));
+    return entry;
+}
+
+static unsigned int kb_pow2_floor_u32(unsigned int value)
+{
+    if (value == 0) {
+        return 0;
+    }
+    unsigned int power = 1;
+    while (power <= value / 2u) {
+        power <<= 1u;
+    }
+    return power;
+}
+
+static void kb_kfifo_load(void *fifo, unsigned int *in, unsigned int *out, unsigned int *mask, unsigned int *esize, void **data)
+{
+    memcpy(in, (const uint8_t *)fifo + KB_KFIFO_IN_OFFSET, sizeof(*in));
+    memcpy(out, (const uint8_t *)fifo + KB_KFIFO_OUT_OFFSET, sizeof(*out));
+    memcpy(mask, (const uint8_t *)fifo + KB_KFIFO_MASK_OFFSET, sizeof(*mask));
+    memcpy(esize, (const uint8_t *)fifo + KB_KFIFO_ESIZE_OFFSET, sizeof(*esize));
+    memcpy(data, (const uint8_t *)fifo + KB_KFIFO_DATA_OFFSET, sizeof(*data));
+}
+
+int kb_kfifo_init(void *fifo, void *buffer, unsigned int size, size_t esize)
+{
+    if (fifo == NULL || buffer == NULL || esize == 0 || esize > UINT32_MAX) {
+        return -22;
+    }
+    unsigned int elements = size / (unsigned int)esize;
+    elements = kb_pow2_floor_u32(elements);
+    unsigned int in = 0;
+    unsigned int out = 0;
+    unsigned int mask = elements < 2 ? 0 : elements - 1u;
+    unsigned int esize32 = (unsigned int)esize;
+    memcpy((uint8_t *)fifo + KB_KFIFO_IN_OFFSET, &in, sizeof(in));
+    memcpy((uint8_t *)fifo + KB_KFIFO_OUT_OFFSET, &out, sizeof(out));
+    memcpy((uint8_t *)fifo + KB_KFIFO_MASK_OFFSET, &mask, sizeof(mask));
+    memcpy((uint8_t *)fifo + KB_KFIFO_ESIZE_OFFSET, &esize32, sizeof(esize32));
+    memcpy((uint8_t *)fifo + KB_KFIFO_DATA_OFFSET, &buffer, sizeof(buffer));
+    return elements < 2 ? -22 : 0;
+}
+
+unsigned int kb_kfifo_in(void *fifo, const void *buffer, unsigned int len)
+{
+    if (fifo == NULL || buffer == NULL) {
+        return 0;
+    }
+    unsigned int in = 0;
+    unsigned int out = 0;
+    unsigned int mask = 0;
+    unsigned int esize = 0;
+    void *data = NULL;
+    kb_kfifo_load(fifo, &in, &out, &mask, &esize, &data);
+    if (data == NULL || esize == 0 || mask == 0) {
+        return 0;
+    }
+    unsigned int size = mask + 1u;
+    unsigned int unused = size - (in - out);
+    if (len > unused) {
+        len = unused;
+    }
+    unsigned int off = in & mask;
+    unsigned int first = size - off;
+    if (first > len) {
+        first = len;
+    }
+    memcpy((uint8_t *)data + (off * esize), buffer, (size_t)first * esize);
+    memcpy(data, (const uint8_t *)buffer + ((size_t)first * esize), (size_t)(len - first) * esize);
+    in += len;
+    memcpy((uint8_t *)fifo + KB_KFIFO_IN_OFFSET, &in, sizeof(in));
+    return len;
+}
+
+unsigned int kb_kfifo_out(void *fifo, void *buffer, unsigned int len)
+{
+    if (fifo == NULL || buffer == NULL) {
+        return 0;
+    }
+    unsigned int in = 0;
+    unsigned int out = 0;
+    unsigned int mask = 0;
+    unsigned int esize = 0;
+    void *data = NULL;
+    kb_kfifo_load(fifo, &in, &out, &mask, &esize, &data);
+    if (data == NULL || esize == 0 || mask == 0) {
+        return 0;
+    }
+    unsigned int available = in - out;
+    if (len > available) {
+        len = available;
+    }
+    unsigned int size = mask + 1u;
+    unsigned int off = out & mask;
+    unsigned int first = size - off;
+    if (first > len) {
+        first = len;
+    }
+    memcpy(buffer, (const uint8_t *)data + (off * esize), (size_t)first * esize);
+    memcpy((uint8_t *)buffer + ((size_t)first * esize), data, (size_t)(len - first) * esize);
+    out += len;
+    memcpy((uint8_t *)fifo + KB_KFIFO_OUT_OFFSET, &out, sizeof(out));
+    return len;
+}
+
+int kb_kfifo_to_user(void *fifo, void *to, unsigned int len, unsigned int *copied)
+{
+    unsigned int done = kb_kfifo_out(fifo, to, len);
+    if (copied != NULL) {
+        *copied = done;
+    }
+    return done == len ? 0 : -14;
+}
+
+void kb_kfifo_free(void *fifo)
+{
+    if (fifo == NULL) {
+        return;
+    }
+    unsigned int zero = 0;
+    void *data = NULL;
+    memcpy(&data, (const uint8_t *)fifo + KB_KFIFO_DATA_OFFSET, sizeof(data));
+    kb_kfree(data);
+    data = NULL;
+    memcpy((uint8_t *)fifo + KB_KFIFO_IN_OFFSET, &zero, sizeof(zero));
+    memcpy((uint8_t *)fifo + KB_KFIFO_OUT_OFFSET, &zero, sizeof(zero));
+    memcpy((uint8_t *)fifo + KB_KFIFO_MASK_OFFSET, &zero, sizeof(zero));
+    memcpy((uint8_t *)fifo + KB_KFIFO_ESIZE_OFFSET, &zero, sizeof(zero));
+    memcpy((uint8_t *)fifo + KB_KFIFO_DATA_OFFSET, &data, sizeof(data));
+}
+
+void *kb_find_vpid(int nr)
+{
+    if (nr <= 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(stub_pids) / sizeof(stub_pids[0]); i++) {
+        if (stub_pids[i].nr == nr) {
+            if (stub_pids[i].task == NULL) {
+                stub_pids[i].task = kb_loader_module_current_task(kb_loader_active_module());
+            }
+            return &stub_pids[i];
+        }
+    }
+    for (size_t i = 0; i < sizeof(stub_pids) / sizeof(stub_pids[0]); i++) {
+        if (stub_pids[i].nr == 0) {
+            stub_pids[i] = (kb_stub_pid_t){
+                .count = 1,
+                .level = 0,
+                .nr = nr,
+                .task = kb_loader_module_current_task(kb_loader_active_module()),
+            };
+            return &stub_pids[i];
+        }
+    }
+    return NULL;
+}
+
+void *kb_pid_task(void *pid, int type)
+{
+    (void)type;
+    kb_stub_pid_t *record = (kb_stub_pid_t *)pid;
+    if (record == NULL) {
+        return NULL;
+    }
+    if (record->task != NULL) {
+        return record->task;
+    }
+    return kb_loader_module_current_task(kb_loader_active_module());
+}
+
+int kb_pid_vnr(void *pid)
+{
+    kb_stub_pid_t *record = (kb_stub_pid_t *)pid;
+    return record == NULL ? 0 : record->nr;
+}
+
+typedef struct kb_substring {
+    char *from;
+    char *to;
+} kb_substring_t;
+
+static int kb_parse_substring_int(const void *substring, int base, int *result)
+{
+    if (substring == NULL || result == NULL) {
+        return -22;
+    }
+    const kb_substring_t *span = (const kb_substring_t *)substring;
+    if (span->from == NULL || span->to == NULL || span->to < span->from) {
+        return -22;
+    }
+    size_t len = (size_t)(span->to - span->from);
+    if (len >= 64) {
+        return -22;
+    }
+    char buffer[64];
+    memcpy(buffer, span->from, len);
+    buffer[len] = '\0';
+    char *end = NULL;
+    long value = strtol(buffer, &end, base);
+    if (end == buffer || *end != '\0') {
+        return -22;
+    }
+    *result = (int)value;
+    return 0;
+}
+
+int kb_match_token(char *string, const void *table, void *args)
+{
+    (void)table;
+    (void)args;
+    return string == NULL || string[0] == '\0' ? 0 : -1;
+}
+
+int kb_match_int(const void *substring, int *result)
+{
+    return kb_parse_substring_int(substring, 10, result);
+}
+
+int kb_match_octal(const void *substring, int *result)
+{
+    return kb_parse_substring_int(substring, 8, result);
 }
 
 int64_t kb_ktime_get_real_seconds(void)
@@ -856,8 +1374,7 @@ void *kb_alloc_pages_exact(size_t size, unsigned int flags)
 
 void kb_free_pages_exact(void *virt, size_t size)
 {
-    (void)size;
-    kb_kfree(virt);
+    kb_kvm_free_pages_exact(virt, size);
 }
 
 int kb_alloc_cpumask_var(void *mask_out, unsigned int flags)

@@ -16,6 +16,7 @@ enum {
     KB_FS_TYPE_MAX = 64,
     KB_FS_MOUNT_MAX = 64,
     KB_FS_FILE_MAX = 256,
+    KB_FS_DEVPTS_DENTRY_MAX = 256,
     KB_FS_FILEMAP_FOLIO_CACHE_MAX = 512,
     KB_FS_CONTEXT_BYTES = 512,
     KB_FS_SUPER_BLOCK_BYTES = 2048,
@@ -69,6 +70,7 @@ enum {
     KB_FS_INODE_MAPPING_OFFSET = 0x30,
     KB_FS_INODE_NUMBER_OFFSET = 0x40,
     KB_FS_INODE_NLINK_OFFSET = 0x48,
+    KB_FS_INODE_RDEV_OFFSET = 0x4c,
     KB_FS_INODE_SIZE_OFFSET = 0x50,
     KB_FS_INODE_ATIME_SEC_OFFSET = 0x58,
     KB_FS_INODE_MTIME_SEC_OFFSET = 0x60,
@@ -105,9 +107,20 @@ enum {
     KB_FS_DENTRY_QSTR_OFFSET = 0x20,
     KB_FS_DENTRY_INODE_OFFSET = 0x30,
     KB_FS_DENTRY_INODE_COMPAT_OFFSET = 0x30,
-    KB_FS_DENTRY_SB_OFFSET = 0x68,
+    KB_FS_DENTRY_SB_OFFSET = 0x70,
+    KB_FS_DENTRY_FLAGS_OFFSET = 0x0,
+    KB_FS_DENTRY_ENTRY_TYPE_MASK = 7u << 20,
+    KB_FS_DENTRY_DIRECTORY_TYPE = 2u << 20,
+    KB_FS_DENTRY_REGULAR_TYPE = 4u << 20,
     KB_FS_QSTR_HASH_LEN_OFFSET = 0x0,
     KB_FS_QSTR_NAME_OFFSET = 0x8,
+    KB_FS_PATH_MNT_OFFSET = 0x0,
+    KB_FS_PATH_DENTRY_OFFSET = 0x8,
+    KB_FS_VFSMOUNT_ROOT_OFFSET = 0x0,
+    KB_FS_VFSMOUNT_SB_OFFSET = 0x8,
+    KB_FS_DEVPTS_SUPER_MAGIC_OFFSET = 0x60,
+    KB_FS_DEVPTS_SUPER_ROOT_OFFSET = 0x68,
+    KB_FS_DEVPTS_SUPER_MAGIC = 0x1cd1,
     KB_FS_FILE_MAPPING_OFFSET = 0x20,
     KB_FS_FILE_INODE_OFFSET = 0x28,
     KB_FS_KIOCB_FILE_OFFSET = 0x0,
@@ -265,6 +278,8 @@ static kb_fs_file_record_t fs_files[KB_FS_FILE_MAX];
 unsigned char kb_fs_subsystem_blockdev_superblock[KB_FS_SUPER_BLOCK_BYTES];
 static uint64_t next_mount_handle = 1;
 static kb_fs_mount_path_probe_t last_mount_path_probe;
+static uint8_t last_nodev_vfsmount[32];
+static void *devpts_index_dentries[KB_FS_DEVPTS_DENTRY_MAX];
 static kb_fs_block_device_t *mount_probe_block_device;
 static kb_fs_bdev_binding_t active_bdev_binding;
 static void *mount_probe_super_block;
@@ -745,6 +760,12 @@ static int low_or_err_pointer(const void *ptr)
     return ptr == NULL || value < 4096u || value >= UINTPTR_MAX - 4095u;
 }
 
+static void *fs_err_ptr(int status)
+{
+    int err = status < 0 ? status : -status;
+    return (void *)(intptr_t)err;
+}
+
 static int fs_trace_enabled(void)
 {
     const char *value = getenv("KOBOX_TRACE_FS");
@@ -822,6 +843,44 @@ static void kb_fs_prepare_dentry_name(void *dentry, const char *name)
     write_pointer_field((uint8_t *)dentry + KB_FS_DENTRY_QSTR_OFFSET, KB_FS_QSTR_NAME_OFFSET, (void *)name);
 }
 
+static uint32_t kb_fs_dentry_type_for_inode(void *inode)
+{
+    if (low_or_err_pointer(inode)) {
+        return 0;
+    }
+    uint32_t mode = 0;
+    memcpy(&mode, (const uint8_t *)inode + KB_FS_INODE_MODE_OFFSET, sizeof(mode));
+    return (mode & 0170000u) == 0040000u ?
+        KB_FS_DENTRY_DIRECTORY_TYPE :
+        KB_FS_DENTRY_REGULAR_TYPE;
+}
+
+static void kb_fs_set_dentry_entry_type(void *dentry, void *inode)
+{
+    if (dentry == NULL) {
+        return;
+    }
+    uint32_t flags = 0;
+    memcpy(&flags, (const uint8_t *)dentry + KB_FS_DENTRY_FLAGS_OFFSET, sizeof(flags));
+    flags &= ~KB_FS_DENTRY_ENTRY_TYPE_MASK;
+    flags |= kb_fs_dentry_type_for_inode(inode);
+    memcpy((uint8_t *)dentry + KB_FS_DENTRY_FLAGS_OFFSET, &flags, sizeof(flags));
+}
+
+static int kb_fs_inode_is_devpts(void *inode)
+{
+    if (low_or_err_pointer(inode)) {
+        return 0;
+    }
+    void *super_block = read_pointer_field(inode, KB_FS_INODE_SB_OFFSET);
+    if (super_block == NULL) {
+        return 0;
+    }
+    uint64_t magic = 0;
+    memcpy(&magic, (const uint8_t *)super_block + KB_FS_DEVPTS_SUPER_MAGIC_OFFSET, sizeof(magic));
+    return magic == KB_FS_DEVPTS_SUPER_MAGIC;
+}
+
 static void kb_fs_prepare_named_dentry(
     void *dentry,
     void *parent,
@@ -838,6 +897,7 @@ static void kb_fs_prepare_named_dentry(
     kb_fs_prepare_dentry_name(dentry, name);
     if (!low_or_err_pointer(inode)) {
         write_pointer_field(dentry, KB_FS_DENTRY_INODE_OFFSET, inode);
+        kb_fs_set_dentry_entry_type(dentry, inode);
     }
 }
 
@@ -1982,6 +2042,39 @@ int kb_fs_subsystem_unregister_filesystem(void *fs_type)
     return 0;
 }
 
+void *kb_fs_subsystem_mount_registered(const char *name, int flags, const char *dev_name, void *data)
+{
+    kb_fs_type_record_t *record = find_fs_type_by_name(name);
+    if (record == NULL || !record->active || record->fs_type == NULL) {
+        return fs_err_ptr(-19);
+    }
+    void *mount_fn = read_pointer_field(record->fs_type, 0x20);
+    if (mount_fn == NULL) {
+        return fs_err_ptr(-95);
+    }
+
+    typedef void *(*kb_fs_mount_fn_t)(void *, int, const char *, void *);
+    unsigned long old_gs = 0;
+    int has_context = record->owner_module != NULL &&
+        kb_loader_enter_module_context(record->owner_module, &old_gs) == KB_OK;
+    void *root = ((kb_fs_mount_fn_t)mount_fn)(
+        record->fs_type,
+        flags,
+        dev_name == NULL ? name : dev_name,
+        data);
+    if (has_context) {
+        kb_loader_leave_module_context(old_gs);
+    }
+    if (fs_trace_enabled()) {
+        fprintf(stderr,
+            "kobox-fs: mount_registered name=%s root=%p owner=%p\n",
+            name == NULL ? "(null)" : name,
+            root,
+            (void *)record->owner_module);
+    }
+    return root;
+}
+
 int kb_fs_block_device_create(const kb_fs_block_device_desc_t *desc, kb_fs_block_device_t **out_device)
 {
     if (desc == NULL || out_device == NULL || desc->read == NULL) {
@@ -2979,6 +3072,23 @@ int kb_fs_subsystem_inode_init_owner(void *idmap, void *inode, void *dir, unsign
     return 0;
 }
 
+void kb_fs_subsystem_init_special_inode(void *inode, unsigned int mode, unsigned int rdev)
+{
+    if (low_or_err_pointer(inode)) {
+        return;
+    }
+    write_u32_field(inode, KB_FS_INODE_MODE_OFFSET, mode);
+    write_u32_field(inode, KB_FS_INODE_RDEV_OFFSET, rdev);
+    write_u32_field(inode, KB_FS_INODE_NLINK_OFFSET, 1);
+    if (fs_trace_enabled() || kb_fs_inode_is_devpts(inode)) {
+        fprintf(stderr,
+            "kobox-fs: init_special_inode inode=%p mode=0%o rdev=%u\n",
+            inode,
+            mode,
+            rdev);
+    }
+}
+
 void *kb_fs_subsystem_d_make_root(void *inode)
 {
     if (low_or_err_pointer(inode)) {
@@ -3010,6 +3120,119 @@ void *kb_fs_subsystem_d_make_root(void *inode)
     return dentry;
 }
 
+void *kb_fs_subsystem_mount_nodev(void *fs_type, int flags, void *data, int (*fill_super)(void *, void *, int))
+{
+    (void)fs_type;
+    if (fill_super == NULL) {
+        return fs_err_ptr(-22);
+    }
+    void *super_block = calloc(1, KB_FS_SUPER_BLOCK_BYTES);
+    if (super_block == NULL) {
+        return fs_err_ptr(-12);
+    }
+    last_mount_path_probe.root_dentry = NULL;
+    last_mount_path_probe.root_inode = NULL;
+    memset(devpts_index_dentries, 0, sizeof(devpts_index_dentries));
+    int status = fill_super(super_block, data, (flags & 0x8000) ? 1 : 0);
+    if (status != 0) {
+        free(super_block);
+        return fs_err_ptr(status);
+    }
+    if (last_mount_path_probe.root_dentry == NULL) {
+        free(super_block);
+        return fs_err_ptr(-2);
+    }
+    last_mount_path_probe.super_block = super_block;
+    write_u64_field(super_block, KB_FS_DEVPTS_SUPER_MAGIC_OFFSET, KB_FS_DEVPTS_SUPER_MAGIC);
+    write_pointer_field(super_block, KB_FS_DEVPTS_SUPER_ROOT_OFFSET, last_mount_path_probe.root_dentry);
+    write_pointer_field(last_mount_path_probe.root_dentry, KB_FS_DENTRY_SB_OFFSET, super_block);
+    write_pointer_field(last_nodev_vfsmount, KB_FS_VFSMOUNT_ROOT_OFFSET, last_mount_path_probe.root_dentry);
+    write_pointer_field(last_nodev_vfsmount, KB_FS_VFSMOUNT_SB_OFFSET, super_block);
+    if (fs_trace_enabled()) {
+        fprintf(stderr,
+            "kobox-fs: mount_nodev super=%p root=%p inode=%p\n",
+            super_block,
+            last_mount_path_probe.root_dentry,
+            last_mount_path_probe.root_inode);
+    }
+    return last_mount_path_probe.root_dentry;
+}
+
+int kb_fs_subsystem_path_pts(void *path)
+{
+    if (path == NULL || last_mount_path_probe.root_dentry == NULL || last_mount_path_probe.super_block == NULL) {
+        return -2;
+    }
+
+    write_pointer_field(path, KB_FS_PATH_MNT_OFFSET, last_nodev_vfsmount);
+    write_pointer_field(path, KB_FS_PATH_DENTRY_OFFSET, last_mount_path_probe.root_dentry);
+    if (fs_trace_enabled()) {
+        fprintf(stderr,
+            "kobox-fs: path_pts path=%p mnt=%p root=%p super=%p\n",
+            path,
+            (void *)last_nodev_vfsmount,
+            last_mount_path_probe.root_dentry,
+            last_mount_path_probe.super_block);
+    }
+    return 0;
+}
+
+static int parse_devpts_index_name(const char *name, unsigned *out_index)
+{
+    if (name == NULL || name[0] == '\0' || out_index == NULL) {
+        return 0;
+    }
+    unsigned value = 0;
+    for (size_t i = 0; name[i] != '\0'; i++) {
+        if (name[i] < '0' || name[i] > '9') {
+            return 0;
+        }
+        value = value * 10u + (unsigned)(name[i] - '0');
+        if (value >= KB_FS_DEVPTS_DENTRY_MAX) {
+            return 0;
+        }
+    }
+    *out_index = value;
+    return 1;
+}
+
+static void remember_devpts_dentry(void *parent, void *dentry, const char *name)
+{
+    if (parent != last_mount_path_probe.root_dentry || dentry == NULL) {
+        return;
+    }
+    unsigned index = 0;
+    if (!parse_devpts_index_name(name, &index)) {
+        return;
+    }
+    devpts_index_dentries[index] = dentry;
+    if (fs_trace_enabled()) {
+        fprintf(stderr, "kobox-fs: devpts remember index=%u dentry=%p\n", index, dentry);
+    }
+}
+
+int kb_fs_subsystem_path_devpts_index(void *path, unsigned index)
+{
+    if (path == NULL ||
+        index >= KB_FS_DEVPTS_DENTRY_MAX ||
+        devpts_index_dentries[index] == NULL ||
+        last_mount_path_probe.super_block == NULL)
+    {
+        return -2;
+    }
+    write_pointer_field(path, KB_FS_PATH_MNT_OFFSET, last_nodev_vfsmount);
+    write_pointer_field(path, KB_FS_PATH_DENTRY_OFFSET, devpts_index_dentries[index]);
+    if (fs_trace_enabled()) {
+        fprintf(stderr,
+            "kobox-fs: path_devpts_index path=%p index=%u mnt=%p dentry=%p\n",
+            path,
+            index,
+            (void *)last_nodev_vfsmount,
+            devpts_index_dentries[index]);
+    }
+    return 0;
+}
+
 void *kb_fs_subsystem_d_splice_alias(void *inode, void *dentry)
 {
     if (low_or_err_pointer(inode)) {
@@ -3019,6 +3242,7 @@ void *kb_fs_subsystem_d_splice_alias(void *inode, void *dentry)
         return NULL;
     }
     write_pointer_field(dentry, KB_FS_DENTRY_INODE_OFFSET, inode);
+    kb_fs_set_dentry_entry_type(dentry, inode);
     void *super_block = read_pointer_field(inode, KB_FS_INODE_SB_OFFSET);
     if (read_pointer_field(dentry, KB_FS_DENTRY_SB_OFFSET) == NULL) {
         write_pointer_field(dentry, KB_FS_DENTRY_SB_OFFSET, super_block);
@@ -3043,18 +3267,60 @@ void *kb_fs_subsystem_d_splice_alias(void *inode, void *dentry)
     return dentry;
 }
 
+void *kb_fs_subsystem_d_alloc_name(void *parent, const char *name)
+{
+    if (parent == NULL || low_or_err_pointer(name)) {
+        return NULL;
+    }
+    void *dentry = calloc(1, KB_FS_FAKE_DENTRY_BYTES);
+    if (dentry == NULL) {
+        return NULL;
+    }
+    void *super_block = read_pointer_field(parent, KB_FS_DENTRY_SB_OFFSET);
+    size_t name_len = strlen(name);
+    char *stored_name = malloc(name_len + 1u);
+    if (stored_name == NULL) {
+        free(dentry);
+        return NULL;
+    }
+    memcpy(stored_name, name, name_len + 1u);
+    kb_fs_prepare_named_dentry(dentry, parent, NULL, super_block, stored_name);
+    remember_devpts_dentry(parent, dentry, stored_name);
+    if (fs_trace_enabled()) {
+        fprintf(stderr, "kobox-fs: d_alloc_name parent=%p dentry=%p name=%s\n", parent, dentry, stored_name);
+    }
+    return dentry;
+}
+
+void kb_fs_subsystem_d_add(void *dentry, void *inode)
+{
+    kb_fs_subsystem_d_instantiate(dentry, inode);
+}
+
 void kb_fs_subsystem_d_instantiate(void *dentry, void *inode)
 {
     if (dentry == NULL || low_or_err_pointer(inode)) {
         return;
     }
     write_pointer_field(dentry, KB_FS_DENTRY_INODE_OFFSET, inode);
+    kb_fs_set_dentry_entry_type(dentry, inode);
     void *super_block = read_pointer_field(inode, KB_FS_INODE_SB_OFFSET);
     if (read_pointer_field(dentry, KB_FS_DENTRY_SB_OFFSET) == NULL) {
         write_pointer_field(dentry, KB_FS_DENTRY_SB_OFFSET, super_block);
     }
     if (fs_trace_enabled()) {
         fprintf(stderr, "kobox-fs: d_instantiate dentry=%p inode=%p\n", dentry, inode);
+    } else if (kb_fs_inode_is_devpts(inode)) {
+        uint32_t flags = 0;
+        uint32_t mode = 0;
+        memcpy(&flags, (const uint8_t *)dentry + KB_FS_DENTRY_FLAGS_OFFSET, sizeof(flags));
+        memcpy(&mode, (const uint8_t *)inode + KB_FS_INODE_MODE_OFFSET, sizeof(mode));
+        fprintf(stderr,
+            "kobox-fs: devpts d_instantiate dentry=%p inode=%p flags=0x%x mode=0%o\n",
+            dentry,
+            inode,
+            flags,
+            mode);
     }
 }
 
@@ -4462,6 +4728,90 @@ long kb_fs_subsystem_generic_write_checks(void *kiocb, void *iter)
         return -22;
     }
     return (long)count;
+}
+
+static size_t kb_fs_subsystem_iov_iter_limit(void *iter, size_t bytes, void **out_buffer)
+{
+    if (iter == NULL || out_buffer == NULL) {
+        return 0;
+    }
+    uint64_t count = 0;
+    void *buffer = NULL;
+    memcpy(&count, (const uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, sizeof(count));
+    memcpy(&buffer, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_OFFSET, sizeof(buffer));
+    if (buffer == NULL || count == 0) {
+        *out_buffer = NULL;
+        return 0;
+    }
+    *out_buffer = buffer;
+    if (bytes > count) {
+        bytes = (size_t)count;
+    }
+    return bytes;
+}
+
+static void kb_fs_subsystem_iov_iter_advance(void *iter, size_t bytes)
+{
+    uint64_t count = 0;
+    uint64_t capacity = 0;
+    void *buffer = NULL;
+    memcpy(&count, (const uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, sizeof(count));
+    memcpy(&buffer, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_OFFSET, sizeof(buffer));
+    memcpy(&capacity, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_CAPACITY_OFFSET, sizeof(capacity));
+    if (bytes > count) {
+        bytes = (size_t)count;
+    }
+    count -= bytes;
+    buffer = (uint8_t *)buffer + bytes;
+    if (capacity >= bytes) {
+        capacity -= bytes;
+    }
+    memcpy((uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, &count, sizeof(count));
+    memcpy((uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_OFFSET, &buffer, sizeof(buffer));
+    memcpy((uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_CAPACITY_OFFSET, &capacity, sizeof(capacity));
+}
+
+size_t kb_fs_subsystem_copy_to_iter(const void *addr, size_t bytes, void *iter)
+{
+    void *buffer = NULL;
+    bytes = kb_fs_subsystem_iov_iter_limit(iter, bytes, &buffer);
+    if (addr == NULL || buffer == NULL || bytes == 0) {
+        return 0;
+    }
+    memcpy(buffer, addr, bytes);
+    kb_fs_subsystem_iov_iter_advance(iter, bytes);
+    return bytes;
+}
+
+size_t kb_fs_subsystem_copy_from_iter(void *addr, size_t bytes, void *iter)
+{
+    void *buffer = NULL;
+    bytes = kb_fs_subsystem_iov_iter_limit(iter, bytes, &buffer);
+    if (addr == NULL || buffer == NULL || bytes == 0) {
+        return 0;
+    }
+    memcpy(addr, buffer, bytes);
+    kb_fs_subsystem_iov_iter_advance(iter, bytes);
+    return bytes;
+}
+
+void kb_fs_subsystem_iov_iter_revert(void *iter, size_t bytes)
+{
+    if (iter == NULL || bytes == 0) {
+        return;
+    }
+    uint64_t count = 0;
+    uint64_t capacity = 0;
+    void *buffer = NULL;
+    memcpy(&count, (const uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, sizeof(count));
+    memcpy(&buffer, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_OFFSET, sizeof(buffer));
+    memcpy(&capacity, (const uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_CAPACITY_OFFSET, sizeof(capacity));
+    buffer = (uint8_t *)buffer - bytes;
+    count += bytes;
+    capacity += bytes;
+    memcpy((uint8_t *)iter + KB_FS_IOV_ITER_COUNT_OFFSET, &count, sizeof(count));
+    memcpy((uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_OFFSET, &buffer, sizeof(buffer));
+    memcpy((uint8_t *)iter + KB_FS_IOV_ITER_BUFFER_CAPACITY_OFFSET, &capacity, sizeof(capacity));
 }
 
 long kb_fs_subsystem_generic_perform_write(void *kiocb, void *iter)

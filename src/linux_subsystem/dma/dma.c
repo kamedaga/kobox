@@ -13,6 +13,9 @@ static kb_subsystem_dma_mapping_t *dma_mappings;
 
 static kb_status_t remember_dma_mapping(void *cpu_addr, uint64_t dma_addr, uint64_t size, kb_device_t *device)
 {
+    if (cpu_addr == NULL || size == 0) {
+        return KB_ERR_INVALID;
+    }
     kb_subsystem_dma_mapping_t *entry = kb_kzalloc(sizeof(*entry), 0);
     if (entry == NULL) {
         return KB_ERR_NOMEM;
@@ -239,6 +242,9 @@ void kb_subsystem_dma_unmap(
 
 int kb_subsystem_dma_mapping_error(uint64_t dma_addr)
 {
+    if (dma_addr == 0) {
+        return 1;
+    }
     for (kb_subsystem_dma_mapping_t *entry = dma_mappings; entry != NULL; entry = entry->next) {
         if (dma_addr >= entry->dma_addr && dma_addr < entry->dma_addr + entry->size) {
             return 0;

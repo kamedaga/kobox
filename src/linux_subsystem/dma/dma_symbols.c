@@ -14,6 +14,7 @@ static const kb_linux_symbol_t dma_symbols[] = {
     {"dma_map_single_attrs", (void *)(uintptr_t)&kb_dma_map_single_attrs},
     {"dma_mapping_error", (void *)(uintptr_t)&kb_dma_mapping_error},
     {"dma_max_mapping_size", (void *)(uintptr_t)&kb_dma_max_mapping_size},
+    {"dma_need_sync", (void *)(uintptr_t)&kb_dma_need_sync},
     {"dma_opt_mapping_size", (void *)(uintptr_t)&kb_return_zero},
     {"dma_pool_alloc", (void *)(uintptr_t)&kb_dma_pool_alloc},
     {"dma_pool_create", (void *)(uintptr_t)&kb_dma_pool_create},

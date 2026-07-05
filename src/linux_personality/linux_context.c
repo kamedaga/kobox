@@ -4,6 +4,10 @@
 
 #include "kobox/shim.h"
 
+#if defined(__pachaos__)
+#include "pacha/abi.h"
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,10 +20,6 @@
 
 static kb_device_backend_t *current_backend;
 
-enum {
-    KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE = 12,
-};
-
 #if defined(__pachaos__) && defined(__x86_64__)
 static long pachaos_set_gs_base(uint64_t gs_base)
 {
@@ -27,7 +27,7 @@ static long pachaos_set_gs_base(uint64_t gs_base)
     __asm__ volatile(
         "syscall"
         : "=a"(ret)
-        : "a"((uint64_t)KB_PACHAOS_SYSCALL_THREAD_SET_GS_BASE), "D"(gs_base)
+        : "a"((uint64_t)PACHA_THREAD_SYSCALL_SET_GS_BASE), "D"(gs_base)
         : "rcx", "r11", "memory");
     return (long)ret;
 }

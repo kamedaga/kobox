@@ -244,6 +244,21 @@ int kb_sysfs_emit(char *buf, const char *fmt, ...)
     return result;
 }
 
+int kb_sysfs_emit_at(char *buf, int at, const char *fmt, ...)
+{
+    if (buf == NULL || fmt == NULL || at < 0 || at >= 4096) {
+        return 0;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int result = kb_vsnprintf_safe(buf + at, 4096u - (size_t)at, fmt, args);
+    va_end(args);
+    if (result < 0) {
+        return result;
+    }
+    return at + result;
+}
+
 int __platform_driver_register(void *driver, void *owner, const char *mod_name)
 {
     return kb_platform_driver_register(driver, owner, mod_name);
@@ -419,4 +434,19 @@ int sysfs_emit(char *buf, const char *fmt, ...)
     int result = kb_vsnprintf_safe(buf, 4096, fmt, args);
     va_end(args);
     return result;
+}
+
+int sysfs_emit_at(char *buf, int at, const char *fmt, ...)
+{
+    if (buf == NULL || fmt == NULL || at < 0 || at >= 4096) {
+        return 0;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int result = kb_vsnprintf_safe(buf + at, 4096u - (size_t)at, fmt, args);
+    va_end(args);
+    if (result < 0) {
+        return result;
+    }
+    return at + result;
 }

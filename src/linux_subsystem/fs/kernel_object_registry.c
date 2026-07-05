@@ -3,6 +3,7 @@
 #endif
 
 #include "linux_subsystem/fs/kernel_object_registry.h"
+#include "kobox/shim.h"
 #include "loader/module_context.h"
 
 #include <stddef.h>
@@ -16,6 +17,7 @@ kb_class_record_t kb_class_records[KB_KERNEL_OBJECT_MAX];
 kb_cdev_record_t kb_cdev_records[KB_KERNEL_OBJECT_MAX];
 kb_fd_record_t kb_fd_records[KB_FAKE_FD_MAX];
 kb_fake_file_record_t kb_fake_file_records[KB_KERNEL_OBJECT_MAX];
+kb_f_owner_record_t kb_f_owner_records[KB_KERNEL_OBJECT_MAX];
 kb_vma_record_t kb_vma_records[KB_FAKE_VMA_MAX];
 int kb_kernel_object_summary_registered;
 unsigned kb_next_dynamic_major = 240;
@@ -51,6 +53,24 @@ const char *kb_linux_kernel_chrdev_name_for_dev(uint64_t dev)
         }
     }
     return "(unmatched)";
+}
+
+const kb_cdev_record_t *kb_linux_kernel_find_active_cdev(uint64_t dev)
+{
+    const uint32_t major = kb_linux_kernel_decode_major(dev);
+    const uint32_t minor = kb_linux_kernel_decode_minor(dev);
+    for (size_t i = 0; i < KB_KERNEL_OBJECT_MAX; i++) {
+        if (!kb_cdev_records[i].active || kb_cdev_records[i].cdev == NULL) {
+            continue;
+        }
+        const uint32_t cdev_major = kb_linux_kernel_decode_major(kb_cdev_records[i].dev);
+        const uint32_t cdev_minor = kb_linux_kernel_decode_minor(kb_cdev_records[i].dev);
+        const uint32_t cdev_last = cdev_minor + kb_cdev_records[i].count;
+        if (cdev_major == major && minor >= cdev_minor && minor < cdev_last) {
+            return &kb_cdev_records[i];
+        }
+    }
+    return NULL;
 }
 
 static void kb_linux_kernel_write_ptr_field(void *base, size_t offset, const void *value)
@@ -161,6 +181,37 @@ static kb_file_ops_view_t kb_decode_file_ops(const void *fops)
     view.open = kb_read_ptr_field(fops, 104);
     view.release = kb_read_ptr_field(fops, 120);
     return view;
+}
+
+static kb_module_t *kb_linux_kernel_infer_file_ops_owner(
+    const void *fops,
+    const kb_file_ops_view_t *view)
+{
+    kb_module_t *owner = kb_loader_active_module();
+    if (owner != NULL) {
+        return owner;
+    }
+    if (view != NULL) {
+        const void *candidates[] = {
+            view->open,
+            view->read_iter,
+            view->write_iter,
+            view->unlocked_ioctl,
+            view->poll,
+            view->release,
+            view->read,
+            view->write,
+            view->mmap,
+            view->llseek,
+        };
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+            owner = kb_module_find_owner_for_address(candidates[i]);
+            if (owner != NULL) {
+                return owner;
+            }
+        }
+    }
+    return kb_module_find_owner_for_address(fops);
 }
 
 static kb_proc_ops_view_t kb_decode_proc_ops(const void *ops)
@@ -380,6 +431,32 @@ static size_t kb_find_free_cdev_slot(void)
         }
     }
     return SIZE_MAX;
+}
+
+enum {
+    KB_LINUX_CDEV_BYTES = 128,
+    KB_LINUX_CDEV_OPS_OFFSET = 72,
+    KB_LINUX_CDEV_LIST_OFFSET = 80,
+};
+
+static void kb_linux_kernel_cdev_capture_ops(size_t slot, void *cdev)
+{
+    if (slot >= KB_KERNEL_OBJECT_MAX || cdev == NULL || kb_cdev_records[slot].fops != NULL) {
+        return;
+    }
+    void *fops = NULL;
+    memcpy(&fops, (uint8_t *)cdev + KB_LINUX_CDEV_OPS_OFFSET, sizeof(fops));
+    if (fops == NULL) {
+        return;
+    }
+    kb_cdev_records[slot].fops = fops;
+    kb_cdev_records[slot].fops_view = kb_decode_file_ops(fops);
+    kb_cdev_records[slot].has_fops_view = 1;
+    if (kb_cdev_records[slot].owner_module == NULL) {
+        kb_cdev_records[slot].owner_module = kb_linux_kernel_infer_file_ops_owner(
+            fops,
+            &kb_cdev_records[slot].fops_view);
+    }
 }
 
 static void kb_proc_deactivate_tree(const char *path)
@@ -626,6 +703,19 @@ void kb_linux_kernel_class_destroy(void *class_ptr)
     }
 }
 
+void *kb_linux_kernel_cdev_alloc(void)
+{
+    void *cdev = kb_kzalloc(KB_LINUX_CDEV_BYTES, 0);
+    if (cdev == NULL) {
+        return NULL;
+    }
+    void *list = (uint8_t *)cdev + KB_LINUX_CDEV_LIST_OFFSET;
+    memcpy((uint8_t *)list + 0, &list, sizeof(list));
+    memcpy((uint8_t *)list + 8, &list, sizeof(list));
+    kb_linux_kernel_cdev_init(cdev, NULL);
+    return cdev;
+}
+
 void kb_linux_kernel_cdev_init(void *cdev, void *fops)
 {
     if (cdev == NULL) {
@@ -647,10 +737,19 @@ void kb_linux_kernel_cdev_init(void *cdev, void *fops)
     }
     kb_cdev_records[slot].cdev = cdev;
     kb_cdev_records[slot].owner_module = kb_loader_active_module();
+    void *list = (uint8_t *)cdev + KB_LINUX_CDEV_LIST_OFFSET;
+    memcpy((uint8_t *)list + 0, &list, sizeof(list));
+    memcpy((uint8_t *)list + 8, &list, sizeof(list));
     if (fops != NULL) {
+        memcpy((uint8_t *)cdev + KB_LINUX_CDEV_OPS_OFFSET, &fops, sizeof(fops));
         kb_cdev_records[slot].fops = fops;
         kb_cdev_records[slot].fops_view = kb_decode_file_ops(fops);
         kb_cdev_records[slot].has_fops_view = 1;
+        if (kb_cdev_records[slot].owner_module == NULL) {
+            kb_cdev_records[slot].owner_module = kb_linux_kernel_infer_file_ops_owner(
+                fops,
+                &kb_cdev_records[slot].fops_view);
+        }
     }
     if (trace_kernel_objects_enabled()) {
         fprintf(stderr, "kobox-kobj: cdev_init cdev=%p fops=%p\n", cdev, fops);
@@ -677,8 +776,11 @@ int kb_linux_kernel_cdev_add(void *cdev, uint64_t dev, unsigned count)
     }
     kb_cdev_records[slot].cdev = cdev;
     kb_cdev_records[slot].active = 1;
+    kb_linux_kernel_cdev_capture_ops(slot, cdev);
     if (kb_cdev_records[slot].owner_module == NULL) {
-        kb_cdev_records[slot].owner_module = kb_loader_active_module();
+        kb_cdev_records[slot].owner_module = kb_linux_kernel_infer_file_ops_owner(
+            kb_cdev_records[slot].fops,
+            &kb_cdev_records[slot].fops_view);
     }
     kb_cdev_records[slot].dev = dev;
     kb_cdev_records[slot].count = count;
@@ -897,6 +999,18 @@ void *kb_linux_kernel_filp_open(const char *path, int flags, unsigned mode)
     return file == NULL ? kb_err_ptr_noent() : file;
 }
 
+void *kb_linux_kernel_dentry_open(void *path, int flags, void *cred)
+{
+    (void)path;
+    (void)flags;
+    (void)cred;
+    void *file = kb_alloc_fake_file("(dentry)");
+    if (trace_kernel_objects_enabled()) {
+        fprintf(stderr, "kobox-fd: dentry_open path=%p file=%p\n", path, file);
+    }
+    return file == NULL ? kb_err_ptr_noent() : file;
+}
+
 int kb_linux_kernel_filp_close(void *file, void *id)
 {
     (void)id;
@@ -921,6 +1035,46 @@ int kb_linux_kernel_iterate_fd(void *files, unsigned first, kb_linux_kernel_iter
         }
     }
     return 0;
+}
+
+void kb_linux_kernel_f_setown(void *file, void *pid, int type, int force)
+{
+    if (file == NULL) {
+        return;
+    }
+    size_t slot = SIZE_MAX;
+    for (size_t i = 0; i < KB_KERNEL_OBJECT_MAX; i++) {
+        if (kb_f_owner_records[i].active && kb_f_owner_records[i].file == file) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == SIZE_MAX) {
+        for (size_t i = 0; i < KB_KERNEL_OBJECT_MAX; i++) {
+            if (!kb_f_owner_records[i].active) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot == SIZE_MAX) {
+        return;
+    }
+    kb_f_owner_records[slot] = (kb_f_owner_record_t){
+        .active = 1,
+        .file = file,
+        .pid = pid,
+        .type = type,
+        .force = force,
+    };
+    if (trace_kernel_objects_enabled()) {
+        fprintf(stderr,
+            "kobox-kobj: f_setown file=%p pid=%p type=%d force=%d\n",
+            file,
+            pid,
+            type,
+            force);
+    }
 }
 
 static kb_vma_record_t *kb_alloc_vma_record(void *mm, uint64_t start, uint64_t length)

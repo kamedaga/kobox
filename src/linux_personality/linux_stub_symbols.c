@@ -6,10 +6,107 @@
 
 static int kb_pm_suspend_default_s2idle;
 static unsigned int kb_pm_suspend_global_flags;
+static void *kb_console_list_head;
+static void *kb_console_driver;
+static int kb_fg_console;
+static unsigned char kb_tasklist_lock[16];
+static unsigned char kb_init_task[16384];
+static unsigned int kb_overflowuid = 65534;
+static unsigned int kb_overflowgid = 65534;
+
+static int kb_virtio_no_restricted_mem_acc(void *dev)
+{
+    (void)dev;
+    return 0;
+}
+
+static void *kb_virtio_check_mem_acc_cb = (void *)(uintptr_t)&kb_virtio_no_restricted_mem_acc;
 
 static uint64_t kb_stub_return_zero_u64(void)
 {
     return 0;
+}
+
+__attribute__((naked)) static long kb_linux_get_user_1(void)
+{
+    __asm__ volatile(
+        "test %rax, %rax\n"
+        "jz 1f\n"
+        "movzbl (%rax), %edx\n"
+        "xor %eax, %eax\n"
+        "ret\n"
+        "1:\n"
+        "xor %edx, %edx\n"
+        "mov $-14, %eax\n"
+        "ret\n");
+}
+
+__attribute__((naked)) static long kb_linux_get_user_2(void)
+{
+    __asm__ volatile(
+        "test %rax, %rax\n"
+        "jz 1f\n"
+        "movzwl (%rax), %edx\n"
+        "xor %eax, %eax\n"
+        "ret\n"
+        "1:\n"
+        "xor %edx, %edx\n"
+        "mov $-14, %eax\n"
+        "ret\n");
+}
+
+__attribute__((naked)) static long kb_linux_get_user_4(void)
+{
+    __asm__ volatile(
+        "test %rax, %rax\n"
+        "jz 1f\n"
+        "movl (%rax), %edx\n"
+        "xor %eax, %eax\n"
+        "ret\n"
+        "1:\n"
+        "xor %edx, %edx\n"
+        "mov $-14, %eax\n"
+        "ret\n");
+}
+
+__attribute__((naked)) static long kb_linux_get_user_8(void)
+{
+    __asm__ volatile(
+        "test %rax, %rax\n"
+        "jz 1f\n"
+        "movq (%rax), %rdx\n"
+        "xor %eax, %eax\n"
+        "ret\n"
+        "1:\n"
+        "xor %edx, %edx\n"
+        "mov $-14, %eax\n"
+        "ret\n");
+}
+
+__attribute__((naked)) static long kb_linux_put_user_4(void)
+{
+    __asm__ volatile(
+        "test %rcx, %rcx\n"
+        "jz 1f\n"
+        "movl %eax, (%rcx)\n"
+        "xor %ecx, %ecx\n"
+        "ret\n"
+        "1:\n"
+        "mov $-14, %ecx\n"
+        "ret\n");
+}
+
+__attribute__((naked)) static long kb_linux_put_user_8(void)
+{
+    __asm__ volatile(
+        "test %rcx, %rcx\n"
+        "jz 1f\n"
+        "movq %rax, (%rcx)\n"
+        "xor %ecx, %ecx\n"
+        "ret\n"
+        "1:\n"
+        "mov $-14, %ecx\n"
+        "ret\n");
 }
 
 typedef struct kb_timespec64_stub {
@@ -59,12 +156,19 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"__dynamic_pr_debug", (void *)(uintptr_t)&kb_noop_stub},
     {"__flush_workqueue", (void *)(uintptr_t)&kb_noop_stub},
     {"__refrigerator", (void *)(uintptr_t)&kb_noop_stub},
+    {"__splice_from_pipe", (void *)(uintptr_t)&kb_return_zero},
     {"__mmap_lock_do_trace_acquire_returned", (void *)(uintptr_t)&kb_noop_stub},
     {"__mmap_lock_do_trace_released", (void *)(uintptr_t)&kb_noop_stub},
     {"__mmap_lock_do_trace_start_locking", (void *)(uintptr_t)&kb_noop_stub},
+    {"__request_module", (void *)(uintptr_t)&kb_return_zero},
     {"__task_pid_nr_ns", (void *)(uintptr_t)&kb_return_zero},
     {"__ubsan_handle_shift_out_of_bounds", (void *)(uintptr_t)&kb_noop_stub},
     {"base64_decode", (void *)(uintptr_t)&kb_return_zero},
+    {"console_device", (void *)(uintptr_t)&kb_return_zero},
+    {"console_driver", (void *)(uintptr_t)&kb_console_driver},
+    {"console_list", (void *)(uintptr_t)&kb_console_list_head},
+    {"console_list_lock", (void *)(uintptr_t)&kb_noop_stub},
+    {"console_list_unlock", (void *)(uintptr_t)&kb_noop_stub},
     {"console_lock", (void *)(uintptr_t)&kb_noop_stub},
     {"console_unlock", (void *)(uintptr_t)&kb_noop_stub},
     {"convert_art_to_tsc", (void *)(uintptr_t)&kb_return_zero},
@@ -102,9 +206,9 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"mempool_create_node", (void *)(uintptr_t)&kb_alloc_stub},
     {"mempool_destroy", (void *)(uintptr_t)&kb_free_first_arg_stub},
     {"mempool_free", (void *)(uintptr_t)&kb_free_first_arg_stub},
-    {"mutex_lock_interruptible", (void *)(uintptr_t)&kb_return_zero},
-    {"mutex_lock_killable", (void *)(uintptr_t)&kb_return_zero},
-    {"mutex_is_locked", (void *)(uintptr_t)&kb_return_zero},
+    {"mutex_lock_interruptible", (void *)(uintptr_t)&kb_mutex_lock_interruptible},
+    {"mutex_lock_killable", (void *)(uintptr_t)&kb_mutex_lock_killable},
+    {"mutex_is_locked", (void *)(uintptr_t)&kb_mutex_is_locked},
     {"sg_free_table", (void *)(uintptr_t)&kb_noop_stub},
     {"set_freezable", (void *)(uintptr_t)&kb_noop_stub},
     {"sme_active", (void *)(uintptr_t)&kb_return_zero},
@@ -134,8 +238,8 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"get_free_pages_noprof", (void *)(uintptr_t)&kb_alloc_stub},
     {"__io_uring_cmd_do_in_task", (void *)(uintptr_t)&kb_return_zero},
     {"__node_distance", (void *)(uintptr_t)&kb_return_zero},
-    {"__put_user_4", (void *)(uintptr_t)&kb_return_zero},
-    {"__put_user_8", (void *)(uintptr_t)&kb_return_zero},
+    {"__put_user_4", (void *)(uintptr_t)&kb_linux_put_user_4},
+    {"__put_user_8", (void *)(uintptr_t)&kb_linux_put_user_8},
     {"__put_devmap_managed_page_refs", (void *)(uintptr_t)&kb_noop_stub},
     {"__printk_ratelimit", (void *)(uintptr_t)&kb_return_one},
     {"__release_region", (void *)(uintptr_t)&kb_noop_stub},
@@ -144,7 +248,7 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"__srcu_read_unlock", (void *)(uintptr_t)&kb_noop_stub},
     {"__trace_trigger_soft_disabled", (void *)(uintptr_t)&kb_return_zero},
     {"__virt_addr_valid", (void *)(uintptr_t)&kb_return_one},
-    {"__wake_up", (void *)(uintptr_t)&kb_noop_stub},
+    {"__wake_up", (void *)(uintptr_t)&kb_wake_up_waitqueue},
     {"add_uevent_var", (void *)(uintptr_t)&kb_return_zero},
     {"address_space_init_once", (void *)(uintptr_t)&kb_noop_stub},
     {"alloc_pages", (void *)(uintptr_t)&kb_kvm_alloc_pages_stub},
@@ -323,18 +427,19 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"drm_vma_node_is_allowed", (void *)(uintptr_t)&kb_return_one},
     {"drm_vma_offset_lookup_locked", (void *)(uintptr_t)&kb_alloc_stub},
     {"drmm_mode_config_init", (void *)(uintptr_t)&kb_return_zero},
-    {"finish_wait", (void *)(uintptr_t)&kb_noop_stub},
+    {"finish_wait", (void *)(uintptr_t)&kb_finish_wait},
     {"free_opal_dev", (void *)(uintptr_t)&kb_noop_stub},
     {"free_pages", (void *)(uintptr_t)&kb_noop_stub},
     {"full_name_hash", (void *)(uintptr_t)&kb_return_zero},
     {"get_device", (void *)(uintptr_t)&kb_identity_ptr},
+    {"handle_sysrq", (void *)(uintptr_t)&kb_noop_stub},
     {"hwmon_device_unregister", (void *)(uintptr_t)&kb_noop_stub},
     {"i2c_add_adapter", (void *)(uintptr_t)&kb_return_zero},
     {"i2c_del_adapter", (void *)(uintptr_t)&kb_noop_stub},
     {"idr_get_next", (void *)(uintptr_t)&kb_return_zero},
     {"init_opal_dev", (void *)(uintptr_t)&kb_return_zero},
     {"init_srcu_struct", (void *)(uintptr_t)&kb_return_zero},
-    {"init_wait_entry", (void *)(uintptr_t)&kb_noop_stub},
+    {"init_wait_entry", (void *)(uintptr_t)&kb_init_wait_entry},
     {"io_uring_cmd_done", (void *)(uintptr_t)&kb_noop_stub},
     {"io_uring_cmd_import_fixed", (void *)(uintptr_t)&kb_return_zero},
     {"iov_iter_kvec", (void *)(uintptr_t)&kb_noop_stub},
@@ -370,9 +475,9 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"out_of_line_wait_on_bit", (void *)(uintptr_t)&kb_return_zero},
     {"perf_trace_buf_alloc", (void *)(uintptr_t)&kb_alloc_stub},
     {"perf_trace_run_bpf_submit", (void *)(uintptr_t)&kb_noop_stub},
-    {"prepare_to_wait", (void *)(uintptr_t)&kb_noop_stub},
-    {"prepare_to_wait_event", (void *)(uintptr_t)&kb_return_zero},
-    {"prepare_to_wait_exclusive", (void *)(uintptr_t)&kb_noop_stub},
+    {"prepare_to_wait", (void *)(uintptr_t)&kb_prepare_to_wait},
+    {"prepare_to_wait_event", (void *)(uintptr_t)&kb_prepare_to_wait_event},
+    {"prepare_to_wait_exclusive", (void *)(uintptr_t)&kb_prepare_to_wait_exclusive},
     {"proc_symlink", (void *)(uintptr_t)&kb_alloc_stub},
     {"put_device", (void *)(uintptr_t)&kb_noop_stub},
     {"rb_erase", (void *)(uintptr_t)&kb_rb_erase},
@@ -437,19 +542,23 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"pm_runtime_allow", (void *)(uintptr_t)&kb_noop_stub},
     {"pm_runtime_forbid", (void *)(uintptr_t)&kb_noop_stub},
     {"__devm_request_region", (void *)(uintptr_t)&kb_alloc_stub},
-    {"__get_user_1", (void *)(uintptr_t)&kb_return_zero},
-    {"__get_user_2", (void *)(uintptr_t)&kb_return_zero},
-    {"__get_user_4", (void *)(uintptr_t)&kb_return_zero},
-    {"__get_user_8", (void *)(uintptr_t)&kb_return_zero},
+    {"__get_user_1", (void *)(uintptr_t)&kb_linux_get_user_1},
+    {"__get_user_2", (void *)(uintptr_t)&kb_linux_get_user_2},
+    {"__get_user_4", (void *)(uintptr_t)&kb_linux_get_user_4},
+    {"__get_user_8", (void *)(uintptr_t)&kb_linux_get_user_8},
     {"__kfifo_alloc", (void *)(uintptr_t)&kb_return_zero},
-    {"__kfifo_free", (void *)(uintptr_t)&kb_noop_stub},
-    {"__kfifo_in", (void *)(uintptr_t)&kb_return_zero},
-    {"__kfifo_to_user", (void *)(uintptr_t)&kb_return_zero},
+    {"__kfifo_free", (void *)(uintptr_t)&kb_kfifo_free},
+    {"__kfifo_init", (void *)(uintptr_t)&kb_kfifo_init},
+    {"__kfifo_in", (void *)(uintptr_t)&kb_kfifo_in},
+    {"__kfifo_out", (void *)(uintptr_t)&kb_kfifo_out},
+    {"__kfifo_to_user", (void *)(uintptr_t)&kb_kfifo_to_user},
     {"__pm_runtime_use_autosuspend", (void *)(uintptr_t)&kb_noop_stub},
     {"__put_cred", (void *)(uintptr_t)&kb_noop_stub},
+    {"__put_task_struct", (void *)(uintptr_t)&kb_noop_stub},
     {"__suspend_report_result", (void *)(uintptr_t)&kb_noop_stub},
     {"add_device_randomness", (void *)(uintptr_t)&kb_noop_stub},
-    {"add_wait_queue", (void *)(uintptr_t)&kb_noop_stub},
+    {"add_wait_queue", (void *)(uintptr_t)&kb_add_wait_queue},
+    {"add_wait_queue_exclusive", (void *)(uintptr_t)&kb_add_wait_queue_exclusive},
     {"blocking_notifier_call_chain", (void *)(uintptr_t)&kb_return_zero},
     {"blocking_notifier_chain_register", (void *)(uintptr_t)&kb_return_zero},
     {"blocking_notifier_chain_unregister", (void *)(uintptr_t)&kb_return_zero},
@@ -463,8 +572,8 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"debugfs_create_regset32", (void *)(uintptr_t)&kb_alloc_stub},
     {"debugfs_lookup_and_remove", (void *)(uintptr_t)&kb_return_zero},
     {"debugfs_remove", (void *)(uintptr_t)&kb_noop_stub},
-    {"autoremove_wake_function", (void *)(uintptr_t)&kb_return_zero},
-    {"default_wake_function", (void *)(uintptr_t)&kb_return_zero},
+    {"autoremove_wake_function", (void *)(uintptr_t)&kb_autoremove_wake_function},
+    {"default_wake_function", (void *)(uintptr_t)&kb_default_wake_function},
     {"device_destroy", (void *)(uintptr_t)&kb_noop_stub},
     {"device_release_driver", (void *)(uintptr_t)&kb_noop_stub},
     {"device_remove_bin_file", (void *)(uintptr_t)&kb_noop_stub},
@@ -473,6 +582,7 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"device_set_wakeup_capable", (void *)(uintptr_t)&kb_noop_stub},
     {"device_unregister", (void *)(uintptr_t)&kb_noop_stub},
     {"driver_remove_file", (void *)(uintptr_t)&kb_noop_stub},
+    {"fg_console", (void *)(uintptr_t)&kb_fg_console},
     {"gen_pool_add_owner", (void *)(uintptr_t)&kb_return_zero},
     {"gen_pool_dma_alloc", (void *)(uintptr_t)&kb_alloc_stub},
     {"gen_pool_dma_alloc_align", (void *)(uintptr_t)&kb_alloc_stub},
@@ -482,6 +592,7 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"idr_destroy", (void *)(uintptr_t)&kb_noop_stub},
     {"idr_remove", (void *)(uintptr_t)&kb_noop_stub},
     {"inode_set_ctime_current", (void *)(uintptr_t)&kb_noop_stub},
+    {"init_task", (void *)(uintptr_t)&kb_init_task},
     {"iommu_get_domain_for_dev", (void *)(uintptr_t)&kb_return_zero},
     {"kernfs_notify", (void *)(uintptr_t)&kb_noop_stub},
     {"kernfs_put", (void *)(uintptr_t)&kb_noop_stub},
@@ -495,6 +606,8 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"kstrtou8", (void *)(uintptr_t)&kb_return_zero},
     {"kstrtoull", (void *)(uintptr_t)&kb_return_zero},
     {"no_seek_end_llseek", (void *)(uintptr_t)&kb_return_zero},
+    {"overflowgid", (void *)(uintptr_t)&kb_overflowgid},
+    {"overflowuid", (void *)(uintptr_t)&kb_overflowuid},
     {"param_get_string", (void *)(uintptr_t)&kb_return_zero},
     {"param_set_copystring", (void *)(uintptr_t)&kb_return_zero},
     {"phy_calibrate", (void *)(uintptr_t)&kb_return_zero},
@@ -503,6 +616,8 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"phy_power_off", (void *)(uintptr_t)&kb_return_zero},
     {"phy_power_on", (void *)(uintptr_t)&kb_return_zero},
     {"phy_set_mode_ext", (void *)(uintptr_t)&kb_return_zero},
+    {"pipe_lock", (void *)(uintptr_t)&kb_noop_stub},
+    {"pipe_unlock", (void *)(uintptr_t)&kb_noop_stub},
     {"platform_device_put", (void *)(uintptr_t)&kb_noop_stub},
     {"platform_device_unregister", (void *)(uintptr_t)&kb_noop_stub},
     {"pm_runtime_no_callbacks", (void *)(uintptr_t)&kb_noop_stub},
@@ -512,15 +627,18 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"put_pid", (void *)(uintptr_t)&kb_noop_stub},
     {"radix_tree_maybe_preload", (void *)(uintptr_t)&kb_return_zero},
     {"register_chrdev_region", (void *)(uintptr_t)&kb_return_zero},
-    {"remove_wait_queue", (void *)(uintptr_t)&kb_noop_stub},
+    {"register_console", (void *)(uintptr_t)&kb_noop_stub},
+    {"remove_wait_queue", (void *)(uintptr_t)&kb_remove_wait_queue},
     {"set_primary_fwnode", (void *)(uintptr_t)&kb_noop_stub},
     {"set_task_ioprio", (void *)(uintptr_t)&kb_noop_stub},
     {"sysfs_notify", (void *)(uintptr_t)&kb_noop_stub},
     {"sysfs_emit", (void *)(uintptr_t)&kb_snprintf_safe},
+    {"sysfs_emit_at", (void *)(uintptr_t)&kb_sysfs_emit_at},
     {"sysfs_remove_file_from_group", (void *)(uintptr_t)&kb_noop_stub},
     {"sysfs_remove_group", (void *)(uintptr_t)&kb_noop_stub},
     {"sysfs_unbreak_active_protection", (void *)(uintptr_t)&kb_noop_stub},
     {"sysfs_unmerge_group", (void *)(uintptr_t)&kb_noop_stub},
+    {"tasklist_lock", (void *)(uintptr_t)&kb_tasklist_lock},
     {"thp_get_unmapped_area", (void *)(uintptr_t)&kb_return_zero},
     {"trace_seq_acquire", (void *)(uintptr_t)&kb_return_zero},
     {"__trace_trigger_soft_disabled", (void *)(uintptr_t)&kb_return_zero},
@@ -533,14 +651,23 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"trace_print_flags_seq", (void *)(uintptr_t)&kb_return_zero},
     {"trace_print_symbols_seq", (void *)(uintptr_t)&kb_return_zero},
     {"trace_raw_output_prep", (void *)(uintptr_t)&kb_return_zero},
+    {"__audit_inode_child", (void *)(uintptr_t)&kb_noop_stub},
+    {"tty_audit_add_data", (void *)(uintptr_t)&kb_noop_stub},
+    {"tty_audit_push", (void *)(uintptr_t)&kb_noop_stub},
+    {"tty_audit_tiocsti", (void *)(uintptr_t)&kb_noop_stub},
+    {"vty_init", (void *)(uintptr_t)&kb_return_zero},
+    {"virtio_check_mem_acc_cb", (void *)(uintptr_t)&kb_virtio_check_mem_acc_cb},
+    {"virtio_reset_device", (void *)(uintptr_t)&kb_noop_stub},
     {"usb_amd_dev_put", (void *)(uintptr_t)&kb_noop_stub},
     {"usb_amd_quirk_pll_disable", (void *)(uintptr_t)&kb_noop_stub},
     {"usb_amd_quirk_pll_enable", (void *)(uintptr_t)&kb_noop_stub},
     {"usb_asmedia_modifyflowcontrol", (void *)(uintptr_t)&kb_noop_stub},
     {"yield", (void *)(uintptr_t)&kb_noop_stub},
     {"wait_for_random_bytes", (void *)(uintptr_t)&kb_return_zero},
+    {"wait_woken", (void *)(uintptr_t)&kb_wait_woken},
     {"wake_up_bit", (void *)(uintptr_t)&kb_noop_stub},
     {"wake_up_process", (void *)(uintptr_t)&kb_wake_up_process},
+    {"woken_wake_function", (void *)(uintptr_t)&kb_woken_wake_function},
     {"ww_mutex_lock", (void *)(uintptr_t)&kb_return_zero},
     {"ww_mutex_unlock", (void *)(uintptr_t)&kb_noop_stub},
     {"__xa_insert", (void *)(uintptr_t)&kb_return_zero},

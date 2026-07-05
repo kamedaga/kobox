@@ -100,6 +100,14 @@ typedef struct kb_fake_file_record {
     char *path;
 } kb_fake_file_record_t;
 
+typedef struct kb_f_owner_record {
+    int active;
+    void *file;
+    void *pid;
+    int type;
+    int force;
+} kb_f_owner_record_t;
+
 typedef struct kb_vma_record {
     int active;
     void *mm;
@@ -116,6 +124,7 @@ extern kb_class_record_t kb_class_records[KB_KERNEL_OBJECT_MAX];
 extern kb_cdev_record_t kb_cdev_records[KB_KERNEL_OBJECT_MAX];
 extern kb_fd_record_t kb_fd_records[KB_FAKE_FD_MAX];
 extern kb_fake_file_record_t kb_fake_file_records[KB_KERNEL_OBJECT_MAX];
+extern kb_f_owner_record_t kb_f_owner_records[KB_KERNEL_OBJECT_MAX];
 extern kb_vma_record_t kb_vma_records[KB_FAKE_VMA_MAX];
 extern int kb_kernel_object_summary_registered;
 extern unsigned kb_next_dynamic_major;
@@ -125,6 +134,7 @@ uint32_t kb_linux_kernel_decode_major(uint64_t dev);
 uint32_t kb_linux_kernel_decode_minor(uint64_t dev);
 uint32_t kb_linux_kernel_encode_dev(unsigned major, unsigned minor);
 const char *kb_linux_kernel_chrdev_name_for_dev(uint64_t dev);
+const kb_cdev_record_t *kb_linux_kernel_find_active_cdev(uint64_t dev);
 void kb_linux_kernel_prepare_fake_vma(uint8_t *vma, void *mm, uint64_t start, uint64_t end, uint64_t pgoff);
 
 int kb_linux_kernel_register_chrdev(unsigned major, unsigned baseminor, unsigned count, const char *name, void *fops);
@@ -137,6 +147,7 @@ void kb_linux_kernel_proc_remove(void *entry);
 void kb_linux_kernel_remove_proc_entry(const char *name, void *parent);
 void *kb_linux_kernel_class_create(const char *name);
 void kb_linux_kernel_class_destroy(void *class_ptr);
+void *kb_linux_kernel_cdev_alloc(void);
 void kb_linux_kernel_cdev_init(void *cdev, void *fops);
 int kb_linux_kernel_cdev_add(void *cdev, uint64_t dev, unsigned count);
 void kb_linux_kernel_cdev_del(void *cdev);
@@ -145,9 +156,11 @@ void kb_linux_kernel_fd_install(unsigned fd, void *file);
 void *kb_linux_kernel_fget(unsigned fd);
 void kb_linux_kernel_fput(void *file);
 int kb_linux_kernel_close_fd(unsigned fd);
+void *kb_linux_kernel_dentry_open(void *path, int flags, void *cred);
 void *kb_linux_kernel_filp_open(const char *path, int flags, unsigned mode);
 int kb_linux_kernel_filp_close(void *file, void *id);
 int kb_linux_kernel_iterate_fd(void *files, unsigned first, int (*fn)(const void *file, unsigned fd, void *data), void *data);
+void kb_linux_kernel_f_setown(void *file, void *pid, int type, int force);
 void *kb_linux_kernel_find_vma(void *mm, unsigned long addr);
 void *kb_linux_kernel_find_vma_intersection(void *mm, unsigned long start, unsigned long end);
 int kb_linux_kernel_follow_pfn(void *vma, unsigned long address, unsigned long *pfn);

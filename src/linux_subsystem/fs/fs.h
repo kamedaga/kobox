@@ -158,6 +158,7 @@ kb_status_t kb_fs_subsystem_write(kb_interface_t *interface, const kb_fs_write_d
 kb_status_t kb_fs_subsystem_readdir(kb_interface_t *interface, const kb_fs_readdir_desc_t *desc);
 int kb_fs_subsystem_register_filesystem(void *fs_type);
 int kb_fs_subsystem_unregister_filesystem(void *fs_type);
+void *kb_fs_subsystem_mount_registered(const char *name, int flags, const char *dev_name, void *data);
 int kb_fs_block_device_create(const kb_fs_block_device_desc_t *desc, kb_fs_block_device_t **out_device);
 int kb_fs_block_device_create_image(const char *name, const char *image_path, kb_fs_block_device_t **out_device);
 int kb_fs_block_device_create_from_disk(const char *name, void *disk, kb_fs_block_device_t **out_device);
@@ -215,11 +216,17 @@ void *kb_fs_subsystem_iget_locked(void *super_block, unsigned long inode_number)
 void *kb_fs_subsystem_new_inode(void *super_block);
 void kb_fs_subsystem_free_fake_inode(void *inode);
 int kb_fs_subsystem_inode_init_owner(void *idmap, void *inode, void *dir, unsigned short mode);
+void kb_fs_subsystem_init_special_inode(void *inode, unsigned int mode, unsigned int rdev);
 void *kb_fs_subsystem_d_make_root(void *inode);
 void *kb_fs_subsystem_d_splice_alias(void *inode, void *dentry);
+void *kb_fs_subsystem_d_alloc_name(void *parent, const char *name);
+void kb_fs_subsystem_d_add(void *dentry, void *inode);
 void kb_fs_subsystem_d_instantiate(void *dentry, void *inode);
 void kb_fs_subsystem_d_instantiate_new(void *dentry, void *inode);
 void kb_fs_subsystem_iget_failed(void *inode);
+void *kb_fs_subsystem_mount_nodev(void *fs_type, int flags, void *data, int (*fill_super)(void *, void *, int));
+int kb_fs_subsystem_path_pts(void *path);
+int kb_fs_subsystem_path_devpts_index(void *path, unsigned index);
 void kb_fs_subsystem_unlock_new_inode(void *inode);
 void kb_fs_subsystem_set_nlink(void *inode, unsigned int nlink);
 void kb_fs_subsystem_clear_nlink(void *inode);
@@ -237,6 +244,9 @@ int kb_fs_subsystem_fscrypt_setup_filename(void *dir, const void *qstr, int look
 long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter);
 long kb_fs_subsystem_generic_write_checks(void *kiocb, void *iter);
 long kb_fs_subsystem_generic_perform_write(void *kiocb, void *iter);
+size_t kb_fs_subsystem_copy_to_iter(const void *addr, size_t bytes, void *iter);
+size_t kb_fs_subsystem_copy_from_iter(void *addr, size_t bytes, void *iter);
+void kb_fs_subsystem_iov_iter_revert(void *iter, size_t bytes);
 int kb_fs_subsystem_bmap(void *inode, uint64_t *block);
 int kb_fs_subsystem_sb_min_blocksize(void *super_block, int size);
 int kb_fs_subsystem_sb_set_blocksize(void *super_block, int size);

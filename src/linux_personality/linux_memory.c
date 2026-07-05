@@ -28,6 +28,7 @@ typedef struct kb_heap_allocation {
     size_t guard_offset;
     int mmap_backed;
     int arena_backed;
+    int page_backed;
     struct kb_heap_allocation *next;
 } kb_heap_allocation_t;
 
@@ -231,6 +232,9 @@ static int allocation_guards_ok(const kb_heap_allocation_t *record)
     if (record == NULL || record->raw == NULL || record->ptr == NULL) {
         return 0;
     }
+    if (record->page_backed) {
+        return 1;
+    }
     const unsigned char *raw = (const unsigned char *)record->raw + record->guard_offset;
     const unsigned char *user = record->ptr;
     return guard_matches(raw, KB_KMALLOC_GUARD_SIZE, 0xa5u) &&
@@ -274,6 +278,29 @@ size_t kb_kmalloc_usable_size(const void *ptr)
 void *kb_kmalloc(size_t size, unsigned int flags)
 {
     size_t actual_size = size == 0 ? 1 : size;
+    if (actual_size == KB_KMALLOC_MMAP_ALIGN && kmalloc_arena_enabled()) {
+        void *page = kb_alloc_pages_exact(actual_size, flags);
+        if (page != NULL) {
+            kb_heap_allocation_t *record = malloc(sizeof(*record));
+            if (record != NULL) {
+                memset(record, 0, sizeof(*record));
+                record->ptr = page;
+                record->raw = page;
+                record->size = actual_size;
+                record->raw_size = actual_size;
+                record->page_backed = 1;
+                track_heap_allocation(record);
+            }
+            if ((flags & KB_LINUX___GFP_ZERO) != 0) {
+                memset(page, 0, actual_size);
+            }
+            if (trace_memory()) {
+                fprintf(stderr, "kobox-shim: kmalloc page size=%zu flags=0x%x ptr=%p\n", size, flags, page);
+            }
+            return page;
+        }
+    }
+
     size_t record_size = align_up_size(sizeof(kb_heap_allocation_t), KB_KMALLOC_RECORD_ALIGN);
     if (record_size > SIZE_MAX - (2u * KB_KMALLOC_GUARD_SIZE) ||
         actual_size > SIZE_MAX - record_size - (2u * KB_KMALLOC_GUARD_SIZE))
@@ -455,6 +482,12 @@ void kb_kfree(void *ptr)
     size_t raw_size = record->raw_size;
     int mmap_backed = record->mmap_backed;
     int arena_backed = record->arena_backed;
+    int page_backed = record->page_backed;
+    if (page_backed) {
+        kb_free_pages_exact(ptr, raw_size);
+        free(record);
+        return;
+    }
     if (arena_backed) {
         if (raw_size >= sizeof(kb_heap_arena_free_block_t)) {
             kb_heap_arena_free_block_t *block = (kb_heap_arena_free_block_t *)raw;

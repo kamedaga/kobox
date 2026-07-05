@@ -72,6 +72,15 @@ static int routine_printk_message(const char *text)
         strncmp(text, "Ignoring bogus Namespace Identifiers", 36) == 0;
 }
 
+static int forced_printk_message(const char *text)
+{
+    if (text == NULL) {
+        return 0;
+    }
+    return strncmp(text, "kobox linux_tty_core:", 21) == 0 ||
+        strncmp(text, "kobox virtio_", 13) == 0;
+}
+
 static size_t safe_bounded_strlen(const char *text, size_t limit)
 {
     size_t length = 0;
@@ -476,7 +485,7 @@ int KB_STACK_REALIGN kb_vprintk_safe(const char *fmt, va_list args)
     va_end(copy);
 
     int level = printk_loglevel(fmt);
-    if (!printk_trace_enabled() && (level >= 5 || routine_printk_message(buffer))) {
+    if (!printk_trace_enabled() && !forced_printk_message(buffer) && (level >= 5 || routine_printk_message(buffer))) {
         return needed;
     }
 
@@ -494,7 +503,7 @@ static int KB_STACK_REALIGN kb_vprintk_filtered(const char *fmt, va_list args)
     va_end(copy);
 
     int level = printk_loglevel(fmt);
-    if (!printk_trace_enabled() && (level >= 5 || routine_printk_message(buffer))) {
+    if (!printk_trace_enabled() && !forced_printk_message(buffer) && (level >= 5 || routine_printk_message(buffer))) {
         return needed;
     }
 
