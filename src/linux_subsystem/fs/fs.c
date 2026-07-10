@@ -3456,16 +3456,20 @@ static uint32_t ext4_extent_node_block_number(const uint8_t *node, uint64_t file
         return 0;
     }
 
-    uint8_t *leaf = calloc(1, (size_t)block_size);
-    if (leaf == NULL) {
+    void *buffer_head = kb_fs_subsystem_bdev_getblk(
+        active_bdev_binding.bdev,
+        leaf_block,
+        (unsigned int)block_size,
+        0);
+    if (buffer_head == NULL) {
         return 0;
     }
-    uint64_t leaf_offset = leaf_block * block_size;
+    void *leaf = read_pointer_field(buffer_head, KB_FS_BUFFER_HEAD_DATA_OFFSET);
     uint32_t mapped = 0;
-    if (active_bdev_binding.device->read(active_bdev_binding.device->ctx, leaf_offset, leaf, (size_t)block_size) == 0) {
+    if (leaf != NULL) {
         mapped = ext4_extent_node_block_number(leaf, file_block, block_size, depth_limit - 1u);
     }
-    free(leaf);
+    kb_fs_subsystem_buffer_head_put(buffer_head);
     return mapped;
 }
 

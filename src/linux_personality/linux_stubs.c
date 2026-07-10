@@ -338,6 +338,40 @@ int kb_kill_pgrp(void *pgrp, int sig, int priv)
     return 0;
 }
 
+int kb_take_pending_pgrp_signal(uint64_t since, int *out_pgrp, int *out_sig, uint64_t *out_sequence)
+{
+    if (out_pgrp == NULL || out_sig == NULL || out_sequence == NULL) {
+        return -22;
+    }
+    *out_pgrp = 0;
+    *out_sig = 0;
+    *out_sequence = pending_pgrp_signal_sequence;
+
+    const kb_pending_pgrp_signal_t *selected = NULL;
+    for (size_t i = 0; i < pending_pgrp_signal_count(); i++) {
+        const kb_pending_pgrp_signal_t *candidate = &pending_pgrp_signals[i];
+        if (candidate->sequence == 0 || candidate->sequence <= since) {
+            continue;
+        }
+        if (selected == NULL || candidate->sequence < selected->sequence) {
+            selected = candidate;
+        }
+    }
+    if (selected == NULL) {
+        return 0;
+    }
+
+    const kb_stub_pid_t *record = (const kb_stub_pid_t *)selected->pgrp;
+    if (record == NULL || record->nr <= 0) {
+        *out_sequence = selected->sequence;
+        return 0;
+    }
+    *out_pgrp = record->nr;
+    *out_sig = selected->sig;
+    *out_sequence = selected->sequence;
+    return 1;
+}
+
 static int kb_record_task_signal(const char *source, int sig, void *info, void *task, int type)
 {
     if (sig < 0 || sig > 64) {

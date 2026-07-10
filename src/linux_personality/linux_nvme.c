@@ -375,11 +375,12 @@ static int nvme_block_map_kernel_buffer(void *request, void *buffer, unsigned in
                 return -95;
             }
 
-            uint64_t *prp_list = calloc(prp_count, sizeof(*prp_list));
+            uint64_t *prp_list = aligned_alloc(KB_NVME_PAGE_SIZE, KB_NVME_PAGE_SIZE);
             if (prp_list == NULL) {
                 kb_linux_block_request_unmap_dma(request);
                 return -12;
             }
+            memset(prp_list, 0, KB_NVME_PAGE_SIZE);
             for (size_t i = 0; i < prp_count; i++) {
                 prp_list[i] = second_prp + ((uint64_t)i * KB_NVME_PAGE_SIZE);
             }
@@ -997,7 +998,6 @@ static int nvme_block_complete_execute(void *request)
     }
 
     atomic_thread_fence(memory_order_seq_cst);
-    nvme_completion_poll_yield();
 
     unsigned char *nvmeq = kb_linux_block_request_driver_data(request);
     if (nvmeq == NULL) {
@@ -1026,59 +1026,74 @@ static int nvme_block_complete_execute(void *request)
 
     volatile unsigned char *completion = cq + ((size_t)head * 16u);
     uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
+    uint32_t request_tag = kb_linux_block_request_tag(request);
+    uint8_t request_gen = kb_linux_block_request_generation(request);
+    uint16_t completion_status = 0;
     unsigned char *poll_bar = qid == 0 ? nvme_bar_from_queue(nvmeq) : NULL;
     if (qid != 0) {
-        if (trace_nvme_enabled()) {
-            size_t queue_index = shim_nvme_queue_index(nvmeq);
-            void *tag_set = kb_linux_block_request_tag_set(request);
-            void *tag_request = kb_linux_block_request_tagset_request(request);
-            uint32_t request_tag = kb_linux_block_request_tag(request);
-            uint16_t command_id = read_u16((const void *)(completion + 12));
-            unsigned int command_gen = (unsigned int)((command_id >> 12) & 0xfu);
-            unsigned int request_gen = kb_linux_block_request_generation(request);
-            fprintf(
-                stderr,
-                "kobox blk-mq: irq lookup qid=%u queue=%zu tagset=%p tag=%u cid=0x%x gen=%u/%u request=%p tag_request=%p\n",
-                (unsigned)qid,
-                queue_index,
-                tag_set,
-                request_tag,
-                command_id,
-                command_gen,
-                request_gen,
-                request,
-                tag_request);
-        }
-        int irq_status = kb_wait_irq_signal_for_dev_id(nvmeq, 1000000000ull);
-        if (irq_status == 0) {
-            tracked_io_irq_waits++;
-            uint16_t irq_head = read_u16(nvmeq + KB_NVME_QUEUE_CQ_HEAD_OFFSET);
-            uint8_t irq_phase = *(uint8_t *)(nvmeq + KB_NVME_QUEUE_PHASE_OFFSET);
-            if (kb_linux_block_request_completed(request) || irq_head != head || irq_phase != phase) {
-                unsigned int end_status = kb_linux_block_request_end_status(request);
-                if (trace_nvme_enabled()) {
-                    fprintf(
-                        stderr,
-                        "kobox nvme: irq handler completed request=%p qid=%u head=%u->%u phase=%u->%u status=0x%x\n",
-                        request,
-                        (unsigned)qid,
-                        (unsigned)head,
-                        (unsigned)irq_head,
-                        (unsigned)phase,
-                        (unsigned)irq_phase,
-                        end_status);
-                }
-                return end_status == 0 ? 0 : -5;
+        int completion_ready = 0;
+        for (unsigned int spins = 0; spins < KB_NVME_EXECUTE_SPIN_BEFORE_SLEEP; spins++) {
+            if (nvme_completion_matches_request(
+                    completion,
+                    phase,
+                    request_tag,
+                    request_gen,
+                    &completion_status))
+            {
+                completion_ready = 1;
+                break;
             }
-        } else if (trace_nvme_enabled()) {
-            fprintf(stderr, "kobox nvme: irq wait failed qid=%u status=%d\n", (unsigned)qid, irq_status);
+        }
+        if (!completion_ready) {
+            if (trace_nvme_enabled()) {
+                size_t queue_index = shim_nvme_queue_index(nvmeq);
+                void *tag_set = kb_linux_block_request_tag_set(request);
+                void *tag_request = kb_linux_block_request_tagset_request(request);
+                uint32_t request_tag = kb_linux_block_request_tag(request);
+                uint16_t command_id = read_u16((const void *)(completion + 12));
+                unsigned int command_gen = (unsigned int)((command_id >> 12) & 0xfu);
+                unsigned int request_gen = kb_linux_block_request_generation(request);
+                fprintf(
+                    stderr,
+                    "kobox blk-mq: irq lookup qid=%u queue=%zu tagset=%p tag=%u cid=0x%x gen=%u/%u request=%p tag_request=%p\n",
+                    (unsigned)qid,
+                    queue_index,
+                    tag_set,
+                    request_tag,
+                    command_id,
+                    command_gen,
+                    request_gen,
+                    request,
+                    tag_request);
+            }
+            int irq_status = kb_wait_irq_signal_for_dev_id(nvmeq, 1000000000ull);
+            if (irq_status == 0) {
+                tracked_io_irq_waits++;
+                uint16_t irq_head = read_u16(nvmeq + KB_NVME_QUEUE_CQ_HEAD_OFFSET);
+                uint8_t irq_phase = *(uint8_t *)(nvmeq + KB_NVME_QUEUE_PHASE_OFFSET);
+                if (kb_linux_block_request_completed(request) || irq_head != head || irq_phase != phase) {
+                    unsigned int end_status = kb_linux_block_request_end_status(request);
+                    if (trace_nvme_enabled()) {
+                        fprintf(
+                            stderr,
+                            "kobox nvme: irq handler completed request=%p qid=%u head=%u->%u phase=%u->%u status=0x%x\n",
+                            request,
+                            (unsigned)qid,
+                            (unsigned)head,
+                            (unsigned)irq_head,
+                            (unsigned)phase,
+                            (unsigned)irq_phase,
+                            end_status);
+                    }
+                    return end_status == 0 ? 0 : -5;
+                }
+            } else if (trace_nvme_enabled()) {
+                fprintf(stderr, "kobox nvme: irq wait failed qid=%u status=%d\n", (unsigned)qid, irq_status);
+            }
         }
     }
 
     int completed = 0;
-    uint32_t request_tag = kb_linux_block_request_tag(request);
-    uint8_t request_gen = kb_linux_block_request_generation(request);
-    uint16_t completion_status = 0;
     uint64_t wait_start_ns = nvme_monotonic_ns();
     uint64_t wait_timeout_ns = qid == 0 ? KB_NVME_EXECUTE_ADMIN_TIMEOUT_NS : KB_NVME_EXECUTE_IO_POLL_TIMEOUT_NS;
     unsigned int spins = 0;

@@ -404,6 +404,7 @@ int kb_return_zero(void);
 int kb_return_one(void);
 char *kb_get_task_comm(char *buf, size_t buf_size, void *task);
 int kb_kill_pgrp(void *pgrp, int sig, int priv);
+int kb_take_pending_pgrp_signal(uint64_t since, int *out_pgrp, int *out_sig, uint64_t *out_sequence);
 int kb_group_send_sig_info(int sig, void *info, void *task, int type);
 int kb_send_signal_locked(int sig, void *info, void *task, int type);
 int kb_llist_add_batch(void *new_first, void *new_last, void *head);
