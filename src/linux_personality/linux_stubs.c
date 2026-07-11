@@ -16,6 +16,9 @@ enum {
     KB_STUB_PAGE_SIZE = 4096,
     KB_STUB_STRUCT_PAGE_SIZE = 64,
     KB_STUB_TASK_FLAGS_OFFSET = 0x0,
+    KB_STUB_TASK_PID_LINKS_OFFSET = 0x638,
+    KB_STUB_TASK_PID_LINK_STRIDE = 0x10,
+    KB_STUB_PID_TYPE_COUNT = 4,
     KB_STUB_TASK_COMM_OFFSET = 0xbd8,
     KB_STUB_TASK_COMM_LEN = 16,
     KB_STUB_TIF_SIGPENDING_BIT = 2,
@@ -62,7 +65,11 @@ typedef struct kb_pending_task_signal {
 typedef struct kb_stub_pid {
     int count;
     unsigned int level;
+    uint32_t lock;
+    uint32_t reserved0;
+    void *tasks[KB_STUB_PID_TYPE_COUNT];
     int nr;
+    uint32_t reserved1;
     void *task;
 } kb_stub_pid_t;
 
@@ -599,15 +606,30 @@ void *kb_find_vpid(int nr)
 
 void *kb_pid_task(void *pid, int type)
 {
-    (void)type;
     kb_stub_pid_t *record = (kb_stub_pid_t *)pid;
     if (record == NULL) {
         return NULL;
     }
-    if (record->task != NULL) {
-        return record->task;
+    void *task = record->task;
+    if (task == NULL) {
+        task = kb_loader_module_current_task(kb_loader_active_module());
+        record->task = task;
     }
-    return kb_loader_module_current_task(kb_loader_active_module());
+    if (task != NULL && type >= 0 && type < KB_STUB_PID_TYPE_COUNT) {
+        void *node = (uint8_t *)task + KB_STUB_TASK_PID_LINKS_OFFSET +
+            ((size_t)type * KB_STUB_TASK_PID_LINK_STRIDE);
+        for (size_t i = 0; i < sizeof(stub_pids) / sizeof(stub_pids[0]); i++) {
+            if (stub_pids[i].tasks[type] == node) {
+                stub_pids[i].tasks[type] = NULL;
+            }
+        }
+        void *next = NULL;
+        void *pprev = &record->tasks[type];
+        memcpy(node, &next, sizeof(next));
+        memcpy((uint8_t *)node + sizeof(void *), &pprev, sizeof(pprev));
+        record->tasks[type] = node;
+    }
+    return task;
 }
 
 int kb_pid_vnr(void *pid)
