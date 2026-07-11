@@ -432,6 +432,22 @@ static kb_drm_device_record_t *kb_drm_find_device(void *device)
     return NULL;
 }
 
+void *kb_drm_primary_device(void)
+{
+    for (size_t i = 0; i < KB_DRM_DEVICE_MAX; i++) {
+        if (drm_devices[i].device != NULL && drm_devices[i].registered) {
+            return drm_devices[i].device;
+        }
+    }
+    return NULL;
+}
+
+void *kb_drm_device_private(void *device)
+{
+    kb_drm_device_record_t *record = kb_drm_find_device(device);
+    return record == NULL ? NULL : kb_read_ptr(record->device, KB_DRM_DEVICE_PRIVATE_OFFSET);
+}
+
 static kb_drm_file_record_t *kb_drm_find_file(void *linux_file)
 {
     for (size_t i = 0; i < KB_DRM_FILE_MAX; i++) {

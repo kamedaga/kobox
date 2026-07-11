@@ -416,6 +416,8 @@ long kb_drm_compat_ioctl(void *linux_file, unsigned int command, unsigned long a
 void *kb_drmm_kmalloc(void *device, size_t size, unsigned int flags);
 void kb_drmm_kfree(void *device, void *memory);
 void *kb_drmm_universal_plane_alloc(void *device, size_t size);
+void *kb_drm_primary_device(void);
+void *kb_drm_device_private(void *device);
 char *kb_get_task_comm(char *buf, size_t buf_size, void *task);
 int kb_kill_pgrp(void *pgrp, int sig, int priv);
 int kb_take_pending_pgrp_signal(uint64_t since, int *out_pgrp, int *out_sig, uint64_t *out_sequence);
