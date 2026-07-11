@@ -1,5 +1,6 @@
 #include "kobox/shim.h"
 #include "loader/module_context.h"
+#include "linux_subsystem/fs/kernel_object_registry.h"
 #include "linux_subsystem/kvm/kvm_symbols.h"
 
 #include <stdarg.h>
@@ -92,6 +93,64 @@ static kb_stub_pid_t stub_pids[64];
 static uint64_t sysctl_registration_sequence;
 static uint64_t pending_pgrp_signal_sequence;
 static uint64_t pending_task_signal_sequence;
+
+enum {
+    KB_DRM_DEVICE_BYTES = 0x610,
+    KB_DRM_FILE_BYTES = 0x170,
+    KB_DRM_DEVICE_DEV_OFFSET = 0x08,
+    KB_DRM_DEVICE_DRIVER_OFFSET = 0x30,
+    KB_DRM_DEVICE_PRIVATE_OFFSET = 0x38,
+    KB_DRM_DEVICE_FEATURES_OFFSET = 0x68,
+    KB_DRM_DRIVER_OPEN_OFFSET = 0x08,
+    KB_DRM_DRIVER_POSTCLOSE_OFFSET = 0x10,
+    KB_DRM_DRIVER_DUMB_CREATE_OFFSET = 0x70,
+    KB_DRM_DRIVER_NAME_OFFSET = 0x98,
+    KB_DRM_DRIVER_DESC_OFFSET = 0xa0,
+    KB_DRM_DRIVER_DATE_OFFSET = 0xa8,
+    KB_DRM_DRIVER_FEATURES_OFFSET = 0xb0,
+    KB_DRM_DRIVER_MAJOR_OFFSET = 0x88,
+    KB_DRM_DRIVER_MINOR_OFFSET = 0x8c,
+    KB_DRM_DRIVER_PATCHLEVEL_OFFSET = 0x90,
+    KB_DRM_DRIVER_FOPS_OFFSET = 0xc8,
+    KB_DRM_LINUX_FILE_PRIVATE_DATA_OFFSET = 0xc8,
+    KB_DRM_MAJOR = 226,
+    KB_DRM_CARD0_MINOR = 0,
+    KB_DRM_DEVICE_MAX = 4,
+    KB_DRM_FILE_MAX = 64,
+};
+
+typedef struct kb_drm_device_record {
+    void *device;
+    void *driver;
+    void *cdev;
+    int registered;
+} kb_drm_device_record_t;
+
+typedef struct kb_drm_file_record {
+    void *linux_file;
+    void *drm_file;
+    kb_drm_device_record_t *device;
+} kb_drm_file_record_t;
+
+typedef struct kb_drm_version {
+    int version_major;
+    int version_minor;
+    int version_patchlevel;
+    size_t name_len;
+    char *name;
+    size_t date_len;
+    char *date;
+    size_t desc_len;
+    char *desc;
+} kb_drm_version_t;
+
+typedef struct kb_drm_get_cap {
+    uint64_t capability;
+    uint64_t value;
+} kb_drm_get_cap_t;
+
+static kb_drm_device_record_t drm_devices[KB_DRM_DEVICE_MAX];
+static kb_drm_file_record_t drm_files[KB_DRM_FILE_MAX];
 
 static size_t pending_pgrp_signal_count(void)
 {
@@ -285,6 +344,334 @@ int kb_return_zero(void)
 int kb_return_one(void)
 {
     return 1;
+}
+
+static void *kb_read_ptr(const void *base, size_t offset)
+{
+    void *value = NULL;
+    if (base != NULL) {
+        memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static uint64_t kb_read_u64(const void *base, size_t offset)
+{
+    uint64_t value = 0;
+    if (base != NULL) {
+        memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static int kb_read_int(const void *base, size_t offset)
+{
+    int value = 0;
+    if (base != NULL) {
+        memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
+static void kb_write_ptr(void *base, size_t offset, const void *value)
+{
+    memcpy((uint8_t *)base + offset, &value, sizeof(value));
+}
+
+static void kb_write_u64(void *base, size_t offset, uint64_t value)
+{
+    memcpy((uint8_t *)base + offset, &value, sizeof(value));
+}
+
+static int kb_drm_call_driver_open(void *function, void *device, void *file)
+{
+    if (function == NULL) {
+        return 0;
+    }
+    kb_module_t *owner = kb_module_find_owner_for_address(function);
+    kb_module_t *previous = kb_loader_active_module();
+    unsigned long old_gs = 0;
+    const int entered = owner != NULL && kb_loader_enter_module_context(owner, &old_gs) == KB_OK;
+    if (entered) {
+        kb_loader_set_active_module(owner);
+    }
+    const int result = ((int (*)(void *, void *))function)(device, file);
+    if (entered) {
+        kb_loader_leave_module_context(old_gs);
+        kb_loader_set_active_module(previous);
+    }
+    return result;
+}
+
+static void kb_drm_call_driver_postclose(void *function, void *device, void *file)
+{
+    if (function == NULL) {
+        return;
+    }
+    kb_module_t *owner = kb_module_find_owner_for_address(function);
+    kb_module_t *previous = kb_loader_active_module();
+    unsigned long old_gs = 0;
+    const int entered = owner != NULL && kb_loader_enter_module_context(owner, &old_gs) == KB_OK;
+    if (entered) {
+        kb_loader_set_active_module(owner);
+    }
+    ((void (*)(void *, void *))function)(device, file);
+    if (entered) {
+        kb_loader_leave_module_context(old_gs);
+        kb_loader_set_active_module(previous);
+    }
+}
+
+static kb_drm_device_record_t *kb_drm_find_device(void *device)
+{
+    for (size_t i = 0; i < KB_DRM_DEVICE_MAX; i++) {
+        if (drm_devices[i].device == device) {
+            return &drm_devices[i];
+        }
+    }
+    return NULL;
+}
+
+static kb_drm_file_record_t *kb_drm_find_file(void *linux_file)
+{
+    for (size_t i = 0; i < KB_DRM_FILE_MAX; i++) {
+        if (drm_files[i].linux_file == linux_file) {
+            return &drm_files[i];
+        }
+    }
+    return NULL;
+}
+
+void *kb_drm_dev_alloc(void *driver, void *parent)
+{
+    if (driver == NULL) {
+        return (void *)(intptr_t)-22;
+    }
+    kb_drm_device_record_t *record = NULL;
+    for (size_t i = 0; i < KB_DRM_DEVICE_MAX; i++) {
+        if (drm_devices[i].device == NULL) {
+            record = &drm_devices[i];
+            break;
+        }
+    }
+    if (record == NULL) {
+        return (void *)(intptr_t)-12;
+    }
+    void *device = kb_kzalloc(KB_DRM_DEVICE_BYTES, 0);
+    if (device == NULL) {
+        return (void *)(intptr_t)-12;
+    }
+    kb_write_ptr(device, KB_DRM_DEVICE_DEV_OFFSET, parent);
+    kb_write_ptr(device, KB_DRM_DEVICE_DRIVER_OFFSET, driver);
+    kb_write_u64(device, KB_DRM_DEVICE_FEATURES_OFFSET,
+        kb_read_u64(driver, KB_DRM_DRIVER_FEATURES_OFFSET));
+    record->device = device;
+    record->driver = driver;
+    return device;
+}
+
+int kb_drm_dev_register(void *device, unsigned long flags)
+{
+    (void)flags;
+    kb_drm_device_record_t *record = kb_drm_find_device(device);
+    if (record == NULL || record->registered) {
+        return record != NULL ? 0 : -22;
+    }
+    void *fops = kb_read_ptr(record->driver, KB_DRM_DRIVER_FOPS_OFFSET);
+    if (fops == NULL) {
+        return -22;
+    }
+    int status = kb_linux_kernel_register_chrdev(
+        KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, 64, "drm", fops);
+    if (status != 0) {
+        return status;
+    }
+    record->cdev = kb_linux_kernel_cdev_alloc();
+    if (record->cdev == NULL) {
+        kb_linux_kernel_unregister_chrdev(KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, 64, "drm");
+        return -12;
+    }
+    kb_linux_kernel_cdev_init(record->cdev, fops);
+    status = kb_linux_kernel_cdev_add(
+        record->cdev,
+        kb_linux_kernel_encode_dev(KB_DRM_MAJOR, KB_DRM_CARD0_MINOR),
+        1);
+    if (status != 0) {
+        kb_linux_kernel_unregister_chrdev(KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, 64, "drm");
+        return status;
+    }
+    record->registered = 1;
+    return 0;
+}
+
+void *kb_drm_dev_get(void *device)
+{
+    return kb_drm_find_device(device) != NULL ? device : NULL;
+}
+
+void kb_drm_dev_put(void *device)
+{
+    (void)device;
+}
+
+int kb_drm_dev_enter(void *device, int *index)
+{
+    kb_drm_device_record_t *record = kb_drm_find_device(device);
+    if (record == NULL || !record->registered) {
+        return 0;
+    }
+    if (index != NULL) {
+        *index = 0;
+    }
+    return 1;
+}
+
+void kb_drm_dev_exit(int index)
+{
+    (void)index;
+}
+
+void kb_drm_dev_unplug(void *device)
+{
+    kb_drm_device_record_t *record = kb_drm_find_device(device);
+    if (record != NULL) {
+        record->registered = 0;
+    }
+}
+
+int kb_drm_open(void *inode, void *linux_file)
+{
+    (void)inode;
+    if (linux_file == NULL || kb_drm_find_file(linux_file) != NULL) {
+        return -22;
+    }
+    kb_drm_device_record_t *device = NULL;
+    for (size_t i = 0; i < KB_DRM_DEVICE_MAX; i++) {
+        if (drm_devices[i].registered) {
+            device = &drm_devices[i];
+            break;
+        }
+    }
+    if (device == NULL) {
+        return -19;
+    }
+    kb_drm_file_record_t *record = NULL;
+    for (size_t i = 0; i < KB_DRM_FILE_MAX; i++) {
+        if (drm_files[i].linux_file == NULL) {
+            record = &drm_files[i];
+            break;
+        }
+    }
+    if (record == NULL) {
+        return -24;
+    }
+    void *drm_file = kb_kzalloc(KB_DRM_FILE_BYTES, 0);
+    if (drm_file == NULL) {
+        return -12;
+    }
+    const int status = kb_drm_call_driver_open(
+        kb_read_ptr(device->driver, KB_DRM_DRIVER_OPEN_OFFSET),
+        device->device,
+        drm_file);
+    if (status != 0) {
+        kb_kfree(drm_file);
+        return status;
+    }
+    record->linux_file = linux_file;
+    record->drm_file = drm_file;
+    record->device = device;
+    kb_write_ptr(linux_file, KB_DRM_LINUX_FILE_PRIVATE_DATA_OFFSET, drm_file);
+    return 0;
+}
+
+int kb_drm_release(void *inode, void *linux_file)
+{
+    (void)inode;
+    kb_drm_file_record_t *record = kb_drm_find_file(linux_file);
+    if (record == NULL) {
+        return -9;
+    }
+    kb_drm_call_driver_postclose(
+        kb_read_ptr(record->device->driver, KB_DRM_DRIVER_POSTCLOSE_OFFSET),
+        record->device->device,
+        record->drm_file);
+    kb_kfree(record->drm_file);
+    kb_write_ptr(linux_file, KB_DRM_LINUX_FILE_PRIVATE_DATA_OFFSET, NULL);
+    memset(record, 0, sizeof(*record));
+    return 0;
+}
+
+static void kb_drm_copy_version_string(size_t *length, char *destination, const char *source)
+{
+    const size_t capacity = *length;
+    const size_t source_length = source != NULL ? strlen(source) : 0;
+    if (destination != NULL && capacity != 0 && source_length != 0) {
+        const size_t copy_length = capacity < source_length ? capacity : source_length;
+        memcpy(destination, source, copy_length);
+    }
+    *length = source_length;
+}
+
+long kb_drm_ioctl(void *linux_file, unsigned int command, unsigned long argument)
+{
+    enum {
+        DRM_IOCTL_VERSION = 0xc0406400u,
+        DRM_IOCTL_GET_CAP = 0xc010640cu,
+        DRM_CAP_DUMB_BUFFER = 1,
+    };
+    kb_drm_file_record_t *record = kb_drm_find_file(linux_file);
+    if (record == NULL || argument == 0) {
+        return record == NULL ? -9 : -14;
+    }
+    void *driver = record->device->driver;
+    if (command == DRM_IOCTL_VERSION) {
+        kb_drm_version_t *version = (kb_drm_version_t *)(uintptr_t)argument;
+        version->version_major = kb_read_int(driver, KB_DRM_DRIVER_MAJOR_OFFSET);
+        version->version_minor = kb_read_int(driver, KB_DRM_DRIVER_MINOR_OFFSET);
+        version->version_patchlevel = kb_read_int(driver, KB_DRM_DRIVER_PATCHLEVEL_OFFSET);
+        kb_drm_copy_version_string(
+            &version->name_len, version->name,
+            (const char *)kb_read_ptr(driver, KB_DRM_DRIVER_NAME_OFFSET));
+        kb_drm_copy_version_string(
+            &version->date_len, version->date,
+            (const char *)kb_read_ptr(driver, KB_DRM_DRIVER_DATE_OFFSET));
+        kb_drm_copy_version_string(
+            &version->desc_len, version->desc,
+            (const char *)kb_read_ptr(driver, KB_DRM_DRIVER_DESC_OFFSET));
+        return 0;
+    }
+    if (command == DRM_IOCTL_GET_CAP) {
+        kb_drm_get_cap_t *cap = (kb_drm_get_cap_t *)(uintptr_t)argument;
+        if (cap->capability == DRM_CAP_DUMB_BUFFER) {
+            cap->value = kb_read_ptr(driver, KB_DRM_DRIVER_DUMB_CREATE_OFFSET) != NULL;
+            return 0;
+        }
+        return -22;
+    }
+    return -25;
+}
+
+long kb_drm_compat_ioctl(void *linux_file, unsigned int command, unsigned long argument)
+{
+    return kb_drm_ioctl(linux_file, command, argument);
+}
+
+void *kb_drmm_kmalloc(void *device, size_t size, unsigned int flags)
+{
+    (void)device;
+    return kb_kmalloc(size, flags);
+}
+
+void kb_drmm_kfree(void *device, void *memory)
+{
+    (void)device;
+    kb_kfree(memory);
+}
+
+void *kb_drmm_universal_plane_alloc(void *device, size_t size)
+{
+    (void)device;
+    return kb_kzalloc(size, 0);
 }
 
 char *kb_get_task_comm(char *buf, size_t buf_size, void *task)
