@@ -3,6 +3,7 @@
 #include "linux_subsystem/kvm/kvm_symbols.h"
 
 #include <stdint.h>
+#include <string.h>
 
 static int kb_pm_suspend_default_s2idle;
 static unsigned int kb_pm_suspend_global_flags;
@@ -128,6 +129,36 @@ static kb_timespec64_stub_t kb_ns_to_timespec64_stub(int64_t nsec)
     return ts;
 }
 
+static void kb_dma_fence_init(
+    void *fence,
+    const void *ops,
+    void *lock,
+    uint64_t context,
+    uint64_t seqno)
+{
+    enum {
+        KB_DMA_FENCE_BYTES = 0x40,
+        KB_DMA_FENCE_LOCK_OFFSET = 0x00,
+        KB_DMA_FENCE_OPS_OFFSET = 0x08,
+        KB_DMA_FENCE_CALLBACKS_OFFSET = 0x10,
+        KB_DMA_FENCE_CONTEXT_OFFSET = 0x20,
+        KB_DMA_FENCE_SEQNO_OFFSET = 0x28,
+        KB_DMA_FENCE_REFCOUNT_OFFSET = 0x38,
+    };
+    if (fence == NULL) return;
+    unsigned char *bytes = fence;
+    memset(bytes, 0, KB_DMA_FENCE_BYTES);
+    memcpy(bytes + KB_DMA_FENCE_LOCK_OFFSET, &lock, sizeof(lock));
+    memcpy(bytes + KB_DMA_FENCE_OPS_OFFSET, &ops, sizeof(ops));
+    void *callbacks = bytes + KB_DMA_FENCE_CALLBACKS_OFFSET;
+    memcpy(bytes + KB_DMA_FENCE_CALLBACKS_OFFSET, &callbacks, sizeof(callbacks));
+    memcpy(bytes + KB_DMA_FENCE_CALLBACKS_OFFSET + sizeof(callbacks), &callbacks, sizeof(callbacks));
+    memcpy(bytes + KB_DMA_FENCE_CONTEXT_OFFSET, &context, sizeof(context));
+    memcpy(bytes + KB_DMA_FENCE_SEQNO_OFFSET, &seqno, sizeof(seqno));
+    const uint32_t refcount = 1;
+    memcpy(bytes + KB_DMA_FENCE_REFCOUNT_OFFSET, &refcount, sizeof(refcount));
+}
+
 static const kb_linux_symbol_t stub_symbols[] = {
     {"__fentry__", (void *)(uintptr_t)&kb_noop_stub},
     {"__x86_return_thunk", (void *)(uintptr_t)&kb_noop_stub},
@@ -181,7 +212,7 @@ static const kb_linux_symbol_t stub_symbols[] = {
     {"crc32_le", (void *)(uintptr_t)&kb_return_zero},
     {"crc32_be", (void *)(uintptr_t)&kb_return_zero},
     {"cachemode2protval", (void *)(uintptr_t)&kb_return_zero},
-    {"dma_fence_init", (void *)(uintptr_t)&kb_noop_stub},
+    {"dma_fence_init", (void *)(uintptr_t)&kb_dma_fence_init},
     {"dma_fence_release", (void *)(uintptr_t)&kb_noop_stub},
     {"dma_resv_add_fence", (void *)(uintptr_t)&kb_noop_stub},
     {"dma_unmap_resource", (void *)(uintptr_t)&kb_noop_stub},
