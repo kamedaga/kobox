@@ -21,6 +21,7 @@ typedef struct kb_pachaos_dma_mapping kb_pachaos_dma_mapping_t;
 
 enum {
     KB_PACHAOS_PCI_BAR_COUNT = 6,
+    KB_PACHAOS_DEVICE_MAX = 8,
     KB_PACHAOS_MMIO_MAP_ATTEMPTS = 8,
     KB_LINUX_IORESOURCE_IO = 0x00000100,
     KB_LINUX_IORESOURCE_MEM = 0x00000200,
@@ -73,7 +74,8 @@ struct kb_device_irq {
 
 struct kb_pachaos_capsule_backend {
     kb_device_backend_t base;
-    struct kb_device device;
+    struct kb_device devices[KB_PACHAOS_DEVICE_MAX];
+    size_t device_count;
     uintptr_t next_mmio_hint;
     kb_pachaos_mmio_mapping_t *mmio_mappings;
     kb_pachaos_dma_mapping_t *dma_mappings;
@@ -454,9 +456,11 @@ static void pachaos_capsule_destroy(kb_device_backend_t *backend)
         }
         free(mapping);
     }
-    if (pacha_capsule_is_fd(pacha->device.device_fd)) {
-        (void)pacha_capsule_close(pacha->device.device_fd);
-        pacha->device.device_fd = -1;
+    for (size_t i = 0; i < pacha->device_count; i++) {
+        if (pacha_capsule_is_fd(pacha->devices[i].device_fd)) {
+            (void)pacha_capsule_close(pacha->devices[i].device_fd);
+            pacha->devices[i].device_fd = -1;
+        }
     }
     free(pacha);
 }
@@ -466,7 +470,7 @@ static kb_status_t pachaos_capsule_device_count(kb_device_backend_t *backend, si
     if (backend == NULL || out_count == NULL) {
         return KB_ERR_INVALID;
     }
-    *out_count = 1;
+    *out_count = from_backend(backend)->device_count;
     return KB_OK;
 }
 
@@ -475,10 +479,11 @@ static kb_status_t pachaos_capsule_device_at(kb_device_backend_t *backend, size_
     if (backend == NULL || out_device == NULL) {
         return KB_ERR_INVALID;
     }
-    if (index != 0) {
+    kb_pachaos_capsule_backend_t *pacha = from_backend(backend);
+    if (index >= pacha->device_count) {
         return KB_ERR_NOT_FOUND;
     }
-    *out_device = &from_backend(backend)->device;
+    *out_device = &pacha->devices[index];
     return KB_OK;
 }
 
@@ -1056,20 +1061,37 @@ static const kb_device_backend_ops_t pachaos_capsule_ops = {
 
 kb_status_t kb_pachaos_capsule_device_create(uint64_t device_capsule, kb_device_backend_t **out_backend)
 {
-    if (out_backend == NULL || device_capsule > INT32_MAX) {
+    return kb_pachaos_capsule_devices_create(&device_capsule, 1, out_backend);
+}
+
+kb_status_t kb_pachaos_capsule_devices_create(
+    const uint64_t *device_capsules,
+    size_t device_count,
+    kb_device_backend_t **out_backend)
+{
+    if (out_backend == NULL || device_capsules == NULL || device_count == 0 ||
+        device_count > KB_PACHAOS_DEVICE_MAX) {
         return KB_ERR_INVALID;
     }
     *out_backend = NULL;
 
-    const int device_fd = (int)device_capsule;
-    if (!pacha_capsule_is_fd(device_fd)) {
-        return KB_ERR_INVALID;
-    }
-
-    struct pacha_capsule_info info;
-    const int status = pacha_capsule_expect_kind(device_fd, PACHA_CAPSULE_KIND_DEVICE, &info);
-    if (status != 0) {
-        return status_from_pacha(status);
+    struct pacha_capsule_info infos[KB_PACHAOS_DEVICE_MAX];
+    int device_fds[KB_PACHAOS_DEVICE_MAX];
+    memset(infos, 0, sizeof(infos));
+    memset(device_fds, 0, sizeof(device_fds));
+    for (size_t i = 0; i < device_count; i++) {
+        if (device_capsules[i] > INT32_MAX) {
+            return KB_ERR_INVALID;
+        }
+        device_fds[i] = (int)device_capsules[i];
+        if (!pacha_capsule_is_fd(device_fds[i])) {
+            return KB_ERR_INVALID;
+        }
+        const int status = pacha_capsule_expect_kind(
+            device_fds[i], PACHA_CAPSULE_KIND_DEVICE, &infos[i]);
+        if (status != 0) {
+            return status_from_pacha(status);
+        }
     }
 
     kb_pachaos_capsule_backend_t *backend = calloc(1, sizeof(*backend));
@@ -1078,14 +1100,18 @@ kb_status_t kb_pachaos_capsule_device_create(uint64_t device_capsule, kb_device_
     }
 
     backend->base.ops = &pachaos_capsule_ops;
-    backend->device.backend = backend;
-    backend->device.device_fd = device_fd;
-    backend->device.info = info;
-    backend->device.dma_mask = UINT64_MAX;
-    backend->device.coherent_dma_mask = UINT64_MAX;
+    backend->device_count = device_count;
     backend->next_mmio_hint = KB_PACHAOS_MMIO_HINT_BASE;
-    configure_location_from_info(&backend->device);
-    refresh_pci_identity(&backend->device);
+    for (size_t i = 0; i < device_count; i++) {
+        struct kb_device *device = &backend->devices[i];
+        device->backend = backend;
+        device->device_fd = device_fds[i];
+        device->info = infos[i];
+        device->dma_mask = UINT64_MAX;
+        device->coherent_dma_mask = UINT64_MAX;
+        configure_location_from_info(device);
+        refresh_pci_identity(device);
+    }
 
     *out_backend = &backend->base;
     return KB_OK;

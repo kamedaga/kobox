@@ -369,6 +369,7 @@ int kb_pci_request_region(void *dev, int bar, const char *name);
 void kb_pci_release_region(void *dev, int bar);
 int kb_pci_select_bars(void *dev, unsigned long flags);
 int kb_pci_device_is_present(void *dev);
+kb_device_t *kb_pci_backend_device_for_linux_dev(const void *dev);
 void *kb_pci_iov_get_pf_drvdata(void *dev, void *driver);
 int kb_pci_iov_vf_id(void *dev);
 void kb_mutex_init(void *lock);

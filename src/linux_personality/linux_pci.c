@@ -80,7 +80,42 @@ typedef struct shim_pci_binding {
     int probed;
 } shim_pci_binding_t;
 
-static shim_pci_binding_t binding;
+enum { KB_PCI_BINDING_MAX = 8 };
+static shim_pci_binding_t bindings[KB_PCI_BINDING_MAX];
+static size_t binding_count = 1;
+static shim_pci_binding_t *active_binding = &bindings[0];
+static size_t registration_device_index;
+static int registration_reentry;
+#define binding (*active_binding)
+
+static shim_pci_binding_t *binding_for_linux_dev(const void *dev)
+{
+    if (dev != NULL) {
+        const uintptr_t address = (uintptr_t)dev;
+        for (size_t i = 0; i < binding_count; i++) {
+            const uintptr_t start = (uintptr_t)bindings[i].pci_dev_storage;
+            const uintptr_t end = start + sizeof(bindings[i].pci_dev_storage);
+            if (address >= start && address < end) {
+                return &bindings[i];
+            }
+        }
+    }
+    return active_binding;
+}
+
+static void activate_binding_for_linux_dev(const void *dev)
+{
+    shim_pci_binding_t *selected = binding_for_linux_dev(dev);
+    if (selected != NULL) {
+        active_binding = selected;
+    }
+}
+
+kb_device_t *kb_pci_backend_device_for_linux_dev(const void *dev)
+{
+    shim_pci_binding_t *selected = binding_for_linux_dev(dev);
+    return selected == NULL ? NULL : selected->device;
+}
 static void *mapped_bar0_addr;
 static size_t mapped_bar0_size;
 
@@ -265,6 +300,7 @@ typedef struct shim_msix_entry {
 
 int kb_pci_msix_unmask_entries(void *dev, const uint16_t *entries, unsigned int count)
 {
+    activate_binding_for_linux_dev(dev);
     if (entries == NULL || count == 0) {
         return -22;
     }
@@ -738,7 +774,11 @@ static kb_status_t first_device(kb_device_backend_t *backend, kb_device_t **out_
     if (ops == NULL || ops->device_at == NULL) {
         return KB_ERR_INVALID;
     }
-    return ops->device_at(backend, 0, out_device);
+    if (!registration_reentry && active_binding != NULL && active_binding->device != NULL) {
+        *out_device = active_binding->device;
+        return KB_OK;
+    }
+    return ops->device_at(backend, registration_reentry ? registration_device_index : 0, out_device);
 }
 
 static kb_status_t update_pci_command(uint16_t set_bits, uint16_t clear_bits)
@@ -1395,6 +1435,34 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
     }
 
     kb_device_backend_t *backend = kb_shim_current_device_backend();
+    const kb_device_backend_ops_t *backend_ops = kb_device_backend_get_ops(backend);
+    if (!registration_reentry) {
+        size_t device_count = 0;
+        if (backend_ops == NULL || backend_ops->device_count == NULL ||
+            backend_ops->device_count(backend, &device_count) != KB_OK || device_count == 0) {
+            return -19;
+        }
+        if (device_count > KB_PCI_BINDING_MAX) {
+            return -28;
+        }
+        binding_count = device_count;
+        memset(bindings, 0, sizeof(bindings));
+        int first_error = 0;
+        registration_reentry = 1;
+        for (registration_device_index = 0;
+             registration_device_index < device_count;
+             registration_device_index++) {
+            active_binding = &bindings[registration_device_index];
+            const int result = kb_pci_register_driver(driver, owner, mod_name);
+            if (result != 0 && first_error == 0) {
+                first_error = result;
+            }
+        }
+        registration_reentry = 0;
+        registration_device_index = 0;
+        active_binding = &bindings[0];
+        return first_error;
+    }
     kb_device_t *device = NULL;
     if (first_device(backend, &device) != KB_OK) {
         return -19;
@@ -1591,32 +1659,34 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
 
 void kb_pci_unregister_driver(void *driver)
 {
-    if (binding.driver == NULL || binding.driver != driver) {
-        return;
-    }
-    if (trace_pci_enabled()) {
-        fprintf(
-            stderr,
-            "kobox pci: pci_unregister_driver probed=%d remove=%p\n",
-            binding.probed,
-            (void *)binding.remove);
-    }
-    if (binding.probed && binding.remove != NULL) {
-        binding.remove(binding.pci_dev_storage);
-        if (trace_pci_enabled()) {
-            fprintf(stderr, "kobox pci: pci_unregister_driver remove returned\n");
+    for (size_t i = 0; i < binding_count; i++) {
+        active_binding = &bindings[i];
+        if (binding.driver == NULL || binding.driver != driver) {
+            continue;
         }
+        if (trace_pci_enabled()) {
+            fprintf(
+                stderr,
+                "kobox pci: pci_unregister_driver binding=%zu probed=%d remove=%p\n",
+                i,
+                binding.probed,
+                (void *)binding.remove);
+        }
+        if (binding.probed && binding.remove != NULL) {
+            binding.remove(binding.pci_dev_storage);
+            if (trace_pci_enabled()) {
+                fprintf(stderr, "kobox pci: pci_unregister_driver remove returned\n");
+            }
+        }
+        memset(&binding, 0, sizeof(binding));
     }
-    binding.driver = NULL;
-    binding.remove = NULL;
-    binding.device = NULL;
-    binding.probed = 0;
+    active_binding = &bindings[0];
 }
 
 int kb_pci_enable_device(void *dev)
 {
     const uint64_t start_cycles = pci_read_tsc();
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
 #if defined(__pachaos__)
     kb_pci_tracef("kobox pci: enable_device enter\n");
 #endif
@@ -1643,7 +1713,7 @@ int kb_pcim_enable_device(void *dev)
 
 void kb_pci_disable_device(void *dev)
 {
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
     if (trace_pci_enabled()) {
         fprintf(stderr, "kobox pci: pci_disable_device\n");
     }
@@ -1659,7 +1729,7 @@ void kb_pci_disable_device(void *dev)
 void kb_pci_set_master(void *dev)
 {
     const uint64_t start_cycles = pci_read_tsc();
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
 #if defined(__pachaos__)
     kb_pci_tracef("kobox pci: set_master enter\n");
 #endif
@@ -1710,7 +1780,7 @@ int kb_pci_set_mwi(void *dev)
 
 const void *kb_pci_match_id(const void *id_table, void *dev)
 {
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
     if (id_table == NULL || binding.device == NULL) {
         return NULL;
     }
@@ -1727,7 +1797,7 @@ const void *kb_pci_match_id(const void *id_table, void *dev)
 
 static int read_config_bytes(void *dev, int where, void *dst, size_t len)
 {
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
     if (where < 0 || dst == NULL || len == 0 || (size_t)where + len > 4096u) {
         return -22;
     }
@@ -1840,7 +1910,7 @@ int kb_pci_read_config_dword(void *dev, int where, uint32_t *value)
 
 static int write_config_bytes(void *dev, int where, const void *src, size_t len)
 {
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
     if (where < 0 || src == NULL || len == 0 || (size_t)where + len > 4096u) {
         return -22;
     }
@@ -2094,7 +2164,7 @@ void *kb_pci_get_class(unsigned int class, void *from)
 
 void *kb_pci_iomap(void *dev, int bar, unsigned long max)
 {
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
     (void)max;
 #if defined(__pachaos__)
     kb_pci_tracef("kobox pci: pci_iomap enter bar=%d max=%lu\n", bar, max);
@@ -2176,6 +2246,7 @@ void *kb_pci_iomap_range(void *dev, int bar, unsigned long offset, unsigned long
 
 void *kb_pcim_iomap(void *dev, int bar, unsigned long max)
 {
+    activate_binding_for_linux_dev(dev);
     void *addr = kb_pci_iomap(dev, bar, max);
     if (bar >= 0 && bar < (int)(sizeof(binding.pcim_iomap_table) / sizeof(binding.pcim_iomap_table[0]))) {
         binding.pcim_iomap_table[bar] = addr;
@@ -2202,7 +2273,7 @@ int kb_pcim_iomap_regions_request_all(void *dev, int mask, const char *name)
 
 void **kb_pcim_iomap_table(void *dev)
 {
-    (void)dev;
+    activate_binding_for_linux_dev(dev);
     return binding.pcim_iomap_table;
 }
 

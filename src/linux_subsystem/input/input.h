@@ -9,6 +9,8 @@ enum {
     KB_INPUT_PHYS_MAX = 128,
     KB_INPUT_UNIQ_MAX = 128,
     KB_INPUT_ABS_MAX = 64,
+    KB_INPUT_KEY_WORDS = 12,
+    KB_INPUT_FF_WORDS = 2,
     KB_INPUT_EVENT_QUEUE_MAX = 1024,
     KB_INPUT_LINUX_DEVICE_STORAGE_SIZE = 8192,
 };
@@ -22,10 +24,12 @@ typedef struct kb_input_id {
 
 typedef struct kb_input_abs_params {
     int active;
+    int value;
     int minimum;
     int maximum;
     int fuzz;
     int flat;
+    int resolution;
 } kb_input_abs_params_t;
 
 typedef struct kb_input_device_snapshot {
@@ -36,6 +40,16 @@ typedef struct kb_input_device_snapshot {
     char phys[KB_INPUT_PHYS_MAX];
     char uniq[KB_INPUT_UNIQ_MAX];
     kb_input_id_t input_id;
+    uint64_t prop_bits;
+    uint64_t event_bits;
+    uint64_t key_bits[KB_INPUT_KEY_WORDS];
+    uint64_t rel_bits;
+    uint64_t abs_bits;
+    uint64_t msc_bits;
+    uint64_t led_bits;
+    uint64_t snd_bits;
+    uint64_t ff_bits[KB_INPUT_FF_WORDS];
+    uint64_t sw_bits;
     unsigned long event_count;
     unsigned long dropped_events;
     int opened;

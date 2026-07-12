@@ -30,7 +30,10 @@ static kb_dma_dir_t linux_dma_dir(int dir)
 
 static kb_device_t *dma_device(void *dev)
 {
-    (void)dev;
+    kb_device_t *device = kb_pci_backend_device_for_linux_dev(dev);
+    if (device != NULL) {
+        return device;
+    }
     return kb_subsystem_dma_default_device(kb_shim_current_device_backend());
 }
 

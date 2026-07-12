@@ -10,14 +10,27 @@ enum {
     KB_LINUX_INPUT_DEV_PHYS_OFFSET = 8,
     KB_LINUX_INPUT_DEV_UNIQ_OFFSET = 16,
     KB_LINUX_INPUT_DEV_ID_OFFSET = 24,
+    KB_LINUX_6_8_INPUT_DEV_PROPBIT_OFFSET = 32,
+    KB_LINUX_6_8_INPUT_DEV_EVBIT_OFFSET = 40,
+    KB_LINUX_6_8_INPUT_DEV_KEYBIT_OFFSET = 48,
+    KB_LINUX_6_8_INPUT_DEV_RELBIT_OFFSET = 144,
+    KB_LINUX_6_8_INPUT_DEV_ABSBIT_OFFSET = 152,
+    KB_LINUX_6_8_INPUT_DEV_MSCBIT_OFFSET = 160,
+    KB_LINUX_6_8_INPUT_DEV_LEDBIT_OFFSET = 168,
+    KB_LINUX_6_8_INPUT_DEV_SNDBIT_OFFSET = 176,
+    KB_LINUX_6_8_INPUT_DEV_FFBIT_OFFSET = 184,
+    KB_LINUX_6_8_INPUT_DEV_SWBIT_OFFSET = 200,
+    KB_LINUX_6_8_INPUT_DEV_ABSINFO_OFFSET = 328,
     KB_LINUX_6_8_INPUT_DEV_OPEN_OFFSET = 456,
     KB_LINUX_6_8_INPUT_DEV_CLOSE_OFFSET = 464,
+    KB_LINUX_6_8_INPUT_ABSINFO_SIZE = 24,
 };
 
 typedef struct kb_input_device_record {
     kb_input_device_snapshot_t snapshot;
     int allocated;
     int absinfo_allocated;
+    void *absinfo;
 } kb_input_device_record_t;
 
 typedef int (*kb_linux_input_open_fn)(void *dev);
@@ -244,6 +257,34 @@ static void refresh_device_snapshot(kb_input_device_record_t *record)
         trust_device_strings_enabled() ? linux_input_string(dev, KB_LINUX_INPUT_DEV_UNIQ_OFFSET) : NULL,
         "");
     record->snapshot.input_id = linux_input_id(dev);
+    memcpy(&record->snapshot.prop_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_PROPBIT_OFFSET, sizeof(record->snapshot.prop_bits));
+    memcpy(&record->snapshot.event_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_EVBIT_OFFSET, sizeof(record->snapshot.event_bits));
+    memcpy(record->snapshot.key_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_KEYBIT_OFFSET, sizeof(record->snapshot.key_bits));
+    memcpy(&record->snapshot.rel_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_RELBIT_OFFSET, sizeof(record->snapshot.rel_bits));
+    memcpy(&record->snapshot.abs_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_ABSBIT_OFFSET, sizeof(record->snapshot.abs_bits));
+    memcpy(&record->snapshot.msc_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_MSCBIT_OFFSET, sizeof(record->snapshot.msc_bits));
+    memcpy(&record->snapshot.led_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_LEDBIT_OFFSET, sizeof(record->snapshot.led_bits));
+    memcpy(&record->snapshot.snd_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_SNDBIT_OFFSET, sizeof(record->snapshot.snd_bits));
+    memcpy(record->snapshot.ff_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_FFBIT_OFFSET, sizeof(record->snapshot.ff_bits));
+    memcpy(&record->snapshot.sw_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_SWBIT_OFFSET, sizeof(record->snapshot.sw_bits));
+    if (record->absinfo != NULL) {
+        for (size_t axis = 0; axis < KB_INPUT_ABS_MAX; axis++) {
+            int values[6];
+            memcpy(values, (unsigned char *)record->absinfo +
+                (axis * KB_LINUX_6_8_INPUT_ABSINFO_SIZE), sizeof(values));
+            if (((record->snapshot.abs_bits >> axis) & 1u) != 0) {
+                record->snapshot.abs[axis] = (kb_input_abs_params_t){
+                    .active = 1,
+                    .value = values[0],
+                    .minimum = values[1],
+                    .maximum = values[2],
+                    .fuzz = values[3],
+                    .flat = values[4],
+                    .resolution = values[5],
+                };
+            }
+        }
+    }
 }
 
 static int open_input_record(kb_input_device_record_t *record)
@@ -256,7 +297,9 @@ static int open_input_record(kb_input_device_record_t *record)
     kb_linux_input_open_fn open_fn =
         (kb_linux_input_open_fn)linux_input_ptr(dev, KB_LINUX_6_8_INPUT_DEV_OPEN_OFFSET);
     if (open_fn == NULL || pointer_is_error_or_low((const void *)open_fn)) {
-        return 0;
+        record->snapshot.open_result = 0;
+        record->snapshot.opened = 1;
+        return 1;
     }
 
     unsigned long old_gs = 0;
@@ -335,6 +378,8 @@ void kb_input_subsystem_free_device(void *dev)
     if (record == NULL) {
         return;
     }
+    free(record->absinfo);
+    record->absinfo = NULL;
     if (record->allocated) {
         kb_kfree(dev);
     }
@@ -347,6 +392,7 @@ int kb_input_subsystem_register_device(void *dev)
     if (record == NULL) {
         return -12;
     }
+    *(unsigned long *)((unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_EVBIT_OFFSET) |= 1ul;
     record->snapshot.active = 1;
     refresh_device_snapshot(record);
     return 0;
@@ -361,6 +407,8 @@ void kb_input_subsystem_unregister_device(void *dev)
     close_input_record(record);
     record->snapshot.active = 0;
     if (record->allocated) {
+        free(record->absinfo);
+        record->absinfo = NULL;
         kb_kfree(dev);
         memset(record, 0, sizeof(*record));
     }
@@ -413,12 +461,24 @@ void kb_input_subsystem_set_abs_params(
         .fuzz = fuzz,
         .flat = flat,
     };
+    kb_input_subsystem_alloc_absinfo(dev);
+    if (record->absinfo != NULL) {
+        int values[6] = { 0, minimum, maximum, fuzz, flat, 0 };
+        memcpy((unsigned char *)record->absinfo +
+            ((size_t)axis * KB_LINUX_6_8_INPUT_ABSINFO_SIZE), values, sizeof(values));
+    }
 }
 
 void kb_input_subsystem_alloc_absinfo(void *dev)
 {
     kb_input_device_record_t *record = alloc_record(dev);
-    if (record != NULL) {
+    if (record != NULL && !record->absinfo_allocated) {
+        record->absinfo = calloc(KB_INPUT_ABS_MAX, KB_LINUX_6_8_INPUT_ABSINFO_SIZE);
+        if (record->absinfo == NULL) {
+            return;
+        }
+        memcpy((unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_ABSINFO_OFFSET,
+            &record->absinfo, sizeof(record->absinfo));
         record->absinfo_allocated = 1;
     }
 }
@@ -605,6 +665,8 @@ void kb_input_subsystem_reset(void)
     kb_input_subsystem_close_registered_devices();
     for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
         if (input_devices[i].allocated && input_devices[i].snapshot.linux_dev != NULL) {
+            free(input_devices[i].absinfo);
+            input_devices[i].absinfo = NULL;
             kb_kfree(input_devices[i].snapshot.linux_dev);
         }
         memset(&input_devices[i], 0, sizeof(input_devices[i]));
