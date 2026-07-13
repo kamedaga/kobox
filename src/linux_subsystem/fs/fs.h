@@ -235,8 +235,6 @@ void kb_fs_subsystem_inc_nlink(void *inode);
 void kb_fs_subsystem_mark_inode_freeing(void *inode);
 int kb_fs_subsystem_ext4_detach_inode_data_blocks(void *inode);
 int kb_fs_subsystem_ext4_detach_inode_data_blocks_deferred(void *inode);
-int kb_fs_subsystem_ext4_release_inode_record(void *super_block, uint64_t inode_number);
-int kb_fs_subsystem_ext4_release_inode_records(void *super_block, const uint64_t *inode_numbers, size_t count);
 int kb_fs_subsystem_dquot_alloc_space(void *inode, uint64_t bytes, int flags);
 void kb_fs_subsystem_dquot_free_space(void *inode, uint64_t bytes, int flags);
 int kb_fs_subsystem_fscrypt_match_name(const void *fname, const void *de_name, unsigned int de_name_len);
