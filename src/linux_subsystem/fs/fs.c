@@ -103,6 +103,9 @@ enum {
     KB_FS_EXT4_GROUP_INFO_BB_FREE_OFFSET = 0x14,
     KB_FS_EXT4_GROUP_INFO_GROUP_OFFSET = 0x24,
     KB_FS_EXT4_GROUP_INFO_PREALLOC_LIST_OFFSET = 0x28,
+    KB_FS_EXT4_GROUP_INFO_NEED_INIT = 1u << 0,
+    KB_FS_EXT4_FREE_BLOCKS_VALIDATED = 0x0004,
+    KB_FS_EXT4_FREE_BLOCKS_NO_QUOT_UPDATE = 0x0008,
     KB_FS_DENTRY_PARENT_OFFSET = 0x18,
     KB_FS_DENTRY_QSTR_OFFSET = 0x20,
     KB_FS_DENTRY_INODE_OFFSET = 0x30,
@@ -3806,12 +3809,16 @@ int kb_fs_subsystem_ext4_sync_super_free_blocks(void *super_block)
     return 0;
 }
 
-static int ext4_free_direct_data_block(void *super_block, uint32_t disk_block, uint64_t block_size)
+static int ext4_free_direct_data_block(
+    void *inode,
+    void *super_block,
+    uint32_t disk_block,
+    uint64_t block_size)
 {
-    if (super_block == NULL || disk_block == 0 ||
+    if (inode == NULL || super_block == NULL || disk_block == 0 ||
+        active_bdev_binding.bdev == NULL ||
         active_bdev_binding.device == NULL ||
-        active_bdev_binding.device->read == NULL ||
-        active_bdev_binding.device->write == NULL)
+        active_bdev_binding.device->read == NULL)
     {
         return -5;
     }
@@ -3820,11 +3827,7 @@ static int ext4_free_direct_data_block(void *super_block, uint32_t disk_block, u
     }
 
     uint8_t super_disk[1024];
-    if (active_bdev_binding.device->read(
-            active_bdev_binding.device->ctx,
-            KB_FS_EXT4_SUPER_OFFSET,
-            super_disk,
-            sizeof(super_disk)) != 0)
+    if (active_bdev_read_exact(KB_FS_EXT4_SUPER_OFFSET, super_disk, sizeof(super_disk)) != 0)
     {
         return -5;
     }
@@ -3863,6 +3866,8 @@ static int ext4_free_direct_data_block(void *super_block, uint32_t disk_block, u
         return -5;
     }
     uint32_t bitmap_block = read_le32_fs(group_desc + KB_FS_EXT4_GROUP_DESC_BLOCK_BITMAP_LO_OFFSET);
+    uint16_t group_free_before =
+        read_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET);
     if (bitmap_block == 0) {
         return -5;
     }
@@ -3885,14 +3890,38 @@ static int ext4_free_direct_data_block(void *super_block, uint32_t disk_block, u
     if ((*byte & mask) == 0) {
         goto done;
     }
-    *byte &= (uint8_t)~mask;
-    if (buffer_cache_dirty_block_write(
-            active_bdev_binding.bdev,
-            bitmap_block,
-            block_size,
-            0,
+
+    typedef void (*ext4_free_blocks_fn)(
+        void *, void *, void *, uint64_t, unsigned long, int);
+    ext4_free_blocks_fn ext4_free_blocks =
+        (ext4_free_blocks_fn)kb_module_lookup_exported_symbol("ext4_free_blocks");
+    if (ext4_free_blocks == NULL)
+    {
+        status = -95;
+        goto done;
+    }
+
+    unsigned long old_gs = 0;
+    int has_gs = kb_fs_enter_ext4_call((void *)ext4_free_blocks, &old_gs);
+    ext4_free_blocks(
+        NULL,
+        inode,
+        NULL,
+        disk_block,
+        1,
+        KB_FS_EXT4_FREE_BLOCKS_VALIDATED | KB_FS_EXT4_FREE_BLOCKS_NO_QUOT_UPDATE);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+
+    if (active_bdev_read_exact(
+            (uint64_t)bitmap_block * block_size,
             bitmap,
-            (size_t)block_size) != 0)
+            (size_t)block_size) != 0 ||
+        (bitmap[bit >> 3] & mask) != 0 ||
+        active_bdev_read_exact(desc_offset, group_desc, desc_size) != 0 ||
+        read_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET) !=
+            (uint16_t)(group_free_before + 1u))
     {
         status = -5;
         goto done;
@@ -3952,7 +3981,11 @@ static int ext4_detach_inode_data_blocks(void *inode, int sync_counts)
                 }
                 continue;
             }
-            int status = ext4_free_direct_data_block(super_block, (uint32_t)disk_block, block_size);
+            int status = ext4_free_direct_data_block(
+                inode,
+                super_block,
+                (uint32_t)disk_block,
+                block_size);
             if (status != 0 && first_error == 0) {
                 first_error = status;
             }
@@ -4056,8 +4089,7 @@ static int ext4_allocate_data_block_for_inode(void *inode, uint64_t file_block, 
         return -5;
     }
 
-    void *super_block = NULL;
-    memcpy(&super_block, (const uint8_t *)inode + KB_FS_INODE_SB_OFFSET, sizeof(super_block));
+    void *super_block = read_pointer_field(inode, KB_FS_INODE_SB_OFFSET);
     uint64_t block_size = 0;
     if (super_block != NULL) {
         memcpy(&block_size, (const uint8_t *)super_block + KB_FS_SUPER_BLOCK_BLOCKSIZE_OFFSET, sizeof(block_size));
@@ -4067,18 +4099,25 @@ static int ext4_allocate_data_block_for_inode(void *inode, uint64_t file_block, 
     }
 
     uint8_t super_disk[1024];
-    if (active_bdev_read_exact(KB_FS_EXT4_SUPER_OFFSET, super_disk, sizeof(super_disk)) != 0)
+    if (active_bdev_read_exact(KB_FS_EXT4_SUPER_OFFSET, super_disk, sizeof(super_disk)) != 0 ||
+        read_le16_fs(super_disk + KB_FS_EXT4_SUPER_MAGIC_OFFSET) != 0xef53u)
     {
         return -5;
     }
-    if (read_le16_fs(super_disk + KB_FS_EXT4_SUPER_MAGIC_OFFSET) != 0xef53u) {
-        return -5;
+
+    typedef void (*ext4_mb_mark_bb_fn)(void *, uint64_t, int, int);
+    typedef void *(*ext4_get_group_info_fn)(void *, unsigned int);
+    ext4_mb_mark_bb_fn ext4_mb_mark_bb =
+        (ext4_mb_mark_bb_fn)kb_module_lookup_exported_symbol("ext4_mb_mark_bb");
+    ext4_get_group_info_fn ext4_get_group_info =
+        (ext4_get_group_info_fn)kb_module_lookup_exported_symbol("ext4_get_group_info");
+    if (ext4_mb_mark_bb == NULL || ext4_get_group_info == NULL) {
+        return -95;
     }
 
     uint32_t blocks_count = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_BLOCKS_COUNT_LO_OFFSET);
     uint32_t first_data_block = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_FIRST_DATA_BLOCK_OFFSET);
     uint32_t blocks_per_group = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_BLOCKS_PER_GROUP_OFFSET);
-    uint32_t free_blocks = read_le32_fs(super_disk + KB_FS_EXT4_SUPER_FREE_BLOCKS_COUNT_LO_OFFSET);
     uint16_t desc_size = read_le16_fs(super_disk + KB_FS_EXT4_SUPER_DESC_SIZE_OFFSET);
     if (blocks_count == 0 || blocks_per_group == 0 || first_data_block >= blocks_count) {
         return -5;
@@ -4086,15 +4125,17 @@ static int ext4_allocate_data_block_for_inode(void *inode, uint64_t file_block, 
     if (desc_size < 32) {
         desc_size = 32;
     }
-    if (desc_size > 1024) {
+    if (desc_size > sizeof(super_disk)) {
         return -5;
     }
 
-    uint64_t groups64 = ((uint64_t)blocks_count - first_data_block + blocks_per_group - 1u) / blocks_per_group;
-    if (groups64 == 0 || groups64 > 4096u) {
+    uint64_t group_count =
+        ((uint64_t)blocks_count - first_data_block + blocks_per_group - 1u) /
+        blocks_per_group;
+    if (group_count == 0 || group_count > 4096u) {
         return -5;
     }
-    uint64_t group_desc_table = (block_size == 1024u ? 2u : 1u) * block_size;
+    const uint64_t group_desc_table = (block_size == 1024u ? 2u : 1u) * block_size;
     uint8_t group_desc[1024];
     uint8_t *bitmap = calloc(1, (size_t)block_size);
     uint8_t *zero = calloc(1, (size_t)block_size);
@@ -4105,24 +4146,20 @@ static int ext4_allocate_data_block_for_inode(void *inode, uint64_t file_block, 
     }
 
     int status = -28;
-    for (uint64_t group = 0; group < groups64; group++) {
-        uint64_t desc_offset = group_desc_table + (group * desc_size);
-        if (active_bdev_binding.device->read(
-                active_bdev_binding.device->ctx,
-                desc_offset,
-                group_desc,
-                desc_size) != 0)
-        {
+    for (uint64_t group = 0; group < group_count; group++) {
+        const uint64_t desc_offset = group_desc_table + (group * desc_size);
+        if (active_bdev_read_exact(desc_offset, group_desc, desc_size) != 0) {
             status = -5;
             break;
         }
-        uint32_t bitmap_block = read_le32_fs(group_desc + KB_FS_EXT4_GROUP_DESC_BLOCK_BITMAP_LO_OFFSET);
-        uint16_t group_free = read_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET);
+        const uint32_t bitmap_block =
+            read_le32_fs(group_desc + KB_FS_EXT4_GROUP_DESC_BLOCK_BITMAP_LO_OFFSET);
+        const uint16_t group_free =
+            read_le16_fs(group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET);
         if (bitmap_block == 0 || group_free == 0) {
             continue;
         }
-        if (active_bdev_binding.device->read(
-                active_bdev_binding.device->ctx,
+        if (active_bdev_read_exact(
                 (uint64_t)bitmap_block * block_size,
                 bitmap,
                 (size_t)block_size) != 0)
@@ -4131,67 +4168,71 @@ static int ext4_allocate_data_block_for_inode(void *inode, uint64_t file_block, 
             break;
         }
 
-        uint64_t group_first_block = (uint64_t)first_data_block + (group * blocks_per_group);
+        const uint64_t group_first_block =
+            (uint64_t)first_data_block + (group * blocks_per_group);
         uint64_t group_block_count = blocks_per_group;
         if (group_first_block + group_block_count > blocks_count) {
             group_block_count = blocks_count - group_first_block;
         }
         for (uint64_t bit = 0; bit < group_block_count; bit++) {
-            uint8_t mask = (uint8_t)(1u << (bit & 7u));
+            const uint8_t mask = (uint8_t)(1u << (bit & 7u));
             if ((bitmap[bit >> 3] & mask) != 0) {
                 continue;
             }
 
-            uint64_t disk_block64 = group_first_block + bit;
-            if (disk_block64 == 0 || disk_block64 > UINT32_MAX) {
+            const uint64_t disk_block = group_first_block + bit;
+            if (disk_block == 0 || disk_block > UINT32_MAX) {
                 continue;
             }
-            bitmap[bit >> 3] |= mask;
-            if (active_bdev_binding.device->write(
-                    active_bdev_binding.device->ctx,
+            unsigned long old_gs = 0;
+            int has_gs = kb_fs_enter_ext4_call((void *)ext4_mb_mark_bb, &old_gs);
+            ext4_mb_mark_bb(super_block, disk_block, 1, 1);
+            if (has_gs) {
+                kb_shim_leave_kernel_gs(old_gs);
+            }
+
+            old_gs = 0;
+            has_gs = kb_fs_enter_ext4_call((void *)ext4_get_group_info, &old_gs);
+            void *group_info = ext4_get_group_info(super_block, (unsigned int)group);
+            if (has_gs) {
+                kb_shim_leave_kernel_gs(old_gs);
+            }
+            if (group_info == NULL) {
+                status = -5;
+                goto done;
+            }
+            write_u32_field(
+                group_info,
+                KB_FS_EXT4_GROUP_INFO_BB_FREE_OFFSET,
+                (uint32_t)(group_free - 1u));
+            /* ext4_mb_mark_bb updates disk metadata, but its replay contract does not rebuild the buddy. */
+            __atomic_fetch_or(
+                (unsigned long *)group_info,
+                (unsigned long)KB_FS_EXT4_GROUP_INFO_NEED_INIT,
+                __ATOMIC_RELEASE);
+
+            if (active_bdev_read_exact(
                     (uint64_t)bitmap_block * block_size,
                     bitmap,
-                    (size_t)block_size) != 0)
+                    (size_t)block_size) != 0 ||
+                (bitmap[bit >> 3] & mask) == 0)
             {
                 status = -5;
                 goto done;
             }
-            if (active_bdev_binding.device->write(
-                    active_bdev_binding.device->ctx,
-                    disk_block64 * block_size,
-                    zero,
-                    (size_t)block_size) != 0)
-            {
-                status = -5;
+            status = buffer_cache_dirty_block_write(
+                active_bdev_binding.bdev,
+                disk_block,
+                block_size,
+                0,
+                zero,
+                (size_t)block_size);
+            if (status != 0) {
                 goto done;
             }
-
-            write_le16_fs(
-                group_desc + KB_FS_EXT4_GROUP_DESC_FREE_BLOCKS_COUNT_LO_OFFSET,
-                group_free == 0 ? 0 : (uint16_t)(group_free - 1u));
-            (void)active_bdev_binding.device->write(
-                active_bdev_binding.device->ctx,
-                desc_offset,
-                group_desc,
-                desc_size);
-            if (free_blocks > 0) {
-                write_le32_fs(
-                    super_disk + KB_FS_EXT4_SUPER_FREE_BLOCKS_COUNT_LO_OFFSET,
-                    free_blocks - 1u);
-                (void)active_bdev_binding.device->write(
-                    active_bdev_binding.device->ctx,
-                    KB_FS_EXT4_SUPER_OFFSET,
-                    super_disk,
-                    sizeof(super_disk));
-            }
-
-            status = ext4_extent_record_block(inode, file_block, (uint32_t)disk_block64);
+            status = ext4_extent_record_block(inode, file_block, (uint32_t)disk_block);
             if (status == 0) {
-                uint64_t blocks = 0;
-                memcpy(&blocks, (const uint8_t *)inode + KB_FS_INODE_BLOCKS_OFFSET, sizeof(blocks));
-                blocks += block_size / 512u;
-                write_u64_field(inode, KB_FS_INODE_BLOCKS_OFFSET, blocks);
-                *out_disk_block = (uint32_t)disk_block64;
+                *out_disk_block = (uint32_t)disk_block;
             }
             goto done;
         }
