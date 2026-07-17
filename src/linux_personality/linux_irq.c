@@ -163,11 +163,10 @@ int kb_request_threaded_irq(
     }
 
     kb_device_backend_t *backend = kb_shim_current_device_backend();
-    kb_device_t *device = NULL;
-    kb_status_t status = first_device(backend, &device);
-    if (status != KB_OK) {
-        return -19;
-    }
+    kb_device_t *device = kb_pci_active_backend_device();
+    kb_status_t status = KB_OK;
+    if (device == NULL) status = first_device(backend, &device);
+    if (status != KB_OK || device == NULL) return -19;
 
     shim_irq_t *entry = kb_kzalloc(sizeof(*entry), 0);
     if (entry == NULL) {
@@ -435,6 +434,39 @@ int kb_trigger_irq_for_dev_id(void *dev_id)
         return 0;
     }
     return -19;
+}
+
+int kb_handle_device_irqs(
+    kb_device_backend_t *backend,
+    size_t device_index,
+    uint64_t timeout_ns)
+{
+    if (backend == NULL) return -22;
+    const kb_device_backend_ops_t *backend_ops = kb_device_backend_get_ops(backend);
+    if (backend_ops == NULL || backend_ops->device_at == NULL) return -95;
+    kb_device_t *device = NULL;
+    if (backend_ops->device_at(backend, device_index, &device) != KB_OK || device == NULL)
+        return -19;
+
+    int handled = 0;
+    for (shim_irq_t *entry = irq_list; entry != NULL; entry = entry->next) {
+        if (entry->backend != backend || entry->device != device) continue;
+        const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(entry->backend);
+        if (ops == NULL || ops->irq_wait == NULL) continue;
+        int (*handler)(int, void *) = entry->handler;
+        int (*thread_fn)(int, void *) = entry->thread_fn;
+        entry->handler = NULL;
+        entry->thread_fn = NULL;
+        const kb_status_t status = ops->irq_wait(
+            entry->device, entry->backend_irq, handled ? 0 : timeout_ns);
+        entry->handler = handler;
+        entry->thread_fn = thread_fn;
+        if (status != KB_OK) continue;
+        irq_trampoline(entry);
+        handled = 1;
+    }
+    if (handled) kb_run_deferred_work();
+    return handled ? 0 : -110;
 }
 
 static int handle_any_irq(uint64_t timeout_ns, int run_work)

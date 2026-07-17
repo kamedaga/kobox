@@ -116,6 +116,11 @@ kb_device_t *kb_pci_backend_device_for_linux_dev(const void *dev)
     shim_pci_binding_t *selected = binding_for_linux_dev(dev);
     return selected == NULL ? NULL : selected->device;
 }
+
+kb_device_t *kb_pci_active_backend_device(void)
+{
+    return active_binding == NULL ? NULL : active_binding->device;
+}
 static void *mapped_bar0_addr;
 static size_t mapped_bar0_size;
 
