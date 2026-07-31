@@ -168,7 +168,7 @@ static const kb_linux_symbol_t symbols[] = {
     {"kfree_sensitive", (void *)(uintptr_t)&kb_kfree_sensitive},
     {"kmalloc_node_trace", (void *)(uintptr_t)&kb_kmalloc_node_trace},
     {"kmem_cache_alloc", (void *)(uintptr_t)&kb_kmem_cache_alloc},
-    {"kmem_cache_alloc_trace", (void *)(uintptr_t)&kb_kmem_cache_alloc},
+    {"kmem_cache_alloc_trace", (void *)(uintptr_t)&kb_kmalloc_trace},
     {"kmemdup", (void *)(uintptr_t)&kb_kmemdup},
     {"mempool_kfree", (void *)(uintptr_t)&kb_kfree},
     {"mempool_kmalloc", (void *)(uintptr_t)&kb_kmalloc},
