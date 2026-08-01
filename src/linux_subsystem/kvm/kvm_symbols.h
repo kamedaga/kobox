@@ -22,4 +22,8 @@ int kb_linux_kvm_page_payload_dma_addr(
     uint64_t *out_dma_addr);
 int kb_kvm_prepare_dma_arena(kb_device_backend_t *backend);
 void *kb_kvm_alloc_pages_stub(unsigned int flags, unsigned int order);
+unsigned long kb_kvm_get_free_pages_stub(unsigned int flags, unsigned int order);
+int kb_kvm_release_pages(void *page, unsigned int order);
+void kb_kvm_free_pages_stub(void *page, unsigned int order);
+void kb_kvm_free_pages_addr_stub(unsigned long addr, unsigned int order);
 void kb_kvm_free_pages_exact(void *virt, size_t size);

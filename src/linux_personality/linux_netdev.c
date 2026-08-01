@@ -265,7 +265,7 @@ void kb_get_random_bytes(void *buf, int len)
 
 void kb_consume_skb(void *skb)
 {
-    (void)skb;
+    kb_net_device_consume_skb(skb);
 }
 
 void kb_skb_tstamp_tx(void *skb, void *hwtstamps)

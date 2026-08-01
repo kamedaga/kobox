@@ -33,3 +33,4 @@ void *kb_alloc_skb(unsigned int length, unsigned int gfp, int flags, int node);
 void *kb_napi_alloc_skb(void *napi, unsigned int length, unsigned int gfp);
 void *kb_skb_put(void *skb, unsigned int len);
 int kb_skb_to_sgvec(void *skb, void *sg, int offset, int len);
+void kb_net_device_consume_skb(void *skb);

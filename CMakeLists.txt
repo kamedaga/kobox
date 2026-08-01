@@ -197,6 +197,9 @@ add_executable(kobox-smoke
 )
 
 target_link_libraries(kobox-smoke PRIVATE kobox_runtime)
+target_include_directories(kobox-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 target_compile_options(kobox-smoke PRIVATE
     -Wall
     -Wextra

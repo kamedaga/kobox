@@ -61,6 +61,7 @@ typedef int (*kb_napi_poll_t)(void *napi, int budget);
 
 typedef struct kb_netdev_record {
     void *dev;
+    kb_device_backend_t *backend;
     size_t size;
     void *tx_queues;
     unsigned int txq_count;
@@ -206,6 +207,7 @@ static void track_netdev(void *dev, size_t size, unsigned int txqs, unsigned int
     for (size_t i = 0; i < KB_NETDEV_TRACKED_MAX; i++) {
         if (netdev_records[i].dev == NULL) {
             netdev_records[i].dev = dev;
+            netdev_records[i].backend = kb_shim_current_device_backend();
             netdev_records[i].size = size;
             netdev_records[i].txq_count = txqs;
             netdev_records[i].rxq_count = rxqs;
@@ -1009,14 +1011,14 @@ static size_t build_arp_reply_frame(
     const unsigned char target_mac[6],
     const unsigned char target_ip[4]);
 
-static void track_skb(void *skb, void *page, void *payload, uint64_t dma_handle, size_t dma_size, unsigned int capacity)
+static int track_skb(void *skb, void *page, void *payload, uint64_t dma_handle, size_t dma_size, unsigned int capacity)
 {
     if (skb == NULL || page == NULL || payload == NULL) {
-        return;
+        return 0;
     }
     kb_skb_record_t *record = kb_kmalloc(sizeof(*record), 0);
     if (record == NULL) {
-        return;
+        return 0;
     }
     record->skb = skb;
     record->page = page;
@@ -1026,6 +1028,23 @@ static void track_skb(void *skb, void *page, void *payload, uint64_t dma_handle,
     record->capacity = capacity;
     record->next = skb_records;
     skb_records = record;
+    return 1;
+}
+
+void kb_net_device_consume_skb(void *skb)
+{
+    kb_skb_record_t **cursor = &skb_records;
+    while (*cursor != NULL) {
+        kb_skb_record_t *record = *cursor;
+        if (record->skb == skb) {
+            *cursor = record->next;
+            kb_kvm_free_pages_exact(record->skb, KB_KVM_PAGE_SIZE);
+            (void)kb_kvm_release_pages(record->page, 0);
+            kb_kfree(record);
+            return;
+        }
+        cursor = &record->next;
+    }
 }
 
 void *kb_net_device_alloc(
@@ -1202,6 +1221,12 @@ void *kb_netdev_alloc_skb(void *dev, unsigned int length, unsigned int gfp)
                 page,
                 (unsigned long long)dma_handle);
         }
+        if (skb != NULL) {
+            kb_kvm_free_pages_exact(skb, KB_KVM_PAGE_SIZE);
+        }
+        if (page != NULL) {
+            (void)kb_kvm_release_pages(page, 0);
+        }
         return NULL;
     }
 
@@ -1226,7 +1251,11 @@ void *kb_netdev_alloc_skb(void *dev, unsigned int length, unsigned int gfp)
     write_u32_at(skb, KB_LINUX_6_8_SKB_END_OFFSET, capacity);
     write_ptr_at(skb, KB_LINUX_6_8_SKB_HEAD_OFFSET, payload);
     write_ptr_at(skb, KB_LINUX_6_8_SKB_DATA_OFFSET, data);
-    track_skb(skb, page, payload, dma_handle, KB_KVM_PAGE_SIZE, capacity);
+    if (!track_skb(skb, page, payload, dma_handle, KB_KVM_PAGE_SIZE, capacity)) {
+        kb_kvm_free_pages_exact(skb, KB_KVM_PAGE_SIZE);
+        (void)kb_kvm_release_pages(page, 0);
+        return NULL;
+    }
 
     if (trace_net_enabled()) {
         fprintf(stderr,
@@ -1369,16 +1398,8 @@ int kb_net_device_xmit_smoke(void *dev)
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
     };
 
-    void *skb = kb_netdev_alloc_skb(dev, sizeof(frame), 0);
-    unsigned char *payload = kb_skb_put(skb, sizeof(frame));
-    if (payload == NULL) {
-        return -12;
-    }
-    memcpy(payload, frame, sizeof(frame));
-    int result = call_module_xmit(xmit_ptr, skb, dev);
-    sync_e1000e_tx_shadow();
+    int result = xmit_raw_frame(dev, xmit_ptr, frame, sizeof(frame));
     dump_virtio_legacy_tx_rings();
-    dump_e1000e_tx_rings();
     if (result == 0) {
         kb_msleep(1000);
         if (rx_poll_smoke_enabled()) {
@@ -1387,7 +1408,7 @@ int kb_net_device_xmit_smoke(void *dev)
         dump_virtio_legacy_tx_rings();
         dump_e1000e_tx_rings();
     }
-    fprintf(stderr, "kobox net: xmit_smoke dev=%p skb=%p len=%zu result=%d\n", dev, skb, sizeof(frame), result);
+    fprintf(stderr, "kobox net: xmit_smoke dev=%p len=%zu result=%d\n", dev, sizeof(frame), result);
     return result;
 }
 
@@ -1421,9 +1442,18 @@ static int xmit_raw_frame(void *dev, void *xmit_ptr, const unsigned char *frame,
         return -22;
     }
 
+    kb_netdev_record_t *record = find_netdev_record(dev);
+    if (record == NULL || record->backend == NULL) {
+        return -19;
+    }
+    kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+    kb_shim_set_device_backend(record->backend);
+
     void *skb = kb_netdev_alloc_skb(dev, (unsigned int)frame_len, 0);
     unsigned char *payload = kb_skb_put(skb, (unsigned int)frame_len);
     if (payload == NULL) {
+        kb_net_device_consume_skb(skb);
+        kb_shim_set_device_backend(old_backend);
         return -12;
     }
     memcpy(payload, frame, frame_len);
@@ -1431,6 +1461,10 @@ static int xmit_raw_frame(void *dev, void *xmit_ptr, const unsigned char *frame,
     int result = call_module_xmit(xmit_ptr, skb, dev);
     sync_e1000e_tx_shadow();
     dump_e1000e_tx_rings();
+    if (result != 0) {
+        kb_net_device_consume_skb(skb);
+    }
+    kb_shim_set_device_backend(old_backend);
     return result;
 }
 
@@ -1732,6 +1766,7 @@ int kb_napi_gro_receive(void *napi, void *skb)
             record == NULL ? 0 : record->rx_count);
     }
     log_received_packet(record, skb);
+    kb_net_device_consume_skb(skb);
     return 0;
 }
 
@@ -1742,6 +1777,10 @@ static void poll_rx_devices(int verbose)
             continue;
         }
         kb_netdev_record_t *netdev = find_netdev_record(record->dev);
+        kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+        if (netdev != NULL) {
+            kb_shim_set_device_backend(netdev->backend);
+        }
         unsigned int rx_before = record->rx_count;
         kb_napi_poll_t poll = NULL;
         memcpy(&poll, &record->poll, sizeof(poll));
@@ -1755,6 +1794,7 @@ static void poll_rx_devices(int verbose)
         }
         record->poll_count++;
         int reply_result = kb_net_device_maybe_reply_gateway_arp(netdev, rx_before);
+        kb_shim_set_device_backend(old_backend);
         if (verbose || trace_net_enabled()) {
             fprintf(stderr,
                 "kobox net: rx_poll_smoke dev=%p napi=%p poll=%p budget=%d result=%d polls=%u rx=%u reply=%d\n",

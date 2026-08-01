@@ -1223,6 +1223,80 @@ void *kb_kvm_alloc_pages_stub(unsigned int flags, unsigned int order)
     return kb_kvm_page_records + (index * KB_KVM_STRUCT_PAGE_SIZE);
 }
 
+static int kb_kvm_release_page_index(size_t index, unsigned int order)
+{
+    if (order >= 8 || index >= KB_KVM_PAGE_RECORD_MAX) {
+        return 0;
+    }
+    unsigned char state = kb_kvm_page_alloc_state[index];
+    if ((state & KB_KVM_PAGE_ALLOC_HEAD) == 0 ||
+        (state & KB_KVM_PAGE_ALLOC_ORDER_MASK) != order)
+    {
+        return 0;
+    }
+    size_t page_count = (size_t)1u << order;
+    if (page_count == 0 || page_count > KB_KVM_PAGE_RECORD_MAX - index) {
+        return 0;
+    }
+    for (size_t n = 1; n < page_count; n++) {
+        if (kb_kvm_page_alloc_state[index + n] != KB_KVM_PAGE_ALLOC_TAIL) {
+            return 0;
+        }
+    }
+    memset(kb_kvm_page_alloc_state + index, 0, page_count);
+    return 1;
+}
+
+int kb_kvm_release_pages(void *page, unsigned int order)
+{
+    if (page == NULL || kb_kvm_ensure_page_arena() != 0) {
+        return 0;
+    }
+    uintptr_t base = (uintptr_t)kb_kvm_page_records;
+    uintptr_t addr = (uintptr_t)page;
+    if (addr < base || addr - base >= KB_KVM_PAGE_RECORD_BYTES) {
+        return 0;
+    }
+    size_t offset = (size_t)(addr - base);
+    if ((offset % KB_KVM_STRUCT_PAGE_SIZE) != 0) {
+        return 0;
+    }
+    return kb_kvm_release_page_index(offset / KB_KVM_STRUCT_PAGE_SIZE, order);
+}
+
+void kb_kvm_free_pages_stub(void *page, unsigned int order)
+{
+    (void)kb_kvm_release_pages(page, order);
+}
+
+unsigned long kb_kvm_get_free_pages_stub(unsigned int flags, unsigned int order)
+{
+    void *page = kb_kvm_alloc_pages_stub(flags, order);
+    if (page == NULL) {
+        return 0;
+    }
+    uintptr_t records = (uintptr_t)kb_kvm_page_records;
+    size_t index = ((uintptr_t)page - records) / KB_KVM_STRUCT_PAGE_SIZE;
+    return (unsigned long)(uintptr_t)(kb_kvm_page_payloads + index * KB_KVM_PAGE_SIZE);
+}
+
+void kb_kvm_free_pages_addr_stub(unsigned long addr, unsigned int order)
+{
+    if (addr == 0 || kb_kvm_ensure_page_arena() != 0) {
+        return;
+    }
+    uintptr_t base = (uintptr_t)kb_kvm_page_payloads;
+    uintptr_t value = (uintptr_t)addr;
+    if (value < base || value - base >= KB_KVM_PAGE_PAYLOAD_BYTES) {
+        return;
+    }
+    size_t offset = (size_t)(value - base);
+    if ((offset % KB_KVM_PAGE_SIZE) != 0) {
+        return;
+    }
+    (void)kb_kvm_release_page_index(offset / KB_KVM_PAGE_SIZE, order);
+}
+
 void kb_kvm_free_pages_exact(void *virt, size_t size)
 {
     if (virt == NULL) {
@@ -1243,15 +1317,15 @@ void kb_kvm_free_pages_exact(void *virt, size_t size)
     }
     size_t index = offset / KB_KVM_PAGE_SIZE;
     unsigned char state = kb_kvm_page_alloc_state[index];
-    size_t page_count = (size + KB_KVM_PAGE_SIZE - 1u) / KB_KVM_PAGE_SIZE;
-    if ((state & KB_KVM_PAGE_ALLOC_HEAD) != 0) {
-        unsigned int order = state & KB_KVM_PAGE_ALLOC_ORDER_MASK;
-        page_count = (size_t)1u << order;
-    }
-    if (page_count == 0 || page_count > KB_KVM_PAGE_RECORD_MAX - index) {
+    if ((state & KB_KVM_PAGE_ALLOC_HEAD) == 0) {
         return;
     }
-    memset(kb_kvm_page_alloc_state + index, 0, page_count);
+    unsigned int order = state & KB_KVM_PAGE_ALLOC_ORDER_MASK;
+    size_t allocation_size = ((size_t)1u << order) * KB_KVM_PAGE_SIZE;
+    if (size == 0 || size > allocation_size) {
+        return;
+    }
+    (void)kb_kvm_release_page_index(index, order);
 }
 
 void kb_kvm_free_stub(void *ptr)

@@ -10,6 +10,8 @@
 #include "../src/linux_personality/linux_nvme.h"
 #include "../src/linux_subsystem/block/block.h"
 #include "../src/linux_subsystem/dma/dma.h"
+#include "../src/linux_subsystem/kvm/kvm_symbols.h"
+#include "../src/linux_subsystem/net/net_device.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -528,6 +530,88 @@ static int test_linux_host_interfaces(void)
     return failed != 0;
 }
 
+static kb_device_backend_t *net_lifetime_test_backend;
+static unsigned int net_lifetime_test_xmits;
+
+static int net_lifetime_test_xmit(void *skb, void *dev)
+{
+    (void)dev;
+    int result = kb_shim_current_device_backend() == net_lifetime_test_backend ? 0 : 1;
+    net_lifetime_test_xmits++;
+    kb_consume_skb(skb);
+    return result;
+}
+
+static int test_net_backend_and_page_lifetime(kb_device_backend_t *backend)
+{
+    enum {
+        RHEL_NETDEV_OPS_OFFSET = 0x198,
+    };
+    kb_shim_set_device_backend(backend);
+    if (kb_kvm_prepare_dma_arena(backend) != 0) {
+        return 1;
+    }
+
+    void *page = kb_kvm_alloc_pages_stub(0, 1);
+    if (page == NULL || kb_kvm_release_pages(page, 0) != 0) {
+        return 2;
+    }
+    void *next_page = kb_kvm_alloc_pages_stub(0, 1);
+    if (next_page == NULL || next_page == page) {
+        return 3;
+    }
+    if (!kb_kvm_release_pages(next_page, 1) || !kb_kvm_release_pages(page, 1) ||
+        kb_kvm_release_pages(page, 1) != 0)
+    {
+        return 4;
+    }
+    void *reused_page = kb_kvm_alloc_pages_stub(0, 1);
+    if (reused_page != page || !kb_kvm_release_pages(reused_page, 1)) {
+        return 5;
+    }
+
+    unsigned long address = kb_kvm_get_free_pages_stub(0, 1);
+    if (address == 0) {
+        return 6;
+    }
+    kb_kvm_free_pages_addr_stub(address, 1);
+    unsigned long reused_address = kb_kvm_get_free_pages_stub(0, 1);
+    if (reused_address != address) {
+        return 7;
+    }
+    kb_kvm_free_pages_addr_stub(reused_address, 1);
+
+    void *dev = kb_net_device_alloc(0, "nettest%d", 0, NULL, 1, 1);
+    if (dev == NULL) {
+        return 8;
+    }
+    void *ops[5] = {0};
+    int (*xmit)(void *, void *) = net_lifetime_test_xmit;
+    memcpy(&ops[4], &xmit, sizeof(xmit));
+    void *ops_ptr = ops;
+    memcpy((unsigned char *)dev + RHEL_NETDEV_OPS_OFFSET, &ops_ptr, sizeof(ops_ptr));
+    if (kb_net_device_register(dev) != 0 || kb_net_device_open(dev) != 0) {
+        kb_net_device_free(dev);
+        return 9;
+    }
+
+    net_lifetime_test_backend = backend;
+    net_lifetime_test_xmits = 0;
+    kb_shim_set_device_backend(NULL);
+    unsigned char frame[60] = {0};
+    int failed = 0;
+    for (unsigned int i = 0; i < 5000; i++) {
+        if (kb_net_device_tx_frame(frame, sizeof(frame)) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    failed |= net_lifetime_test_xmits != 5000 || kb_shim_current_device_backend() != NULL;
+    kb_net_device_free(dev);
+    net_lifetime_test_backend = NULL;
+    return failed ? 10 : 0;
+}
+
 int main(void)
 {
     if (getenv("KOBOX_TEST_NVME_SCATTER_ONLY") != NULL) {
@@ -820,6 +904,11 @@ int main(void)
     if (test_nvme_scattered_prps() != 0) {
         kb_device_backend_destroy(backend);
         return 42;
+    }
+
+    if (test_net_backend_and_page_lifetime(backend) != 0) {
+        kb_device_backend_destroy(backend);
+        return 43;
     }
 
     kb_device_backend_destroy(backend);
