@@ -42,7 +42,7 @@ static int page_for_buffer(const void *buf, unsigned int buflen, void **out_page
         return 0;
     }
     uintptr_t offset = addr - page_offset;
-    if ((offset & KB_INPUT_PAGE_MASK) + buflen > KB_INPUT_PAGE_SIZE) {
+    if ((uintptr_t)buflen > payload_size - offset) {
         return 0;
     }
     *out_page = (void *)(kb_linux_kvm_vmemmap_base() + ((offset >> KB_INPUT_PAGE_SHIFT) * KB_INPUT_STRUCT_PAGE_SIZE));

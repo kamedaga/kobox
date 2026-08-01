@@ -1112,17 +1112,33 @@ unsigned long kb_schedule_timeout(unsigned long timeout)
     if (trace_work_enabled()) {
         fprintf(stderr, "kobox work: schedule_timeout timeout=%lu\n", timeout);
     }
+    if (timeout == 0) {
+        return 0;
+    }
+
+    /*
+     * schedule_timeout() is the sleep primitive behind wait_event_timeout().
+     * IRQ handlers commonly queue ordinary work which makes the wait
+     * condition true, so draining only tasklets/timers here loses that wakeup.
+     * Sleep in one-jiffy quanta, run the full deferred queue after the IRQ,
+     * then let the caller recheck its condition with an accurate remainder.
+     */
+    const uint64_t start_ns = monotonic_ns();
+    kb_run_deferred_work();
+    (void)kb_handle_any_irq_no_work(jiffies_to_ns(1));
+    kb_run_deferred_work();
     kb_jbd2_progress_registered_journals();
+
     if (timeout == ULONG_MAX) {
-        kb_run_deferred_bottom_halves();
-        (void)kb_handle_any_irq_no_work(0);
-        kb_jbd2_progress_registered_journals();
         return timeout;
     }
-    kb_run_deferred_bottom_halves();
-    (void)kb_handle_any_irq_no_work(0);
-    kb_jbd2_progress_registered_journals();
-    return 0;
+    const uint64_t end_ns = monotonic_ns();
+    uint64_t elapsed = end_ns >= start_ns ? end_ns - start_ns : 0;
+    unsigned long elapsed_jiffies = ns_to_jiffies_ceil(elapsed);
+    if (elapsed_jiffies == 0) {
+        elapsed_jiffies = 1;
+    }
+    return elapsed_jiffies < timeout ? timeout - elapsed_jiffies : 0;
 }
 
 unsigned long kb_msecs_to_jiffies(unsigned int msecs)

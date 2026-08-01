@@ -2837,6 +2837,9 @@ int kb_usb_synthesize_connected_hid_mouse(void)
         KB_LINUX_INPUT_DEV_PHYS_OFFSET = 8,
         KB_LINUX_INPUT_DEV_UNIQ_OFFSET = 16,
         KB_LINUX_INPUT_DEV_ID_OFFSET = 24,
+        KB_LINUX_INPUT_DEV_EVBIT_OFFSET = 40,
+        KB_LINUX_INPUT_DEV_KEYBIT_OFFSET = 48,
+        KB_LINUX_INPUT_DEV_RELBIT_OFFSET = 144,
         BUS_USB = 0x03,
         EV_SYN = 0x00,
         EV_KEY = 0x01,
@@ -2865,6 +2868,19 @@ int kb_usb_synthesize_connected_hid_mouse(void)
         memcpy(usb_synthetic_hid_mouse_input + KB_LINUX_INPUT_DEV_PHYS_OFFSET, &phys, sizeof(phys));
         memcpy(usb_synthetic_hid_mouse_input + KB_LINUX_INPUT_DEV_UNIQ_OFFSET, &uniq, sizeof(uniq));
         memcpy(usb_synthetic_hid_mouse_input + KB_LINUX_INPUT_DEV_ID_OFFSET, &id, sizeof(id));
+        const uint64_t event_bits =
+            (UINT64_C(1) << EV_SYN) |
+            (UINT64_C(1) << EV_KEY) |
+            (UINT64_C(1) << EV_REL);
+        const uint64_t key_bits = UINT64_C(1) << (BTN_LEFT % 64u);
+        const uint64_t rel_bits =
+            (UINT64_C(1) << REL_X) | (UINT64_C(1) << REL_Y);
+        memcpy(usb_synthetic_hid_mouse_input + KB_LINUX_INPUT_DEV_EVBIT_OFFSET,
+            &event_bits, sizeof(event_bits));
+        memcpy(usb_synthetic_hid_mouse_input + KB_LINUX_INPUT_DEV_KEYBIT_OFFSET +
+            ((BTN_LEFT / 64u) * sizeof(key_bits)), &key_bits, sizeof(key_bits));
+        memcpy(usb_synthetic_hid_mouse_input + KB_LINUX_INPUT_DEV_RELBIT_OFFSET,
+            &rel_bits, sizeof(rel_bits));
         if (kb_input_subsystem_register_device(usb_synthetic_hid_mouse_input) != 0) {
             return 0;
         }

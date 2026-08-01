@@ -4337,7 +4337,7 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
         }
         if (block_offset == 0 && requested >= block_size) {
             uint64_t max_blocks = requested / block_size;
-            uint64_t max_bulk_blocks = (512u * 1024u) / block_size;
+            uint64_t max_bulk_blocks = (128u * 1024u) / block_size;
             if (max_bulk_blocks == 0) {
                 max_bulk_blocks = 1;
             }

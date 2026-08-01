@@ -184,47 +184,12 @@ static int pachaos_backend_active(void)
 #endif
 }
 
-static int env_enabled(const char *name)
+static int backend_requires_routed_msix(void *dev)
 {
-#if defined(__pachaos__)
-    (void)name;
-    return 0;
-#else
-    const char *value = getenv(name);
-    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
-#endif
-}
-
-static int pci_device_is_xhci(void *dev)
-{
-    enum {
-        KB_PCI_REVISION_CLASS_OFFSET = 0x08,
-        KB_PCI_CLASS_XHCI = 0x0c0330,
-    };
-
-    uint32_t revision_class = 0;
-    if (kb_pci_read_config_dword(dev, KB_PCI_REVISION_CLASS_OFFSET, &revision_class) != 0) {
-        return 0;
-    }
-    return ((revision_class >> 8) & UINT32_C(0x00ffffff)) == KB_PCI_CLASS_XHCI;
-}
-
-static int pachaos_device_uses_legacy_irq(void *dev)
-{
-    /*
-     * PachaOS does not yet deliver PCI MSI/MSI-X to kobox correctly. qemu-xhci
-     * stalls in the command doorbell path once the Linux xHCI driver enables
-     * MSI-X, while the same controller enumerates and reports HID input through
-     * the legacy vector path. Keep this scoped to xHCI so other PCI devices can
-     * use the normal vector selection path. KOBOX_PACHAOS_ENABLE_MSI=1 keeps a
-     * direct comparison path for fixing the kernel MSI/MSI-X route later.
-     */
-    return pachaos_backend_active() && !env_enabled("KOBOX_PACHAOS_ENABLE_MSI") && pci_device_is_xhci(dev);
-}
-
-static int pachaos_backend_programs_msix_table(void)
-{
-    return 0;
+    activate_binding_for_linux_dev(dev);
+    const kb_device_backend_ops_t *ops =
+        kb_device_backend_get_ops(kb_shim_current_device_backend());
+    return ops != NULL && ops->msix_delivery_vector != NULL;
 }
 
 enum {
@@ -303,10 +268,69 @@ typedef struct shim_msix_entry {
     uint16_t reserved;
 } shim_msix_entry_t;
 
+static int program_msix_table_entries(
+    kb_device_t *device,
+    const kb_device_backend_ops_t *ops,
+    const kb_mmio_region_t *region,
+    uint32_t table_offset,
+    const uint16_t *entries,
+    unsigned int count)
+{
+    if (device == NULL || ops == NULL || region == NULL || region->addr == NULL ||
+        entries == NULL || count == 0 || count > KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX)
+    {
+        return -22;
+    }
+
+    uint32_t delivery_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
+    const int backend_programs_table = ops->msix_delivery_vector != NULL;
+    if (backend_programs_table) {
+        for (unsigned int i = 0; i < count; i++) {
+            const kb_status_t status =
+                ops->msix_delivery_vector(device, entries[i], &delivery_vectors[i]);
+            if (status != KB_OK) {
+                return status == KB_ERR_INVALID ? -22 : -95;
+            }
+        }
+    }
+
+    for (unsigned int i = 0; i < count; i++) {
+        const uint64_t entry_offset =
+            (uint64_t)table_offset + ((uint64_t)entries[i] * KB_PCI_MSIX_ENTRY_SIZE);
+        const uint64_t ctrl_offset = entry_offset + KB_PCI_MSIX_ENTRY_VECTOR_CTRL;
+        if (ctrl_offset + sizeof(uint32_t) > region->size) {
+            return -22;
+        }
+    }
+
+    for (unsigned int i = 0; i < count; i++) {
+        const uint32_t x86_msi_address_base = UINT32_C(0xfee00000);
+        const uint64_t entry_offset =
+            (uint64_t)table_offset + ((uint64_t)entries[i] * KB_PCI_MSIX_ENTRY_SIZE);
+        const uint64_t ctrl_offset = entry_offset + KB_PCI_MSIX_ENTRY_VECTOR_CTRL;
+        volatile uint32_t *ctrl =
+            (volatile uint32_t *)((unsigned char *)region->addr + ctrl_offset);
+        if (backend_programs_table) {
+            volatile uint32_t *addr_lo =
+                (volatile uint32_t *)((unsigned char *)region->addr + entry_offset + KB_PCI_MSIX_ENTRY_ADDR_LO);
+            volatile uint32_t *addr_hi =
+                (volatile uint32_t *)((unsigned char *)region->addr + entry_offset + KB_PCI_MSIX_ENTRY_ADDR_HI);
+            volatile uint32_t *data =
+                (volatile uint32_t *)((unsigned char *)region->addr + entry_offset + KB_PCI_MSIX_ENTRY_DATA);
+            *ctrl |= (uint32_t)KB_PCI_MSIX_ENTRY_CTRL_MASKED;
+            *addr_lo = x86_msi_address_base;
+            *addr_hi = 0;
+            *data = delivery_vectors[i];
+        }
+        *ctrl &= ~((uint32_t)KB_PCI_MSIX_ENTRY_CTRL_MASKED);
+    }
+    return 0;
+}
+
 int kb_pci_msix_unmask_entries(void *dev, const uint16_t *entries, unsigned int count)
 {
     activate_binding_for_linux_dev(dev);
-    if (entries == NULL || count == 0) {
+    if (entries == NULL || count == 0 || count > KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX) {
         return -22;
     }
 
@@ -337,35 +361,8 @@ int kb_pci_msix_unmask_entries(void *dev, const uint16_t *entries, unsigned int 
         return -5;
     }
 
-    int result = 0;
-    for (unsigned int i = 0; i < count; i++) {
-        enum {
-            PACHAOS_GENERIC_DEVICE_INTERRUPT_VECTOR = 0x41,
-            X86_MSI_ADDRESS_BASE = 0xfee00000,
-        };
-        uint64_t entry_offset = (uint64_t)table_offset + ((uint64_t)entries[i] * KB_PCI_MSIX_ENTRY_SIZE);
-        uint64_t ctrl_offset = entry_offset + KB_PCI_MSIX_ENTRY_VECTOR_CTRL;
-        if (ctrl_offset + sizeof(uint32_t) > region.size) {
-            result = -22;
-            break;
-        }
-        if (pachaos_backend_active() &&
-            entry_offset + KB_PCI_MSIX_ENTRY_SIZE <= region.size)
-        {
-            volatile uint32_t *addr_lo =
-                (volatile uint32_t *)((unsigned char *)region.addr + entry_offset + KB_PCI_MSIX_ENTRY_ADDR_LO);
-            volatile uint32_t *addr_hi =
-                (volatile uint32_t *)((unsigned char *)region.addr + entry_offset + KB_PCI_MSIX_ENTRY_ADDR_HI);
-            volatile uint32_t *data =
-                (volatile uint32_t *)((unsigned char *)region.addr + entry_offset + KB_PCI_MSIX_ENTRY_DATA);
-            *addr_lo = X86_MSI_ADDRESS_BASE;
-            *addr_hi = 0;
-            *data = PACHAOS_GENERIC_DEVICE_INTERRUPT_VECTOR;
-        }
-        volatile uint32_t *ctrl = (volatile uint32_t *)((unsigned char *)region.addr + ctrl_offset);
-        *ctrl &= ~((uint32_t)KB_PCI_MSIX_ENTRY_CTRL_MASKED);
-    }
-
+    const int result =
+        program_msix_table_entries(device, ops, &region, table_offset, entries, count);
     ops->unmap_bar(device, &region);
     return result;
 }
@@ -396,32 +393,21 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
         max_vecs = KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX;
     }
 
-    kb_pci_subsystem_irq_vectors_clear();
-    kb_irq_clear_mappings();
-
-#if defined(__pachaos__)
-    kb_pci_tracef("kobox pci: alloc_irq_vectors before xhci legacy check\n");
-#endif
-    if (pachaos_device_uses_legacy_irq(dev)) {
-        if (min_vecs > 1) {
-            if (trace_pci_enabled()) {
-                fprintf(stderr, "kobox pci: alloc_irq_vectors pachaos-legacy insufficient min=%u\n", min_vecs);
-            }
+    const int requires_routed_msix = backend_requires_routed_msix(dev);
+    if (requires_routed_msix) {
+        if ((flags & KB_PCI_IRQ_MSIX) == 0) {
+            return -95;
+        }
+        if (min_vecs > KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) {
             return -28;
         }
-        unsigned int legacy_vector = 0;
-        if (kb_pci_subsystem_irq_vectors_set(1, &legacy_vector) != 0) {
-            return -22;
+        if (max_vecs > KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) {
+            max_vecs = KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT;
         }
-        if (trace_pci_enabled()) {
-            fprintf(
-                stderr,
-                "kobox pci: alloc_irq_vectors pachaos-legacy flags=0x%x max=%u\n",
-                flags,
-                max_vecs);
-        }
-        return 1;
     }
+
+    kb_pci_subsystem_irq_vectors_clear();
+    kb_irq_clear_mappings();
 
     if (trace_pci_enabled()) {
         fprintf(
@@ -457,12 +443,6 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
                     min_vecs);
 #endif
                 if (vectors >= min_vecs) {
-                    int backend_programs_table = pachaos_backend_programs_msix_table();
-#if defined(__pachaos__)
-                    kb_pci_tracef(
-                        "kobox pci: alloc_irq_vectors msix backend_programs_table=%d\n",
-                        backend_programs_table);
-#endif
                     unsigned int linux_vectors[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
                     uint16_t entries[KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX];
                     for (unsigned int i = 0; i < vectors; i++) {
@@ -482,25 +462,24 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
                             linux_vectors[i]);
 #endif
                     }
-                    if (!backend_programs_table) {
 #if defined(__pachaos__)
-                        kb_pci_tracef("kobox pci: alloc_irq_vectors msix before enable write\n");
+                    kb_pci_tracef("kobox pci: alloc_irq_vectors msix before enable write\n");
 #endif
-                        control |= KB_PCI_MSIX_CONTROL_ENABLE;
-                        control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
-                        if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
-                            kb_irq_clear_mappings();
-                            kb_pci_subsystem_irq_vectors_clear();
-                            return -5;
-                        }
+                    control |= KB_PCI_MSIX_CONTROL_ENABLE;
+                    control &= (uint16_t)~KB_PCI_MSIX_CONTROL_MASKALL;
+                    if (kb_pci_write_config_word(dev, cap + 2, control) != 0) {
+                        kb_irq_clear_mappings();
+                        kb_pci_subsystem_irq_vectors_clear();
+                        return -5;
+                    }
 #if defined(__pachaos__)
-                        kb_pci_tracef("kobox pci: alloc_irq_vectors msix before unmask\n");
+                    kb_pci_tracef("kobox pci: alloc_irq_vectors msix before unmask\n");
 #endif
-                        if (kb_pci_msix_unmask_entries(dev, entries, vectors) != 0) {
-                            kb_irq_clear_mappings();
-                            kb_pci_subsystem_irq_vectors_clear();
-                            return -5;
-                        }
+                    const int unmask_status = kb_pci_msix_unmask_entries(dev, entries, vectors);
+                    if (unmask_status != 0) {
+                        kb_irq_clear_mappings();
+                        kb_pci_subsystem_irq_vectors_clear();
+                        return unmask_status;
                     }
 #if defined(__pachaos__)
                     kb_pci_tracef("kobox pci: alloc_irq_vectors msix before vector set\n");
@@ -513,11 +492,7 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
                     kb_pci_tracef("kobox pci: alloc_irq_vectors msix done vectors=%u\n", vectors);
 #endif
                     if (trace_pci_enabled()) {
-                        fprintf(
-                            stderr,
-                            "kobox pci: alloc_irq_vectors msix=%u%s\n",
-                            vectors,
-                            backend_programs_table ? " backend-programmed" : "");
+                        fprintf(stderr, "kobox pci: alloc_irq_vectors msix=%u\n", vectors);
                     }
                     return (int)vectors;
                 } else if (trace_pci_enabled()) {
@@ -529,6 +504,9 @@ int kb_pci_alloc_irq_vectors(void *dev, unsigned int min_vecs, unsigned int max_
                 }
             }
         }
+    }
+    if (requires_routed_msix) {
+        return -28;
     }
 #if defined(__pachaos__)
     kb_pci_tracef("kobox pci: alloc_irq_vectors before msi check\n");
@@ -2030,6 +2008,10 @@ int kb_pci_find_next_capability(void *dev, uint8_t pos, int cap)
 
 int kb_pci_enable_msi(void *dev)
 {
+    if (backend_requires_routed_msix(dev)) {
+        return -95;
+    }
+
     int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSI);
     if (cap == 0) {
         return -28;
@@ -2049,6 +2031,11 @@ int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec)
         return -22;
     }
 
+    const int requires_routed_msix = backend_requires_routed_msix(dev);
+    if (requires_routed_msix && minvec > KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) {
+        return -28;
+    }
+
     int cap = kb_pci_find_capability(dev, KB_PCI_CAP_ID_MSIX);
     if (cap == 0) {
         return -28;
@@ -2064,13 +2051,19 @@ int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec)
     if (vectors > KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX) {
         vectors = KB_PCI_SUBSYSTEM_IRQ_VECTOR_MAX;
     }
+    if (requires_routed_msix && vectors > KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) {
+        vectors = KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT;
+    }
     if (vectors < minvec) {
         return -28;
     }
 
     shim_msix_entry_t *msix_entries = entries;
     for (int i = 0; i < vectors; i++) {
-        if (msix_entries[i].entry >= (uint16_t)table_size) {
+        if (msix_entries[i].entry >= (uint16_t)table_size ||
+            (requires_routed_msix &&
+             msix_entries[i].entry >= KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT))
+        {
             return -22;
         }
     }
@@ -2093,11 +2086,13 @@ int kb_pci_enable_msix_range(void *dev, void *entries, int minvec, int maxvec)
         table_entries[i] = msix_entries[i].entry;
         msix_entries[i].vector = linux_irq;
     }
-    if (kb_pci_msix_unmask_entries(dev, table_entries, (unsigned int)vectors) != 0) {
+    const int unmask_status =
+        kb_pci_msix_unmask_entries(dev, table_entries, (unsigned int)vectors);
+    if (unmask_status != 0) {
         kb_irq_clear_mappings();
         kb_pci_subsystem_irq_vectors_clear();
         kb_kfree(table_entries);
-        return -5;
+        return unmask_status;
     }
     kb_kfree(table_entries);
 

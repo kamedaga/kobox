@@ -183,6 +183,48 @@ uint64_t kb_subsystem_dma_map(
     return status == KB_OK ? dma_addr : 0;
 }
 
+kb_status_t kb_subsystem_dma_map_pages(
+    kb_device_backend_t *backend,
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
+    kb_dma_dir_t direction,
+    uint64_t *out_page_dma,
+    size_t out_capacity)
+{
+    if (backend == NULL || cpu_addr == NULL || size == 0 || out_page_dma == NULL || out_capacity == 0) {
+        return KB_ERR_INVALID;
+    }
+    if (device == NULL) {
+        device = kb_subsystem_dma_default_device(backend);
+    }
+    if (device == NULL) {
+        return KB_ERR_INVALID;
+    }
+
+    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
+    if (ops == NULL || ops->dma_map_pages == NULL) {
+        return KB_ERR_UNSUPPORTED;
+    }
+
+    kb_status_t status = ops->dma_map_pages(
+        device,
+        cpu_addr,
+        size,
+        direction,
+        out_page_dma,
+        out_capacity);
+    if (status != KB_OK) {
+        return status;
+    }
+
+    status = remember_dma_mapping(cpu_addr, out_page_dma[0], size, device);
+    if (status != KB_OK && ops->dma_unmap != NULL) {
+        ops->dma_unmap(device, out_page_dma[0], size, direction);
+    }
+    return status;
+}
+
 kb_status_t kb_subsystem_dma_map_fixed(
     kb_device_backend_t *backend,
     kb_device_t *device,

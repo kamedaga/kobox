@@ -43,6 +43,7 @@ typedef struct kb_input_device_snapshot {
     uint64_t prop_bits;
     uint64_t event_bits;
     uint64_t key_bits[KB_INPUT_KEY_WORDS];
+    uint64_t key_state[KB_INPUT_KEY_WORDS];
     uint64_t rel_bits;
     uint64_t abs_bits;
     uint64_t msc_bits;
@@ -50,6 +51,9 @@ typedef struct kb_input_device_snapshot {
     uint64_t snd_bits;
     uint64_t ff_bits[KB_INPUT_FF_WORDS];
     uint64_t sw_bits;
+    uint64_t led_state;
+    uint64_t snd_state;
+    uint64_t sw_state;
     unsigned long event_count;
     unsigned long dropped_events;
     int opened;

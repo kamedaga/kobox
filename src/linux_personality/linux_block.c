@@ -88,7 +88,12 @@ typedef struct shim_linux_request {
     kb_dma_dir_t prp_list_dma_dir;
     const kb_linux_block_driver_ops_t *driver_ops;
     uint32_t started;
-    unsigned char reserved_a44[KB_SHIM_REQUEST_SIZE - 0xa44];
+    uint32_t reserved_a44;
+    kb_device_backend_t *dma_backend;
+    kb_device_t *dma_device;
+    kb_device_backend_t *prp_list_backend;
+    kb_device_t *prp_list_device;
+    unsigned char reserved_a68[KB_SHIM_REQUEST_SIZE - 0xa68];
 } shim_linux_request_t;
 
 _Static_assert(offsetof(shim_linux_request_t, hctx) == KB_LINUX_REQUEST_HCTX_OFFSET, "request.hctx offset");
@@ -111,6 +116,9 @@ _Static_assert(offsetof(shim_linux_request_t, prp_list_len) == KB_SHIM_REQUEST_P
 _Static_assert(offsetof(shim_linux_request_t, owns_queue) == KB_SHIM_REQUEST_OWNS_QUEUE_OFFSET, "shim owns_queue offset");
 _Static_assert(offsetof(shim_linux_request_t, driver_ops) == 0xa38, "shim driver_ops offset");
 _Static_assert(offsetof(shim_linux_request_t, started) == 0xa40, "shim started offset");
+_Static_assert(offsetof(shim_linux_request_t, dma_backend) == 0xa48, "shim dma_backend offset");
+_Static_assert(offsetof(shim_linux_request_t, dma_device) == 0xa50, "shim dma_device offset");
+_Static_assert(offsetof(shim_linux_request_t, prp_list_backend) == 0xa58, "shim prp_list_backend offset");
 _Static_assert(sizeof(shim_linux_request_t) == KB_SHIM_REQUEST_SIZE, "shim request size");
 _Static_assert(offsetof(shim_linux_hctx_t, driver_data) == 0xc8, "hctx.driver_data offset");
 _Static_assert(offsetof(shim_linux_queue_data_t, rq) == 0x00, "queue_data.rq offset");
@@ -632,15 +640,18 @@ void kb_linux_block_request_mark_complete(void *request, unsigned int status)
     }
 }
 
-static int map_request_dma(
+static int map_request_dma_raw(
     shim_linux_request_t *request,
     void *cpu_addr,
     uint32_t length,
     kb_dma_dir_t direction,
     uint64_t *out_dma,
-    int auxiliary)
+    kb_device_backend_t **out_backend,
+    kb_device_t **out_device)
 {
-    if (request == NULL || cpu_addr == NULL || length == 0 || out_dma == NULL) {
+    if (request == NULL || cpu_addr == NULL || length == 0 || out_dma == NULL ||
+        out_backend == NULL || out_device == NULL)
+    {
         return -22;
     }
 
@@ -683,46 +694,88 @@ static int map_request_dma(
         return -5;
     }
 
-    if (auxiliary) {
-        request->prp_list_cpu = cpu_addr;
-        request->prp_list_dma = dma_addr;
-        request->prp_list_len = length;
-        request->prp_list_dma_dir = direction;
-    } else {
-        request->dma_addr = dma_addr;
-        request->dma_len = length;
-        request->dma_dir = direction;
-    }
     *out_dma = dma_addr;
+    *out_backend = backend;
+    *out_device = device;
     return 0;
 }
 
-int kb_linux_block_request_map_dma(
+int kb_linux_block_request_map_dma_pages(
     void *request,
     void *cpu_addr,
     uint32_t length,
     kb_dma_dir_t direction,
-    uint64_t *out_dma)
+    uint64_t *out_page_dma,
+    size_t out_capacity)
 {
+    shim_linux_request_t *rq = request;
+    if (rq == NULL || cpu_addr == NULL || length == 0 || out_page_dma == NULL || out_capacity == 0) {
+        return -22;
+    }
     kb_linux_block_request_unmap_dma(request);
-    return map_request_dma(request, cpu_addr, length, direction, out_dma, 0);
+
+    kb_device_backend_t *backend = kb_shim_current_device_backend();
+    kb_device_t *device = kb_subsystem_dma_default_device(backend);
+    if (device == NULL) {
+        fprintf(stderr,
+            "kobox blk-mq: dma map pages no default device backend=%p request=%p cpu=%p len=%u dir=%u\n",
+            (void *)backend,
+            request,
+            cpu_addr,
+            length,
+            (unsigned)direction);
+        return -19;
+    }
+
+    const kb_status_t dma_status = kb_subsystem_dma_map_pages(
+        backend,
+        device,
+        cpu_addr,
+        length,
+        direction,
+        out_page_dma,
+        out_capacity);
+    if (dma_status != KB_OK) {
+        fprintf(stderr,
+            "kobox blk-mq: dma map pages %s status=%d backend=%p device=%p request=%p cpu=%p len=%u dir=%u pages=%zu\n",
+            dma_status == KB_ERR_UNSUPPORTED ? "unsupported" : "failed",
+            (int)dma_status,
+            (void *)backend,
+            (void *)device,
+            request,
+            cpu_addr,
+            length,
+            (unsigned)direction,
+            out_capacity);
+        return dma_status == KB_ERR_UNSUPPORTED ? -95 : -5;
+    }
+
+    rq->dma_addr = out_page_dma[0];
+    rq->dma_len = length;
+    rq->dma_dir = direction;
+    rq->dma_backend = backend;
+    rq->dma_device = device;
+    return 0;
 }
 
 void kb_linux_block_request_unmap_dma(void *request)
 {
     shim_linux_request_t *rq = request;
-    if (rq == NULL || rq->dma_addr == 0 || rq->dma_len == 0) {
+    if (rq == NULL) {
         return;
     }
-    kb_device_backend_t *backend = kb_shim_current_device_backend();
-    kb_subsystem_dma_unmap(
-        backend,
-        kb_subsystem_dma_default_device(backend),
-        rq->dma_addr,
-        rq->dma_len,
-        rq->dma_dir);
+    if (rq->dma_len != 0) {
+        kb_subsystem_dma_unmap(
+            rq->dma_backend,
+            rq->dma_device,
+            rq->dma_addr,
+            rq->dma_len,
+            rq->dma_dir);
+    }
     rq->dma_addr = 0;
     rq->dma_len = 0;
+    rq->dma_backend = NULL;
+    rq->dma_device = NULL;
 }
 
 int kb_linux_block_request_map_owned_aux_dma(
@@ -733,7 +786,29 @@ int kb_linux_block_request_map_owned_aux_dma(
     uint64_t *out_dma)
 {
     kb_linux_block_request_unmap_owned_aux_dma(request);
-    return map_request_dma(request, cpu_addr, length, direction, out_dma, 1);
+    shim_linux_request_t *rq = request;
+    uint64_t dma_addr = 0;
+    kb_device_backend_t *backend = NULL;
+    kb_device_t *device = NULL;
+    int result = map_request_dma_raw(
+        rq,
+        cpu_addr,
+        length,
+        direction,
+        &dma_addr,
+        &backend,
+        &device);
+    if (result != 0) {
+        return result;
+    }
+    rq->prp_list_cpu = cpu_addr;
+    rq->prp_list_dma = dma_addr;
+    rq->prp_list_len = length;
+    rq->prp_list_dma_dir = direction;
+    rq->prp_list_backend = backend;
+    rq->prp_list_device = device;
+    *out_dma = dma_addr;
+    return 0;
 }
 
 void kb_linux_block_request_unmap_owned_aux_dma(void *request)
@@ -743,10 +818,9 @@ void kb_linux_block_request_unmap_owned_aux_dma(void *request)
         return;
     }
     if (rq->prp_list_dma != 0 && rq->prp_list_len != 0) {
-        kb_device_backend_t *backend = kb_shim_current_device_backend();
         kb_subsystem_dma_unmap(
-            backend,
-            kb_subsystem_dma_default_device(backend),
+            rq->prp_list_backend,
+            rq->prp_list_device,
             rq->prp_list_dma,
             rq->prp_list_len,
             rq->prp_list_dma_dir);
@@ -755,6 +829,8 @@ void kb_linux_block_request_unmap_owned_aux_dma(void *request)
     rq->prp_list_cpu = NULL;
     rq->prp_list_dma = 0;
     rq->prp_list_len = 0;
+    rq->prp_list_backend = NULL;
+    rq->prp_list_device = NULL;
 }
 
 int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int length, unsigned int gfp)

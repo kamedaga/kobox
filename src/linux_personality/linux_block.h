@@ -39,12 +39,13 @@ int kb_linux_block_request_completed(const void *request);
 unsigned int kb_linux_block_request_end_status(const void *request);
 void kb_linux_block_request_set_result_status(void *request, uint64_t result, uint16_t status);
 void kb_linux_block_request_mark_complete(void *request, unsigned int status);
-int kb_linux_block_request_map_dma(
+int kb_linux_block_request_map_dma_pages(
     void *request,
     void *cpu_addr,
     uint32_t length,
     kb_dma_dir_t direction,
-    uint64_t *out_dma);
+    uint64_t *out_page_dma,
+    size_t out_capacity);
 void kb_linux_block_request_unmap_dma(void *request);
 int kb_linux_block_request_map_owned_aux_dma(
     void *request,

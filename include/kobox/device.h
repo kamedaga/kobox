@@ -28,6 +28,10 @@ typedef enum kb_dma_dir {
     KB_DMA_BIDIRECTIONAL = 3,
 } kb_dma_dir_t;
 
+enum {
+    KB_DEVICE_DMA_MAPPING_MAX_PAGES = 512,
+};
+
 typedef struct kb_pci_id {
     uint16_t vendor_id;
     uint16_t device_id;
@@ -71,6 +75,25 @@ typedef struct kb_dma_buffer {
 
 typedef void (*kb_device_irq_handler_t)(void *ctx);
 
+enum {
+    KB_DEVICE_IRQ_BACKEND_KIND_SHIFT = 30,
+    KB_DEVICE_IRQ_BACKEND_VECTOR_MASK = 0x3fffffff,
+    KB_DEVICE_IRQ_BACKEND_KIND_LEGACY = 0,
+    KB_DEVICE_IRQ_BACKEND_KIND_MSI = 1,
+    KB_DEVICE_IRQ_BACKEND_KIND_MSIX = 2,
+    KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT = 16,
+};
+
+static inline unsigned kb_device_irq_backend_kind(unsigned vector)
+{
+    return vector >> KB_DEVICE_IRQ_BACKEND_KIND_SHIFT;
+}
+
+static inline unsigned kb_device_irq_backend_vector(unsigned vector)
+{
+    return vector & KB_DEVICE_IRQ_BACKEND_VECTOR_MASK;
+}
+
 typedef struct kb_device_backend_ops {
     void (*destroy)(kb_device_backend_t *backend);
 
@@ -102,6 +125,18 @@ typedef struct kb_device_backend_ops {
         uint64_t size,
         kb_dma_dir_t direction,
         uint64_t *out_dma_addr);
+    /*
+     * Maps one byte range under one backend lifetime. out_page_dma[0]
+     * includes cpu_addr's 4 KiB page offset; every later entry is a page
+     * base. The caller supplies one entry per page touched by the range.
+     */
+    kb_status_t (*dma_map_pages)(
+        kb_device_t *device,
+        void *cpu_addr,
+        uint64_t size,
+        kb_dma_dir_t direction,
+        uint64_t *out_page_dma,
+        size_t out_capacity);
     kb_status_t (*dma_map_fixed)(
         kb_device_t *device,
         void *cpu_addr,
@@ -122,6 +157,11 @@ typedef struct kb_device_backend_ops {
 
     uint64_t (*monotonic_ns)(kb_device_backend_t *backend);
     void (*log)(kb_device_backend_t *backend, int level, const char *message);
+
+    kb_status_t (*msix_delivery_vector)(
+        kb_device_t *device,
+        unsigned entry,
+        uint32_t *out_vector);
 } kb_device_backend_ops_t;
 
 const kb_device_backend_ops_t *kb_device_backend_get_ops(const kb_device_backend_t *backend);

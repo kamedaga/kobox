@@ -350,57 +350,85 @@ static int nvme_block_map_kernel_buffer(void *request, void *buffer, unsigned in
         direction = KB_DMA_FROM_DEVICE;
     }
 
-    uint64_t dma_addr = 0;
-    int result = kb_linux_block_request_map_dma(request, buffer, length, direction, &dma_addr);
+    kb_linux_block_request_unmap_owned_aux_dma(request);
+    kb_linux_block_request_unmap_dma(request);
+    write_u64(cmd + 24, 0);
+    write_u64(cmd + 32, 0);
+
+    const size_t page_mask = KB_NVME_PAGE_SIZE - 1u;
+    const size_t first_page_len = KB_NVME_PAGE_SIZE - ((uintptr_t)buffer & page_mask);
+    const size_t first_segment_len = first_page_len < length ? first_page_len : length;
+    const size_t after_first = (size_t)length - first_segment_len;
+    const size_t following_pages =
+        (after_first + KB_NVME_PAGE_SIZE - 1u) / KB_NVME_PAGE_SIZE;
+    const size_t page_count = 1u + following_pages;
+    if (following_pages > KB_NVME_PAGE_SIZE / sizeof(uint64_t) ||
+        page_count > KB_DEVICE_DMA_MAPPING_MAX_PAGES)
+    {
+        return -95;
+    }
+
+    uint64_t *prp_list = NULL;
+    if (following_pages > 1u) {
+        prp_list = aligned_alloc(KB_NVME_PAGE_SIZE, KB_NVME_PAGE_SIZE);
+        if (prp_list == NULL) {
+            return -12;
+        }
+        memset(prp_list, 0, KB_NVME_PAGE_SIZE);
+    }
+
+    uint64_t page_dma[KB_DEVICE_DMA_MAPPING_MAX_PAGES] = {0};
+    int result = kb_linux_block_request_map_dma_pages(
+        request,
+        buffer,
+        length,
+        direction,
+        page_dma,
+        page_count);
     if (result != 0) {
-        return result;
+        goto fail;
     }
-
-    size_t first_prp_len = KB_NVME_PAGE_SIZE - (size_t)(dma_addr & (KB_NVME_PAGE_SIZE - 1u));
-    if (first_prp_len > length) {
-        first_prp_len = length;
+    if ((page_dma[0] & page_mask) != ((uintptr_t)buffer & page_mask)) {
+        result = -5;
+        goto fail;
     }
-
-    write_u64(cmd + 24, dma_addr);
-    if (length > first_prp_len) {
-        uint64_t second_prp = dma_addr + first_prp_len;
-        size_t remaining = length - first_prp_len;
-        if (remaining <= KB_NVME_PAGE_SIZE) {
-            write_u64(cmd + 32, second_prp);
-        } else {
-            size_t prp_count = (remaining + KB_NVME_PAGE_SIZE - 1u) / KB_NVME_PAGE_SIZE;
-            size_t list_len = prp_count * sizeof(uint64_t);
-            if (list_len > KB_NVME_PAGE_SIZE) {
-                kb_linux_block_request_unmap_dma(request);
-                return -95;
-            }
-
-            uint64_t *prp_list = aligned_alloc(KB_NVME_PAGE_SIZE, KB_NVME_PAGE_SIZE);
-            if (prp_list == NULL) {
-                kb_linux_block_request_unmap_dma(request);
-                return -12;
-            }
-            memset(prp_list, 0, KB_NVME_PAGE_SIZE);
-            for (size_t i = 0; i < prp_count; i++) {
-                prp_list[i] = second_prp + ((uint64_t)i * KB_NVME_PAGE_SIZE);
-            }
-
-            uint64_t prp_list_dma = 0;
-            result = kb_linux_block_request_map_owned_aux_dma(
-                request,
-                prp_list,
-                (uint32_t)list_len,
-                KB_DMA_BIDIRECTIONAL,
-                &prp_list_dma);
-            if (result != 0) {
-                free(prp_list);
-                kb_linux_block_request_unmap_dma(request);
-                return result;
-            }
-
-            write_u64(cmd + 32, prp_list_dma);
+    for (size_t i = 1; i < page_count; i++) {
+        if ((page_dma[i] & page_mask) != 0) {
+            result = -5;
+            goto fail;
         }
     }
+
+    const uint64_t first_dma = page_dma[0];
+    uint64_t second_dma = 0;
+    if (following_pages == 1u) {
+        second_dma = page_dma[1];
+    } else if (following_pages > 1u) {
+        memcpy(prp_list, page_dma + 1, following_pages * sizeof(*prp_list));
+    }
+
+    if (following_pages > 1u) {
+        const size_t list_len = following_pages * sizeof(uint64_t);
+        uint64_t prp_list_dma = 0;
+        result = kb_linux_block_request_map_owned_aux_dma(
+            request,
+            prp_list,
+            (uint32_t)list_len,
+            KB_DMA_TO_DEVICE,
+            &prp_list_dma);
+        if (result != 0) {
+            goto fail;
+        }
+        prp_list = NULL;
+        if ((prp_list_dma & page_mask) != 0) {
+            result = -5;
+            goto fail;
+        }
+        second_dma = prp_list_dma;
+    }
+
+    write_u64(cmd + 24, first_dma);
+    write_u64(cmd + 32, second_dma);
     if (trace_nvme_enabled()) {
         fprintf(
             stderr,
@@ -408,12 +436,20 @@ static int nvme_block_map_kernel_buffer(void *request, void *buffer, unsigned in
                 request,
                 buffer,
                 length,
-                (unsigned long long)dma_addr,
+                (unsigned long long)first_dma,
                 (unsigned long long)read_u64(cmd + 32),
                 (unsigned)cmd[0],
                 (unsigned)read_u64(cmd + 40));
     }
     return 0;
+
+fail:
+    free(prp_list);
+    kb_linux_block_request_unmap_owned_aux_dma(request);
+    kb_linux_block_request_unmap_dma(request);
+    write_u64(cmd + 24, 0);
+    write_u64(cmd + 32, 0);
+    return result;
 }
 
 static int nvme_block_before_execute(void *request)

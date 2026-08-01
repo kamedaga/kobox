@@ -6,6 +6,9 @@
 #include "kobox/device_pachaos_capsule.h"
 
 #include "pacha/capsule.h"
+#if defined(__pachaos__)
+#include "pacha/ipc.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +21,10 @@
 typedef struct kb_pachaos_capsule_backend kb_pachaos_capsule_backend_t;
 typedef struct kb_pachaos_mmio_mapping kb_pachaos_mmio_mapping_t;
 typedef struct kb_pachaos_dma_mapping kb_pachaos_dma_mapping_t;
+
+_Static_assert(
+    KB_DEVICE_DMA_MAPPING_MAX_PAGES == PACHA_CAPSULE_DMA_MAPPING_MAX_PAGES,
+    "Kobox and PachaOS scatter DMA limits must match");
 
 enum {
     KB_PACHAOS_PCI_BAR_COUNT = 6,
@@ -50,6 +57,7 @@ struct kb_pachaos_dma_mapping {
     kb_dma_dir_t direction;
     int owns_cpu_addr;
     int owns_mapped_cpu_addr;
+    int page_mapping;
     kb_pachaos_dma_mapping_t *next;
 };
 
@@ -372,7 +380,10 @@ static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_pachaos_capsule_backend_t *
     kb_pachaos_dma_mapping_t **cursor = backend != NULL ? &backend->dma_mappings : NULL;
     while (cursor != NULL && *cursor != NULL) {
         kb_pachaos_dma_mapping_t *mapping = *cursor;
-        if (iova >= mapping->dma.iova && iova - mapping->dma.iova < mapping->dma.len) {
+        const int matches = mapping->page_mapping ?
+            iova == mapping->dma.iova :
+            iova >= mapping->dma.iova && iova - mapping->dma.iova < mapping->dma.len;
+        if (matches) {
             *cursor = mapping->next;
             mapping->next = NULL;
             return mapping;
@@ -827,6 +838,111 @@ static kb_status_t pachaos_capsule_dma_map(
     return KB_OK;
 }
 
+static kb_status_t pachaos_capsule_dma_map_pages(
+    kb_device_t *device,
+    void *cpu_addr,
+    uint64_t size,
+    kb_dma_dir_t direction,
+    uint64_t *out_page_dma,
+    size_t out_capacity)
+{
+    if (device == NULL || cpu_addr == NULL || size == 0 || size > (uint64_t)SIZE_MAX ||
+        out_page_dma == NULL || out_capacity == 0)
+    {
+        return KB_ERR_INVALID;
+    }
+
+    const uint64_t page_size = page_size_u64();
+    if (page_size == 0 || !is_power_of_two_u64(page_size)) {
+        return KB_ERR_INVALID;
+    }
+    const uint64_t page_offset = (uint64_t)((uintptr_t)cpu_addr & (uintptr_t)(page_size - 1u));
+    if (size > UINT64_MAX - page_offset) {
+        return KB_ERR_INVALID;
+    }
+    const uint64_t span = page_offset + size;
+    const uint64_t page_count_u64 = span / page_size + (span % page_size != 0);
+    if (page_count_u64 == 0 || page_count_u64 > KB_DEVICE_DMA_MAPPING_MAX_PAGES ||
+        page_count_u64 > (uint64_t)SIZE_MAX ||
+        (size_t)page_count_u64 > SIZE_MAX / sizeof(*out_page_dma) ||
+        (size_t)page_count_u64 > out_capacity)
+    {
+        return page_count_u64 > KB_DEVICE_DMA_MAPPING_MAX_PAGES ?
+            KB_ERR_UNSUPPORTED : KB_ERR_INVALID;
+    }
+    const size_t page_count = (size_t)page_count_u64;
+    memset(out_page_dma, 0, page_count * sizeof(*out_page_dma));
+
+    const int mapping_fd = pacha_capsule_derive_dma_mapping_pages(
+        device->device_fd,
+        cpu_addr,
+        (size_t)size,
+        (unsigned)dma_dir_to_pacha(direction),
+        out_page_dma,
+        out_capacity);
+    if (!pacha_capsule_is_fd(mapping_fd)) {
+        if (trace_pachaos_dma_enabled()) {
+            fprintf(stderr,
+                "kobox pachaos_capsule: dma_map_pages derive failed cpu=%p size=%llu pages=%zu status=%d\n",
+                cpu_addr,
+                (unsigned long long)size,
+                page_count,
+                mapping_fd);
+        }
+        memset(out_page_dma, 0, page_count * sizeof(*out_page_dma));
+        return status_from_pacha(mapping_fd);
+    }
+
+    struct pacha_capsule_dma dma = {0};
+    const int read_status = pacha_capsule_dma_from_fd(mapping_fd, &dma);
+    if (read_status != 0) {
+        (void)pacha_capsule_close(mapping_fd);
+        memset(out_page_dma, 0, page_count * sizeof(*out_page_dma));
+        return status_from_pacha(read_status);
+    }
+    if (dma.fd != mapping_fd || dma.addr != cpu_addr || dma.len != (size_t)size ||
+        dma.iova != out_page_dma[0] ||
+        (out_page_dma[0] & (page_size - 1u)) != page_offset)
+    {
+        (void)pacha_capsule_close(mapping_fd);
+        memset(out_page_dma, 0, page_count * sizeof(*out_page_dma));
+        return KB_ERR_IO;
+    }
+    for (size_t i = 1; i < page_count; i++) {
+        if ((out_page_dma[i] & (page_size - 1u)) != 0) {
+            (void)pacha_capsule_close(mapping_fd);
+            memset(out_page_dma, 0, page_count * sizeof(*out_page_dma));
+            return KB_ERR_IO;
+        }
+    }
+
+    kb_pachaos_dma_mapping_t mapping = {
+        .dma = dma,
+        .cpu_addr = cpu_addr,
+        .mapped_cpu_addr = cpu_addr,
+        .size = size,
+        .direction = direction,
+        .page_mapping = 1,
+    };
+    const kb_status_t remember_status = remember_dma_mapping(device->backend, &mapping);
+    if (remember_status != KB_OK) {
+        (void)pacha_capsule_close(mapping_fd);
+        memset(out_page_dma, 0, page_count * sizeof(*out_page_dma));
+        return remember_status;
+    }
+    if (trace_pachaos_dma_enabled()) {
+        fprintf(stderr,
+            "kobox pachaos_capsule: dma_map_pages cpu=%p size=%llu pages=%zu fd=%d first=0x%llx dir=%d\n",
+            cpu_addr,
+            (unsigned long long)size,
+            page_count,
+            mapping_fd,
+            (unsigned long long)out_page_dma[0],
+            direction);
+    }
+    return KB_OK;
+}
+
 static void pachaos_capsule_dma_unmap(kb_device_t *device, uint64_t dma_addr, uint64_t size, kb_dma_dir_t direction)
 {
     (void)size;
@@ -924,6 +1040,32 @@ static kb_status_t pachaos_capsule_dma_set_mask(kb_device_t *device, uint64_t ma
     return KB_OK;
 }
 
+static kb_status_t pachaos_capsule_msix_delivery_vector(
+    kb_device_t *device,
+    unsigned entry,
+    uint32_t *out_vector)
+{
+    enum {
+        PACHAOS_MSIX_DELIVERY_VECTOR_BASE = 0x50,
+        PACHAOS_MSIX_DELIVERY_VECTOR_LIMIT = 0xd0,
+    };
+
+    if (device == NULL || out_vector == NULL || entry >= KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) {
+        return KB_ERR_INVALID;
+    }
+
+    const uint64_t base = device->info.index;
+    if (base < PACHAOS_MSIX_DELIVERY_VECTOR_BASE ||
+        base > PACHAOS_MSIX_DELIVERY_VECTOR_LIMIT - KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT ||
+        ((base - PACHAOS_MSIX_DELIVERY_VECTOR_BASE) % KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) != 0)
+    {
+        return KB_ERR_INVALID;
+    }
+
+    *out_vector = (uint32_t)(base + entry);
+    return KB_OK;
+}
+
 static kb_status_t pachaos_capsule_irq_register(
     kb_device_t *device,
     unsigned vector,
@@ -936,16 +1078,25 @@ static kb_status_t pachaos_capsule_irq_register(
     }
     *out_irq = NULL;
 
-    /*
-     * PachaOS currently publishes PCI device interrupts through one generic
-     * vector. The Linux personality still tracks MSI/MSI-X entries internally,
-     * but the capsule IRQ fd must subscribe to the generic device source.
-     */
-    unsigned irq_kind = PACHA_CAPSULE_IRQ_AUTO;
-    unsigned irq_vector = 0;
+    const unsigned backend_kind = kb_device_irq_backend_kind(vector);
+    const unsigned irq_vector = kb_device_irq_backend_vector(vector);
+    if (backend_kind != KB_DEVICE_IRQ_BACKEND_KIND_MSIX) {
+        return KB_ERR_UNSUPPORTED;
+    }
+    if (irq_vector >= KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) {
+        return KB_ERR_INVALID;
+    }
+    uint32_t delivery_vector = 0;
+    const kb_status_t delivery_status =
+        pachaos_capsule_msix_delivery_vector(device, irq_vector, &delivery_vector);
+    if (delivery_status != KB_OK) {
+        return delivery_status;
+    }
+    (void)delivery_vector;
 
     struct pacha_capsule_irq irq_fd = {0};
-    const int status = pacha_capsule_device_derive_irq(device->device_fd, irq_kind, irq_vector, 0, &irq_fd);
+    const int status = pacha_capsule_device_derive_irq(
+        device->device_fd, PACHA_CAPSULE_IRQ_MSIX, irq_vector, 0, &irq_fd);
     if (status != 0) {
         return status_from_pacha(status);
     }
@@ -993,6 +1144,30 @@ static kb_status_t pachaos_capsule_irq_wait(kb_device_t *device, kb_device_irq_t
     if (irq == NULL || !pacha_capsule_is_fd(irq->irq.fd)) {
         return KB_ERR_INVALID;
     }
+#if defined(__pachaos__)
+    if (timeout_ns != 0) {
+        const uint64_t timeout_ticks =
+            timeout_ns > UINT64_MAX - 999999ull ? UINT64_MAX :
+            (timeout_ns + 999999ull) / 1000000ull;
+        struct pacha_pollfd pollfd = {
+            .fd = irq->irq.fd,
+            .events = PACHA_FD_EVENT_READABLE,
+        };
+        const long ready = pacha_fd_wait_many(&pollfd, 1, timeout_ticks);
+        if (ready <= 0) {
+            return status_from_pacha((int)ready);
+        }
+    }
+    uint64_t next_count = 0;
+    const int status = pacha_capsule_irq_poll(
+        irq->irq.fd, irq->irq.count, &next_count);
+    if (status != 0) {
+        return status_from_pacha(status);
+    }
+    irq->irq.count = next_count;
+    irq->handler(irq->ctx);
+    return KB_OK;
+#else
     uint64_t attempts = timeout_ns == 0 ? 1 : (timeout_ns + 999999ull) / 1000000ull;
     if (attempts == 0) {
         attempts = 1;
@@ -1017,6 +1192,7 @@ static kb_status_t pachaos_capsule_irq_wait(kb_device_t *device, kb_device_irq_t
         __asm__ volatile("pause");
     }
     return KB_ERR_NOT_FOUND;
+#endif
 }
 
 static uint64_t pachaos_capsule_monotonic_ns(kb_device_backend_t *backend)
@@ -1049,9 +1225,11 @@ static const kb_device_backend_ops_t pachaos_capsule_ops = {
     .dma_alloc = pachaos_capsule_dma_alloc,
     .dma_free = pachaos_capsule_dma_free,
     .dma_map = pachaos_capsule_dma_map,
+    .dma_map_pages = pachaos_capsule_dma_map_pages,
     .dma_map_fixed = pachaos_capsule_dma_map_fixed,
     .dma_unmap = pachaos_capsule_dma_unmap,
     .dma_set_mask = pachaos_capsule_dma_set_mask,
+    .msix_delivery_vector = pachaos_capsule_msix_delivery_vector,
     .irq_register = pachaos_capsule_irq_register,
     .irq_unregister = pachaos_capsule_irq_unregister,
     .irq_wait = pachaos_capsule_irq_wait,

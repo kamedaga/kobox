@@ -111,10 +111,21 @@ enum {
     KB_DRM_DRIVER_MAJOR_OFFSET = 0x88,
     KB_DRM_DRIVER_MINOR_OFFSET = 0x8c,
     KB_DRM_DRIVER_PATCHLEVEL_OFFSET = 0x90,
+    KB_DRM_DRIVER_IOCTLS_OFFSET = 0xb8,
+    KB_DRM_DRIVER_NUM_IOCTLS_OFFSET = 0xc0,
     KB_DRM_DRIVER_FOPS_OFFSET = 0xc8,
     KB_DRM_LINUX_FILE_PRIVATE_DATA_OFFSET = 0xc8,
+    KB_DRM_IOCTL_DESC_BYTES = 24,
+    KB_DRM_IOCTL_DESC_CMD_OFFSET = 0,
+    KB_DRM_IOCTL_DESC_FLAGS_OFFSET = 4,
+    KB_DRM_IOCTL_DESC_FUNC_OFFSET = 8,
+    KB_DRM_COMMAND_BASE = 0x40,
+    KB_DRM_RENDER_ALLOW = 1u << 5,
     KB_DRM_MAJOR = 226,
     KB_DRM_CARD0_MINOR = 0,
+    KB_DRM_RENDERD128_MINOR = 128,
+    KB_DRM_MINOR_COUNT = 256,
+    KB_DRM_DRIVER_RENDER = 1u << 3,
     KB_DRM_DEVICE_MAX = 4,
     KB_DRM_FILE_MAX = 64,
 };
@@ -123,13 +134,16 @@ typedef struct kb_drm_device_record {
     void *device;
     void *driver;
     void *cdev;
+    void *render_cdev;
     int registered;
+    int unplugged;
 } kb_drm_device_record_t;
 
 typedef struct kb_drm_file_record {
     void *linux_file;
     void *drm_file;
     kb_drm_device_record_t *device;
+    int render_node;
 } kb_drm_file_record_t;
 
 typedef struct kb_drm_version {
@@ -373,6 +387,15 @@ static int kb_read_int(const void *base, size_t offset)
     return value;
 }
 
+static uint32_t kb_read_u32(const void *base, size_t offset)
+{
+    uint32_t value = 0;
+    if (base != NULL) {
+        memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
+    }
+    return value;
+}
+
 static void kb_write_ptr(void *base, size_t offset, const void *value)
 {
     memcpy((uint8_t *)base + offset, &value, sizeof(value));
@@ -420,6 +443,32 @@ static void kb_drm_call_driver_postclose(void *function, void *device, void *fil
         kb_loader_leave_module_context(old_gs);
         kb_loader_set_active_module(previous);
     }
+}
+
+static int kb_drm_call_driver_ioctl(
+    void *function,
+    void *device,
+    void *data,
+    void *file)
+{
+    if (function == NULL) {
+        return -25;
+    }
+    kb_module_t *owner = kb_module_find_owner_for_address(function);
+    kb_module_t *previous = kb_loader_active_module();
+    unsigned long old_gs = 0;
+    const int entered = owner != NULL &&
+        kb_loader_enter_module_context(owner, &old_gs) == KB_OK;
+    if (entered) {
+        kb_loader_set_active_module(owner);
+    }
+    const int result = ((int (*)(void *, void *, void *))function)(
+        device, data, file);
+    if (entered) {
+        kb_loader_leave_module_context(old_gs);
+        kb_loader_set_active_module(previous);
+    }
+    return result;
 }
 
 static kb_drm_device_record_t *kb_drm_find_device(void *device)
@@ -498,13 +547,14 @@ int kb_drm_dev_register(void *device, unsigned long flags)
         return -22;
     }
     int status = kb_linux_kernel_register_chrdev(
-        KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, 64, "drm", fops);
+        KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, KB_DRM_MINOR_COUNT, "drm", fops);
     if (status != 0) {
         return status;
     }
     record->cdev = kb_linux_kernel_cdev_alloc();
     if (record->cdev == NULL) {
-        kb_linux_kernel_unregister_chrdev(KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, 64, "drm");
+        kb_linux_kernel_unregister_chrdev(
+            KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, KB_DRM_MINOR_COUNT, "drm");
         return -12;
     }
     kb_linux_kernel_cdev_init(record->cdev, fops);
@@ -513,8 +563,30 @@ int kb_drm_dev_register(void *device, unsigned long flags)
         kb_linux_kernel_encode_dev(KB_DRM_MAJOR, KB_DRM_CARD0_MINOR),
         1);
     if (status != 0) {
-        kb_linux_kernel_unregister_chrdev(KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, 64, "drm");
+        kb_linux_kernel_unregister_chrdev(
+            KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, KB_DRM_MINOR_COUNT, "drm");
         return status;
+    }
+    if ((kb_read_u64(record->driver, KB_DRM_DRIVER_FEATURES_OFFSET) &
+            KB_DRM_DRIVER_RENDER) != 0) {
+        record->render_cdev = kb_linux_kernel_cdev_alloc();
+        if (record->render_cdev == NULL) {
+            kb_linux_kernel_cdev_del(record->cdev);
+            kb_linux_kernel_unregister_chrdev(
+                KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, KB_DRM_MINOR_COUNT, "drm");
+            return -12;
+        }
+        kb_linux_kernel_cdev_init(record->render_cdev, fops);
+        status = kb_linux_kernel_cdev_add(
+            record->render_cdev,
+            kb_linux_kernel_encode_dev(KB_DRM_MAJOR, KB_DRM_RENDERD128_MINOR),
+            1);
+        if (status != 0) {
+            kb_linux_kernel_cdev_del(record->cdev);
+            kb_linux_kernel_unregister_chrdev(
+                KB_DRM_MAJOR, KB_DRM_CARD0_MINOR, KB_DRM_MINOR_COUNT, "drm");
+            return status;
+        }
     }
     record->registered = 1;
     return 0;
@@ -533,7 +605,12 @@ void kb_drm_dev_put(void *device)
 int kb_drm_dev_enter(void *device, int *index)
 {
     kb_drm_device_record_t *record = kb_drm_find_device(device);
-    if (record == NULL || !record->registered) {
+    /*
+     * drm_dev_enter() guards unplug, not character-device publication.
+     * Drivers issue initialization commands before drm_dev_register(), so
+     * tying this guard to node registration drops their first requests.
+     */
+    if (record == NULL || record->unplugged) {
         return 0;
     }
     if (index != NULL) {
@@ -551,19 +628,22 @@ void kb_drm_dev_unplug(void *device)
 {
     kb_drm_device_record_t *record = kb_drm_find_device(device);
     if (record != NULL) {
+        record->unplugged = 1;
         record->registered = 0;
     }
 }
 
 int kb_drm_open(void *inode, void *linux_file)
 {
-    (void)inode;
     if (linux_file == NULL || kb_drm_find_file(linux_file) != NULL) {
         return -22;
     }
     kb_drm_device_record_t *device = NULL;
+    void *inode_cdev = kb_read_ptr(inode, 0x238);
     for (size_t i = 0; i < KB_DRM_DEVICE_MAX; i++) {
-        if (drm_devices[i].registered) {
+        if (drm_devices[i].registered &&
+            (drm_devices[i].cdev == inode_cdev ||
+                drm_devices[i].render_cdev == inode_cdev)) {
             device = &drm_devices[i];
             break;
         }
@@ -596,6 +676,7 @@ int kb_drm_open(void *inode, void *linux_file)
     record->linux_file = linux_file;
     record->drm_file = drm_file;
     record->device = device;
+    record->render_node = device->render_cdev == inode_cdev;
     kb_write_ptr(linux_file, KB_DRM_LINUX_FILE_PRIVATE_DATA_OFFSET, drm_file);
     return 0;
 }
@@ -664,7 +745,38 @@ long kb_drm_ioctl(void *linux_file, unsigned int command, unsigned long argument
         }
         return -22;
     }
-    return -25;
+
+    const uint32_t command_type = (command >> 8u) & 0xffu;
+    const uint32_t command_nr = command & 0xffu;
+    const uint32_t ioctl_count = kb_read_u32(
+        driver, KB_DRM_DRIVER_NUM_IOCTLS_OFFSET);
+    if (command_type != 'd' || command_nr < KB_DRM_COMMAND_BASE ||
+        command_nr - KB_DRM_COMMAND_BASE >= ioctl_count) {
+        return -25;
+    }
+    void *table = kb_read_ptr(driver, KB_DRM_DRIVER_IOCTLS_OFFSET);
+    if (table == NULL) {
+        return -25;
+    }
+    const void *descriptor = (const uint8_t *)table +
+        (size_t)(command_nr - KB_DRM_COMMAND_BASE) * KB_DRM_IOCTL_DESC_BYTES;
+    const uint32_t descriptor_command = kb_read_u32(
+        descriptor, KB_DRM_IOCTL_DESC_CMD_OFFSET);
+    const uint32_t descriptor_flags = kb_read_u32(
+        descriptor, KB_DRM_IOCTL_DESC_FLAGS_OFFSET);
+    void *function = kb_read_ptr(descriptor, KB_DRM_IOCTL_DESC_FUNC_OFFSET);
+    if (descriptor_command != command || function == NULL) {
+        return -25;
+    }
+    if (record->render_node &&
+        (descriptor_flags & KB_DRM_RENDER_ALLOW) == 0) {
+        return -13;
+    }
+    return kb_drm_call_driver_ioctl(
+        function,
+        record->device->device,
+        (void *)(uintptr_t)argument,
+        record->drm_file);
 }
 
 long kb_drm_compat_ioctl(void *linux_file, unsigned int command, unsigned long argument)

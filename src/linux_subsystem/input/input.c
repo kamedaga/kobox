@@ -6,6 +6,7 @@
 
 enum {
     KB_INPUT_DEVICE_MAX = 64,
+    KB_INPUT_FRAME_STAGE_MAX = 255,
     KB_LINUX_INPUT_DEV_NAME_OFFSET = 0,
     KB_LINUX_INPUT_DEV_PHYS_OFFSET = 8,
     KB_LINUX_INPUT_DEV_UNIQ_OFFSET = 16,
@@ -21,16 +22,40 @@ enum {
     KB_LINUX_6_8_INPUT_DEV_FFBIT_OFFSET = 184,
     KB_LINUX_6_8_INPUT_DEV_SWBIT_OFFSET = 200,
     KB_LINUX_6_8_INPUT_DEV_ABSINFO_OFFSET = 328,
+    KB_LINUX_6_8_INPUT_DEV_KEY_OFFSET = 336,
+    KB_LINUX_6_8_INPUT_DEV_LED_OFFSET = 432,
+    KB_LINUX_6_8_INPUT_DEV_SND_OFFSET = 440,
+    KB_LINUX_6_8_INPUT_DEV_SW_OFFSET = 448,
     KB_LINUX_6_8_INPUT_DEV_OPEN_OFFSET = 456,
     KB_LINUX_6_8_INPUT_DEV_CLOSE_OFFSET = 464,
     KB_LINUX_6_8_INPUT_ABSINFO_SIZE = 24,
+    KB_INPUT_EV_SYN = 0,
+    KB_INPUT_EV_KEY = 1,
+    KB_INPUT_EV_REL = 2,
+    KB_INPUT_EV_ABS = 3,
+    KB_INPUT_EV_SW = 5,
+    KB_INPUT_EV_LED = 0x11,
+    KB_INPUT_EV_SND = 0x12,
+    KB_INPUT_SYN_REPORT = 0,
+    KB_INPUT_SYN_DROPPED = 3,
+    KB_INPUT_ABS_MT_SLOT = 0x2f,
 };
+
+typedef struct kb_input_staged_event {
+    unsigned int type;
+    unsigned int code;
+    int value;
+} kb_input_staged_event_t;
 
 typedef struct kb_input_device_record {
     kb_input_device_snapshot_t snapshot;
     int allocated;
     int absinfo_allocated;
     void *absinfo;
+    size_t stage_count;
+    unsigned long stage_dropped_events;
+    int stage_dropped;
+    kb_input_staged_event_t stage[KB_INPUT_FRAME_STAGE_MAX];
 } kb_input_device_record_t;
 
 typedef int (*kb_linux_input_open_fn)(void *dev);
@@ -178,6 +203,39 @@ static kb_input_device_record_t *find_device(void *dev)
     return NULL;
 }
 
+static kb_input_device_record_t *find_device_by_id(unsigned int device_id)
+{
+    if (device_id == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
+        if (input_devices[i].snapshot.id == device_id) {
+            return &input_devices[i];
+        }
+    }
+    return NULL;
+}
+
+static void purge_queued_events_for_device(unsigned int device_id)
+{
+    const size_t original_count = input_event_count;
+    for (size_t i = 0; i < original_count; i++) {
+        const kb_input_event_t event = input_events[input_event_head];
+        input_event_head = (input_event_head + 1u) % KB_INPUT_EVENT_QUEUE_MAX;
+        input_event_count--;
+        if (event.device_id == device_id) {
+            continue;
+        }
+        const size_t tail =
+            (input_event_head + input_event_count) % KB_INPUT_EVENT_QUEUE_MAX;
+        input_events[tail] = event;
+        input_event_count++;
+    }
+    if (input_event_count == 0) {
+        input_event_head = 0;
+    }
+}
+
 static kb_input_device_record_t *alloc_record(void *dev)
 {
     kb_input_device_record_t *record = find_device(dev);
@@ -217,6 +275,162 @@ static kb_input_device_record_t *fallback_event_record(void)
         }
     }
     return NULL;
+}
+
+static int defuzz_abs_event(int value, int old_value, int fuzz)
+{
+    const int64_t candidate = value;
+    const int64_t previous = old_value;
+    const int64_t tolerance = fuzz;
+    if (tolerance > 0) {
+        if (candidate > previous - tolerance / 2 &&
+            candidate < previous + tolerance / 2)
+        {
+            return old_value;
+        }
+        if (candidate > previous - tolerance && candidate < previous + tolerance) {
+            return (int)((previous * 3 + candidate) / 4);
+        }
+        if (candidate > previous - tolerance * 2 &&
+            candidate < previous + tolerance * 2)
+        {
+            return (int)((previous + candidate) / 2);
+        }
+    }
+    return value;
+}
+
+static int update_abs_event_state(
+    kb_input_device_record_t *record,
+    unsigned int code,
+    int *value)
+{
+    if (record == NULL || value == NULL || code >= KB_INPUT_ABS_MAX ||
+        ((record->snapshot.abs_bits >> code) & 1u) == 0 ||
+        record->absinfo == NULL)
+    {
+        return 0;
+    }
+    if (code >= KB_INPUT_ABS_MT_SLOT) {
+        return 0;
+    }
+
+    int values[6];
+    unsigned char *absinfo = (unsigned char *)record->absinfo +
+        ((size_t)code * KB_LINUX_6_8_INPUT_ABSINFO_SIZE);
+    memcpy(values, absinfo, sizeof(values));
+    *value = defuzz_abs_event(*value, values[0], values[3]);
+    if (*value == values[0]) {
+        return 0;
+    }
+
+    values[0] = *value;
+    memcpy(absinfo, values, sizeof(values));
+    record->snapshot.abs[code].value = *value;
+    return 1;
+}
+
+static int update_key_event_state(
+    kb_input_device_record_t *record,
+    unsigned int code,
+    int value)
+{
+    const unsigned int word = code / 64u;
+    const uint64_t mask = UINT64_C(1) << (code % 64u);
+    if (record == NULL || word >= KB_INPUT_KEY_WORDS ||
+        (record->snapshot.key_bits[word] & mask) == 0)
+    {
+        return 0;
+    }
+    if (value == 2) {
+        return 1;
+    }
+
+    const int pressed = value != 0;
+    if (((record->snapshot.key_state[word] & mask) != 0) == pressed) {
+        return 0;
+    }
+
+    uint64_t key_state = 0;
+    unsigned char *state_slot = (unsigned char *)record->snapshot.linux_dev +
+        KB_LINUX_6_8_INPUT_DEV_KEY_OFFSET + ((size_t)word * sizeof(key_state));
+    memcpy(&key_state, state_slot, sizeof(key_state));
+    if (pressed) {
+        key_state |= mask;
+        record->snapshot.key_state[word] |= mask;
+    } else {
+        key_state &= ~mask;
+        record->snapshot.key_state[word] &= ~mask;
+    }
+    memcpy(state_slot, &key_state, sizeof(key_state));
+    return 1;
+}
+
+static int update_single_word_state(
+    kb_input_device_record_t *record,
+    unsigned int code,
+    int value,
+    uint64_t supported,
+    size_t linux_state_offset,
+    uint64_t *snapshot_state,
+    int pass_unchanged)
+{
+    if (record == NULL || code >= 64u || snapshot_state == NULL) {
+        return 0;
+    }
+    const uint64_t mask = UINT64_C(1) << code;
+    if ((supported & mask) == 0) {
+        return 0;
+    }
+
+    const int enabled = value != 0;
+    if (((*snapshot_state & mask) != 0) == enabled) {
+        return pass_unchanged;
+    }
+    if (enabled) {
+        *snapshot_state |= mask;
+    } else {
+        *snapshot_state &= ~mask;
+    }
+    memcpy((unsigned char *)record->snapshot.linux_dev + linux_state_offset,
+        snapshot_state, sizeof(*snapshot_state));
+    return 1;
+}
+
+static int update_switch_event_state(
+    kb_input_device_record_t *record,
+    unsigned int code,
+    int value)
+{
+    return update_single_word_state(record, code, value,
+        record == NULL ? 0 : record->snapshot.sw_bits,
+        KB_LINUX_6_8_INPUT_DEV_SW_OFFSET,
+        record == NULL ? NULL : &record->snapshot.sw_state,
+        0);
+}
+
+static int update_led_event_state(
+    kb_input_device_record_t *record,
+    unsigned int code,
+    int value)
+{
+    return update_single_word_state(record, code, value,
+        record == NULL ? 0 : record->snapshot.led_bits,
+        KB_LINUX_6_8_INPUT_DEV_LED_OFFSET,
+        record == NULL ? NULL : &record->snapshot.led_state,
+        0);
+}
+
+static int update_sound_event_state(
+    kb_input_device_record_t *record,
+    unsigned int code,
+    int value)
+{
+    return update_single_word_state(record, code, value,
+        record == NULL ? 0 : record->snapshot.snd_bits,
+        KB_LINUX_6_8_INPUT_DEV_SND_OFFSET,
+        record == NULL ? NULL : &record->snapshot.snd_state,
+        1);
 }
 
 static int input_record_can_open(const kb_input_device_record_t *record)
@@ -260,6 +474,7 @@ static void refresh_device_snapshot(kb_input_device_record_t *record)
     memcpy(&record->snapshot.prop_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_PROPBIT_OFFSET, sizeof(record->snapshot.prop_bits));
     memcpy(&record->snapshot.event_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_EVBIT_OFFSET, sizeof(record->snapshot.event_bits));
     memcpy(record->snapshot.key_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_KEYBIT_OFFSET, sizeof(record->snapshot.key_bits));
+    memcpy(record->snapshot.key_state, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_KEY_OFFSET, sizeof(record->snapshot.key_state));
     memcpy(&record->snapshot.rel_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_RELBIT_OFFSET, sizeof(record->snapshot.rel_bits));
     memcpy(&record->snapshot.abs_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_ABSBIT_OFFSET, sizeof(record->snapshot.abs_bits));
     memcpy(&record->snapshot.msc_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_MSCBIT_OFFSET, sizeof(record->snapshot.msc_bits));
@@ -267,6 +482,9 @@ static void refresh_device_snapshot(kb_input_device_record_t *record)
     memcpy(&record->snapshot.snd_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_SNDBIT_OFFSET, sizeof(record->snapshot.snd_bits));
     memcpy(record->snapshot.ff_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_FFBIT_OFFSET, sizeof(record->snapshot.ff_bits));
     memcpy(&record->snapshot.sw_bits, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_SWBIT_OFFSET, sizeof(record->snapshot.sw_bits));
+    memcpy(&record->snapshot.led_state, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_LED_OFFSET, sizeof(record->snapshot.led_state));
+    memcpy(&record->snapshot.snd_state, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_SND_OFFSET, sizeof(record->snapshot.snd_state));
+    memcpy(&record->snapshot.sw_state, (unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_SW_OFFSET, sizeof(record->snapshot.sw_state));
     if (record->absinfo != NULL) {
         for (size_t axis = 0; axis < KB_INPUT_ABS_MAX; axis++) {
             int values[6];
@@ -378,6 +596,7 @@ void kb_input_subsystem_free_device(void *dev)
     if (record == NULL) {
         return;
     }
+    purge_queued_events_for_device(record->snapshot.id);
     free(record->absinfo);
     record->absinfo = NULL;
     if (record->allocated) {
@@ -392,9 +611,24 @@ int kb_input_subsystem_register_device(void *dev)
     if (record == NULL) {
         return -12;
     }
+    record->stage_count = 0;
+    record->stage_dropped_events = 0;
+    record->stage_dropped = 0;
     *(unsigned long *)((unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_EVBIT_OFFSET) |= 1ul;
     record->snapshot.active = 1;
     refresh_device_snapshot(record);
+    const uint64_t mt_abs_bits = record->snapshot.abs_bits &
+        (UINT64_MAX << KB_INPUT_ABS_MT_SLOT);
+    if (record->snapshot.mt_slots != 0 || mt_abs_bits != 0) {
+        record->snapshot.active = 0;
+        return -95;
+    }
+    if ((record->snapshot.event_bits & (UINT64_C(1) << KB_INPUT_EV_ABS)) != 0 &&
+        record->absinfo == NULL)
+    {
+        record->snapshot.active = 0;
+        return -22;
+    }
     return 0;
 }
 
@@ -405,6 +639,10 @@ void kb_input_subsystem_unregister_device(void *dev)
         return;
     }
     close_input_record(record);
+    purge_queued_events_for_device(record->snapshot.id);
+    record->stage_count = 0;
+    record->stage_dropped_events = 0;
+    record->stage_dropped = 0;
     record->snapshot.active = 0;
     if (record->allocated) {
         free(record->absinfo);
@@ -412,6 +650,133 @@ void kb_input_subsystem_unregister_device(void *dev)
         kb_kfree(dev);
         memset(record, 0, sizeof(*record));
     }
+}
+
+static void append_input_event_unchecked(
+    const kb_input_device_record_t *record,
+    unsigned int type,
+    unsigned int code,
+    int value)
+{
+    if (record == NULL || input_event_count >= KB_INPUT_EVENT_QUEUE_MAX) {
+        return;
+    }
+    const size_t index =
+        (input_event_head + input_event_count) % KB_INPUT_EVENT_QUEUE_MAX;
+    input_event_count++;
+    input_events[index] = (kb_input_event_t){
+        .sequence = next_event_sequence++,
+        .device_id = record->snapshot.id,
+        .linux_dev = record->snapshot.linux_dev,
+        .type = type,
+        .code = code,
+        .value = value,
+    };
+}
+
+static void append_recovery_frame_unchecked(
+    const kb_input_device_record_t *record)
+{
+    _Static_assert(2u * KB_INPUT_DEVICE_MAX <= KB_INPUT_EVENT_QUEUE_MAX,
+        "input recovery frames must fit in the event queue");
+    if (record == NULL || !record->snapshot.active ||
+        input_event_count > KB_INPUT_EVENT_QUEUE_MAX - 2u)
+    {
+        return;
+    }
+    append_input_event_unchecked(record,
+        KB_INPUT_EV_SYN, KB_INPUT_SYN_DROPPED, 0);
+    append_input_event_unchecked(record,
+        KB_INPUT_EV_SYN, KB_INPUT_SYN_REPORT, 0);
+}
+
+static void recover_input_event_queue_overflow(
+    kb_input_device_record_t *current_record,
+    unsigned long current_lost_events)
+{
+    unsigned long lost_events[KB_INPUT_DEVICE_MAX] = {0};
+    for (size_t i = 0; i < input_event_count; i++) {
+        const kb_input_event_t *event =
+            &input_events[(input_event_head + i) % KB_INPUT_EVENT_QUEUE_MAX];
+        kb_input_device_record_t *record = find_device_by_id(event->device_id);
+        if (record != NULL) {
+            lost_events[record - input_devices]++;
+        }
+    }
+    if (current_record != NULL && current_lost_events != 0) {
+        lost_events[current_record - input_devices] += current_lost_events;
+    }
+
+    input_event_head = 0;
+    input_event_count = 0;
+    for (size_t i = 0; i < KB_INPUT_DEVICE_MAX; i++) {
+        kb_input_device_record_t *record = &input_devices[i];
+        if (lost_events[i] == 0) {
+            continue;
+        }
+        record->snapshot.dropped_events += lost_events[i];
+        if (record != current_record &&
+            (record->stage_count != 0 || record->stage_dropped))
+        {
+            if (!record->stage_dropped) {
+                record->stage_dropped = 1;
+                record->stage_dropped_events =
+                    (unsigned long)record->stage_count;
+                record->stage_count = 0;
+            }
+            continue;
+        }
+        append_recovery_frame_unchecked(record);
+    }
+}
+
+static void reset_staged_input_frame(kb_input_device_record_t *record)
+{
+    if (record == NULL) {
+        return;
+    }
+    record->stage_count = 0;
+    record->stage_dropped_events = 0;
+    record->stage_dropped = 0;
+}
+
+static void publish_staged_input_frame(kb_input_device_record_t *record)
+{
+    if (record == NULL || !record->snapshot.active) {
+        reset_staged_input_frame(record);
+        return;
+    }
+
+    if (record->stage_dropped) {
+        const unsigned long lost = record->stage_dropped_events + 1u;
+        if (input_event_count > KB_INPUT_EVENT_QUEUE_MAX - 2u) {
+            recover_input_event_queue_overflow(record, lost);
+        } else {
+            record->snapshot.dropped_events += lost;
+            append_recovery_frame_unchecked(record);
+        }
+        reset_staged_input_frame(record);
+        return;
+    }
+    if (record->stage_count == 0) {
+        return;
+    }
+
+    const size_t required = record->stage_count + 1u;
+    if (input_event_count > KB_INPUT_EVENT_QUEUE_MAX - required) {
+        recover_input_event_queue_overflow(record, (unsigned long)required);
+        reset_staged_input_frame(record);
+        return;
+    }
+    for (size_t i = 0; i < record->stage_count; i++) {
+        append_input_event_unchecked(record,
+            record->stage[i].type,
+            record->stage[i].code,
+            record->stage[i].value);
+    }
+    append_input_event_unchecked(record,
+        KB_INPUT_EV_SYN, KB_INPUT_SYN_REPORT, 0);
+    reset_staged_input_frame(record);
 }
 
 void kb_input_subsystem_record_event(void *dev, unsigned int type, unsigned int code, int value)
@@ -422,20 +787,47 @@ void kb_input_subsystem_record_event(void *dev, unsigned int type, unsigned int 
     }
     refresh_device_snapshot(record);
     record->snapshot.event_count++;
-
-    size_t index = (input_event_head + input_event_count) % KB_INPUT_EVENT_QUEUE_MAX;
-    if (input_event_count == KB_INPUT_EVENT_QUEUE_MAX) {
-        index = input_event_head;
-        input_event_head = (input_event_head + 1u) % KB_INPUT_EVENT_QUEUE_MAX;
-        record->snapshot.dropped_events++;
-    } else {
-        input_event_count++;
+    if (type == KB_INPUT_EV_KEY && !update_key_event_state(record, code, value)) {
+        return;
+    }
+    if (type == KB_INPUT_EV_ABS && !update_abs_event_state(record, code, &value)) {
+        return;
+    }
+    if (type == KB_INPUT_EV_REL &&
+        (code >= 64u ||
+         (record->snapshot.rel_bits & (UINT64_C(1) << code)) == 0 ||
+         value == 0))
+    {
+        return;
+    }
+    if (type == KB_INPUT_EV_SW && !update_switch_event_state(record, code, value)) {
+        return;
+    }
+    if (type == KB_INPUT_EV_LED && !update_led_event_state(record, code, value)) {
+        return;
+    }
+    if (type == KB_INPUT_EV_SND && !update_sound_event_state(record, code, value)) {
+        return;
+    }
+    if (!record->snapshot.active) {
+        return;
     }
 
-    input_events[index] = (kb_input_event_t){
-        .sequence = next_event_sequence++,
-        .device_id = record->snapshot.id,
-        .linux_dev = record->snapshot.linux_dev,
+    if (type == KB_INPUT_EV_SYN && code == KB_INPUT_SYN_REPORT) {
+        publish_staged_input_frame(record);
+        return;
+    }
+    if (record->stage_dropped) {
+        record->stage_dropped_events++;
+        return;
+    }
+    if (record->stage_count == KB_INPUT_FRAME_STAGE_MAX) {
+        record->stage_dropped = 1;
+        record->stage_dropped_events = (unsigned long)record->stage_count + 1u;
+        record->stage_count = 0;
+        return;
+    }
+    record->stage[record->stage_count++] = (kb_input_staged_event_t){
         .type = type,
         .code = code,
         .value = value,
@@ -454,6 +846,12 @@ void kb_input_subsystem_set_abs_params(
     if (record == NULL || axis >= KB_INPUT_ABS_MAX) {
         return;
     }
+    *(uint64_t *)((unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_EVBIT_OFFSET) |=
+        UINT64_C(1) << KB_INPUT_EV_ABS;
+    *(uint64_t *)((unsigned char *)dev + KB_LINUX_6_8_INPUT_DEV_ABSBIT_OFFSET) |=
+        UINT64_C(1) << axis;
+    record->snapshot.event_bits |= UINT64_C(1) << KB_INPUT_EV_ABS;
+    record->snapshot.abs_bits |= UINT64_C(1) << axis;
     record->snapshot.abs[axis] = (kb_input_abs_params_t){
         .active = 1,
         .minimum = minimum,
@@ -488,6 +886,9 @@ int kb_input_subsystem_mt_init_slots(void *dev, unsigned int num_slots, unsigned
     kb_input_device_record_t *record = alloc_record(dev);
     if (record == NULL) {
         return -12;
+    }
+    if (record->snapshot.active) {
+        return -95;
     }
     record->snapshot.mt_slots = num_slots;
     record->snapshot.mt_flags = flags;

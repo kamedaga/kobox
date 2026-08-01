@@ -15,9 +15,21 @@ enum {
     KB_KMALLOC_ARENA_CHUNK_MIN = 1024u * 1024u,
 };
 
+typedef struct kb_kmem_cache_page {
+    void *addr;
+    struct kb_kmem_cache_page *next;
+} kb_kmem_cache_page_t;
+
+typedef struct kb_kmem_cache_free_slot {
+    struct kb_kmem_cache_free_slot *next;
+} kb_kmem_cache_free_slot_t;
+
 typedef struct kb_kmem_cache {
     size_t size;
     size_t align;
+    size_t slot_size;
+    kb_kmem_cache_page_t *pages;
+    kb_kmem_cache_free_slot_t *free_slots;
 } kb_kmem_cache_t;
 
 typedef struct kb_heap_allocation {
@@ -278,7 +290,7 @@ size_t kb_kmalloc_usable_size(const void *ptr)
 void *kb_kmalloc(size_t size, unsigned int flags)
 {
     size_t actual_size = size == 0 ? 1 : size;
-    if (actual_size == KB_KMALLOC_MMAP_ALIGN && kmalloc_arena_enabled()) {
+    if (actual_size >= KB_KMALLOC_MMAP_ALIGN && kmalloc_arena_enabled()) {
         void *page = kb_alloc_pages_exact(actual_size, flags);
         if (page != NULL) {
             kb_heap_allocation_t *record = malloc(sizeof(*record));
@@ -427,7 +439,17 @@ void *kb_kmem_cache_create(const char *name, size_t size, size_t align, unsigned
         return NULL;
     }
     cache->size = size == 0 ? 1 : size;
-    cache->align = align;
+    cache->align = align < sizeof(void *) ? sizeof(void *) : align;
+    if ((cache->align & (cache->align - 1u)) != 0) {
+        cache->align = sizeof(void *);
+    }
+    const size_t minimum_slot = cache->size < sizeof(kb_kmem_cache_free_slot_t) ?
+        sizeof(kb_kmem_cache_free_slot_t) : cache->size;
+    cache->slot_size = align_up_size(minimum_slot, cache->align);
+    if (cache->slot_size > KB_KMALLOC_MMAP_ALIGN) {
+        kb_kfree(cache);
+        return NULL;
+    }
     if (trace_memory()) {
         fprintf(stderr, "kobox-shim: kmem_cache_create size=%zu align=%zu cache=%p\n", size, align, (void *)cache);
     }
@@ -442,22 +464,64 @@ void *kb_kmem_cache_create_args(const char *name, unsigned int object_size, void
 
 void kb_kmem_cache_destroy(void *cache)
 {
-    kb_kfree(cache);
+    kb_kmem_cache_t *typed = cache;
+    if (typed == NULL) {
+        return;
+    }
+    while (typed->pages != NULL) {
+        kb_kmem_cache_page_t *page = typed->pages;
+        typed->pages = page->next;
+        kb_free_pages_exact(page->addr, KB_KMALLOC_MMAP_ALIGN);
+        free(page);
+    }
+    kb_kfree(typed);
 }
 
 void *kb_kmem_cache_alloc(void *cache, unsigned int flags)
 {
-    size_t size = 4096;
-    if (cache != NULL) {
-        size = ((const kb_kmem_cache_t *)cache)->size;
+    kb_kmem_cache_t *typed = cache;
+    if (typed == NULL || typed->slot_size == 0 || typed->slot_size > KB_KMALLOC_MMAP_ALIGN) {
+        return NULL;
     }
-    return kb_kmalloc(size, flags);
+    if (typed->free_slots == NULL) {
+        void *page_addr = kb_alloc_pages_exact(KB_KMALLOC_MMAP_ALIGN, flags);
+        if (page_addr == NULL) {
+            return NULL;
+        }
+        kb_kmem_cache_page_t *page = malloc(sizeof(*page));
+        if (page == NULL) {
+            kb_free_pages_exact(page_addr, KB_KMALLOC_MMAP_ALIGN);
+            return NULL;
+        }
+        page->addr = page_addr;
+        page->next = typed->pages;
+        typed->pages = page;
+
+        const size_t slot_count = KB_KMALLOC_MMAP_ALIGN / typed->slot_size;
+        for (size_t index = slot_count; index != 0; index--) {
+            kb_kmem_cache_free_slot_t *slot =
+                (kb_kmem_cache_free_slot_t *)((unsigned char *)page_addr + ((index - 1u) * typed->slot_size));
+            slot->next = typed->free_slots;
+            typed->free_slots = slot;
+        }
+    }
+    kb_kmem_cache_free_slot_t *slot = typed->free_slots;
+    typed->free_slots = slot->next;
+    if ((flags & KB_LINUX___GFP_ZERO) != 0) {
+        memset(slot, 0, typed->size);
+    }
+    return slot;
 }
 
 void kb_kmem_cache_free(void *cache, void *ptr)
 {
-    (void)cache;
-    kb_kfree(ptr);
+    kb_kmem_cache_t *typed = cache;
+    if (typed == NULL || ptr == NULL) {
+        return;
+    }
+    kb_kmem_cache_free_slot_t *slot = ptr;
+    slot->next = typed->free_slots;
+    typed->free_slots = slot;
 }
 
 void kb_kfree(void *ptr)

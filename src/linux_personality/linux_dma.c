@@ -12,6 +12,7 @@ enum {
 };
 
 static const uintptr_t KB_LINUX_DMA_ENCODED_PAGE_TAG = (uintptr_t)1ull << 63;
+static const uint64_t KB_LINUX_DMA_MAPPING_ERROR = UINT64_MAX;
 
 kb_device_backend_t *kb_shim_current_device_backend(void);
 
@@ -176,7 +177,7 @@ uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size
 {
     (void)attrs;
     if (page == NULL || size == 0) {
-        return 0;
+        return KB_LINUX_DMA_MAPPING_ERROR;
     }
 
     void *cpu_addr = NULL;
@@ -201,7 +202,7 @@ uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size
 
     kb_device_t *device = dma_device(dev);
     if (device == NULL) {
-        return 0;
+        return KB_LINUX_DMA_MAPPING_ERROR;
     }
 
     if (!linux_page_to_cpu_addr(page, offset, &cpu_addr)) {
@@ -213,7 +214,7 @@ uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size
                 size,
                 dir);
         }
-        return 0;
+        return KB_LINUX_DMA_MAPPING_ERROR;
     }
     kb_status_t status = KB_ERR_INVALID;
     uint64_t dma_addr = kb_subsystem_dma_map(
@@ -261,14 +262,14 @@ uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size
                 (unsigned long long)kb_linux_kvm_phys_base());
         }
     }
-    return status == KB_OK ? dma_addr : 0;
+    return status == KB_OK && dma_addr != 0 ? dma_addr : KB_LINUX_DMA_MAPPING_ERROR;
 }
 
 uint64_t kb_dma_map_single_attrs(void *dev, void *ptr, size_t size, int dir, unsigned long attrs)
 {
     (void)attrs;
     if (ptr == NULL || size == 0) {
-        return 0;
+        return KB_LINUX_DMA_MAPPING_ERROR;
     }
 
     uint64_t direct_dma_addr = 0;
@@ -287,7 +288,7 @@ uint64_t kb_dma_map_single_attrs(void *dev, void *ptr, size_t size, int dir, uns
 
     kb_device_t *device = dma_device(dev);
     if (device == NULL) {
-        return 0;
+        return KB_LINUX_DMA_MAPPING_ERROR;
     }
 
     kb_status_t status = KB_ERR_INVALID;
@@ -318,7 +319,7 @@ uint64_t kb_dma_map_single_attrs(void *dev, void *ptr, size_t size, int dir, uns
                 (unsigned long long)dma_addr);
         }
     }
-    return status == KB_OK ? dma_addr : 0;
+    return status == KB_OK && dma_addr != 0 ? dma_addr : KB_LINUX_DMA_MAPPING_ERROR;
 }
 
 void kb_dma_unmap_page_attrs(void *dev, uint64_t dma_addr, size_t size, int dir, unsigned long attrs)
@@ -343,7 +344,7 @@ void kb_dma_unmap_single_attrs(void *dev, uint64_t dma_addr, size_t size, int di
 int kb_dma_mapping_error(void *dev, uint64_t dma_addr)
 {
     (void)dev;
-    if (dma_addr == 0) {
+    if (dma_addr == KB_LINUX_DMA_MAPPING_ERROR) {
         return 1;
     }
     if (kb_linux_kvm_dma_addr_in_payload_arena(dma_addr, 1)) {

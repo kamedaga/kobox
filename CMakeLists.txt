@@ -206,6 +206,51 @@ target_compile_options(kobox-smoke PRIVATE
 
 add_test(NAME kobox-smoke COMMAND kobox-smoke)
 
+add_executable(kobox-pachaos-msix-route-smoke
+    tests/pachaos_msix_route_smoke.c
+)
+target_include_directories(kobox-pachaos-msix-route-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../userland/libcapsule/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../userland/libpacha/include
+)
+target_compile_options(kobox-pachaos-msix-route-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+    -Wno-pedantic
+    -Wno-enum-too-large
+    -ffunction-sections
+)
+target_link_options(kobox-pachaos-msix-route-smoke PRIVATE
+    -Wl,--gc-sections
+)
+add_test(NAME kobox-pachaos-msix-route-smoke COMMAND kobox-pachaos-msix-route-smoke)
+
+add_executable(kobox-linux-pci-msix-table-smoke
+    tests/linux_pci_msix_table_smoke.c
+)
+target_include_directories(kobox-linux-pci-msix-table-smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../userland/libcapsule/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../userland/libpacha/include
+)
+target_compile_options(kobox-linux-pci-msix-table-smoke PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+    -ffunction-sections
+    -fdata-sections
+)
+target_link_options(kobox-linux-pci-msix-table-smoke PRIVATE
+    -Wl,--gc-sections
+)
+add_test(NAME kobox-linux-pci-msix-table-smoke COMMAND kobox-linux-pci-msix-table-smoke)
+
 add_executable(kobox-usb-subsystem-smoke
     tests/usb_subsystem_smoke.c
     src/linux_personality/linux_memory.c

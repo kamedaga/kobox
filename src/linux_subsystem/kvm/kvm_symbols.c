@@ -486,7 +486,7 @@ int kb_linux_kvm_page_payload_dma_addr(
     if (page == NULL || size == 0 || out_cpu_addr == NULL || out_dma_addr == NULL) {
         return 0;
     }
-    if (offset >= KB_KVM_PAGE_SIZE || size > KB_KVM_PAGE_SIZE - offset) {
+    if (offset >= KB_KVM_PAGE_SIZE) {
         return 0;
     }
     kb_kvm_sync_page_model();
@@ -501,8 +501,21 @@ int kb_linux_kvm_page_payload_dma_addr(
         return 0;
     }
     size_t page_index = record_offset / KB_KVM_STRUCT_PAGE_SIZE;
-    if (page_index >= KB_KVM_PAGE_RECORD_MAX || kb_kvm_page_alloc_state[page_index] == 0) {
+    if (page_index >= KB_KVM_PAGE_RECORD_MAX) {
         return 0;
+    }
+    const size_t span = offset + size;
+    if (span < size) {
+        return 0;
+    }
+    const size_t page_count = (span + KB_KVM_PAGE_SIZE - 1u) / KB_KVM_PAGE_SIZE;
+    if (page_count == 0 || page_count > KB_KVM_PAGE_RECORD_MAX - page_index) {
+        return 0;
+    }
+    for (size_t index = 0; index < page_count; index++) {
+        if (kb_kvm_page_alloc_state[page_index + index] == 0) {
+            return 0;
+        }
     }
     uintptr_t cpu_addr = (uintptr_t)kb_kvm_page_payloads + (page_index * KB_KVM_PAGE_SIZE) + offset;
     uint64_t dma_addr = 0;

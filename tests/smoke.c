@@ -5,8 +5,14 @@
 #include "kobox/module.h"
 #include "kobox/platform.h"
 #include "kobox/shim.h"
+#include "../src/device/device_backend_internal.h"
+#include "../src/linux_personality/linux_block.h"
+#include "../src/linux_personality/linux_nvme.h"
+#include "../src/linux_subsystem/block/block.h"
+#include "../src/linux_subsystem/dma/dma.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void irq_callback(void *ctx)
@@ -33,6 +39,287 @@ static void write_u64le(unsigned char *p, uint64_t value)
 {
     write_u32le(p, (uint32_t)(value & 0xffffffffu));
     write_u32le(p + 4, (uint32_t)(value >> 32));
+}
+
+static uint64_t read_u64le(const unsigned char *p)
+{
+    uint64_t value;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
+typedef struct scatter_dma_test_backend scatter_dma_test_backend_t;
+
+typedef struct scatter_dma_test_device {
+    scatter_dma_test_backend_t *backend;
+} scatter_dma_test_device_t;
+
+typedef struct scatter_dma_test_mapping {
+    void *cpu_addr;
+    uint64_t dma_addr;
+    uint64_t size;
+    kb_dma_dir_t direction;
+    unsigned int unmap_count;
+} scatter_dma_test_mapping_t;
+
+struct scatter_dma_test_backend {
+    kb_device_backend_t base;
+    scatter_dma_test_device_t device;
+    scatter_dma_test_mapping_t mappings[4];
+    unsigned int mapping_count;
+    unsigned int page_map_call_count;
+    unsigned int single_map_call_count;
+    int fail_single_map;
+    uint64_t page_dma[8];
+    size_t page_count;
+    unsigned int unmap_order[4];
+    unsigned int unmap_count;
+};
+
+static kb_status_t scatter_dma_test_device_at(
+    kb_device_backend_t *backend_raw,
+    size_t index,
+    kb_device_t **out_device)
+{
+    scatter_dma_test_backend_t *backend = (scatter_dma_test_backend_t *)backend_raw;
+    if (backend == NULL || index != 0 || out_device == NULL) {
+        return KB_ERR_INVALID;
+    }
+    *out_device = (kb_device_t *)&backend->device;
+    return KB_OK;
+}
+
+static kb_status_t scatter_dma_test_map(
+    kb_device_t *device_raw,
+    void *cpu_addr,
+    uint64_t size,
+    kb_dma_dir_t direction,
+    uint64_t *out_dma_addr)
+{
+    scatter_dma_test_device_t *device = (scatter_dma_test_device_t *)device_raw;
+    scatter_dma_test_backend_t *backend = device == NULL ? NULL : device->backend;
+    if (backend == NULL || cpu_addr == NULL || size == 0 || out_dma_addr == NULL ||
+        backend->mapping_count >= 4)
+    {
+        return KB_ERR_INVALID;
+    }
+    backend->single_map_call_count++;
+    if (backend->fail_single_map) {
+        return KB_ERR_IO;
+    }
+
+    const uint64_t dma_addr = UINT64_C(0x20000000) +
+        (uint64_t)backend->mapping_count * UINT64_C(0x10000);
+    scatter_dma_test_mapping_t *mapping = &backend->mappings[backend->mapping_count++];
+    mapping->cpu_addr = cpu_addr;
+    mapping->dma_addr = dma_addr;
+    mapping->size = size;
+    mapping->direction = direction;
+    *out_dma_addr = dma_addr;
+    return KB_OK;
+}
+
+static kb_status_t scatter_dma_test_map_pages(
+    kb_device_t *device_raw,
+    void *cpu_addr,
+    uint64_t size,
+    kb_dma_dir_t direction,
+    uint64_t *out_page_dma,
+    size_t out_capacity)
+{
+    enum { PAGE_SIZE = 4096 };
+    scatter_dma_test_device_t *device = (scatter_dma_test_device_t *)device_raw;
+    scatter_dma_test_backend_t *backend = device == NULL ? NULL : device->backend;
+    if (backend == NULL || cpu_addr == NULL || size == 0 || size > (uint64_t)SIZE_MAX ||
+        out_page_dma == NULL || backend->mapping_count >= 4)
+    {
+        return KB_ERR_INVALID;
+    }
+
+    const size_t page_offset = (uintptr_t)cpu_addr & (PAGE_SIZE - 1u);
+    if ((size_t)size > SIZE_MAX - page_offset) {
+        return KB_ERR_INVALID;
+    }
+    const size_t span = page_offset + (size_t)size;
+    const size_t page_count = span / PAGE_SIZE + (span % PAGE_SIZE != 0);
+    if (page_count == 0 || page_count > out_capacity || page_count > 8) {
+        return KB_ERR_INVALID;
+    }
+
+    backend->page_map_call_count++;
+    backend->page_count = page_count;
+    for (size_t i = 0; i < page_count; i++) {
+        const uint64_t page_base = UINT64_C(0x10000000) + (uint64_t)i * UINT64_C(0x3000);
+        out_page_dma[i] = page_base + (i == 0 ? page_offset : 0);
+        backend->page_dma[i] = out_page_dma[i];
+    }
+
+    scatter_dma_test_mapping_t *mapping = &backend->mappings[backend->mapping_count++];
+    mapping->cpu_addr = cpu_addr;
+    mapping->dma_addr = out_page_dma[0];
+    mapping->size = size;
+    mapping->direction = direction;
+    return KB_OK;
+}
+
+static void scatter_dma_test_unmap(
+    kb_device_t *device_raw,
+    uint64_t dma_addr,
+    uint64_t size,
+    kb_dma_dir_t direction)
+{
+    scatter_dma_test_device_t *device = (scatter_dma_test_device_t *)device_raw;
+    scatter_dma_test_backend_t *backend = device == NULL ? NULL : device->backend;
+    if (backend == NULL) {
+        return;
+    }
+    for (unsigned int i = 0; i < backend->mapping_count; i++) {
+        scatter_dma_test_mapping_t *mapping = &backend->mappings[i];
+        if (mapping->dma_addr == dma_addr && mapping->size == size && mapping->direction == direction) {
+            mapping->unmap_count++;
+            if (backend->unmap_count < 4) {
+                backend->unmap_order[backend->unmap_count++] = i;
+            }
+            return;
+        }
+    }
+}
+
+static const kb_device_backend_ops_t scatter_dma_test_ops = {
+    .device_at = scatter_dma_test_device_at,
+    .dma_map = scatter_dma_test_map,
+    .dma_map_pages = scatter_dma_test_map_pages,
+    .dma_unmap = scatter_dma_test_unmap,
+};
+
+static int test_nvme_scattered_prps(void)
+{
+    enum {
+        PAGE_SIZE = 4096,
+        BUFFER_OFFSET = 123,
+        BUFFER_ALLOC_SIZE = PAGE_SIZE * 5,
+        BUFFER_SIZE = (PAGE_SIZE - BUFFER_OFFSET) + PAGE_SIZE * 2 + 321,
+        NVME_DEV_CTRL_OFFSET = 0x1f0,
+        NVME_QUEUE_QID_OFFSET = 0x74,
+        TAG_SET_DRIVER_DATA_OFFSET = 0x58,
+    };
+
+    scatter_dma_test_backend_t backend;
+    memset(&backend, 0, sizeof(backend));
+    backend.base.ops = &scatter_dma_test_ops;
+    backend.device.backend = &backend;
+    kb_shim_set_device_backend(&backend.base);
+
+    unsigned char nvme_device[0x300];
+    unsigned char nvme_queue[0x100];
+    unsigned char tag_set[0x100];
+    memset(nvme_device, 0, sizeof(nvme_device));
+    memset(nvme_queue, 0, sizeof(nvme_queue));
+    memset(tag_set, 0, sizeof(tag_set));
+    void *device_ptr = nvme_device;
+    void *ctrl = nvme_device + NVME_DEV_CTRL_OFFSET;
+    memcpy(nvme_queue, &device_ptr, sizeof(device_ptr));
+    write_u16le(nvme_queue + NVME_QUEUE_QID_OFFSET, 1);
+    memcpy(tag_set + TAG_SET_DRIVER_DATA_OFFSET, &ctrl, sizeof(ctrl));
+
+    kb_nvme_shim_track_queue(nvme_queue);
+    kb_nvme_shim_register_block_driver();
+    void *request = kb_linux_block_alloc_driver_request(tag_set, ctrl, nvme_queue, 0x22, 1);
+    void *raw_buffer = aligned_alloc(PAGE_SIZE, BUFFER_ALLOC_SIZE);
+    int result = 0;
+    if (request == NULL || raw_buffer == NULL) {
+        result = 1;
+        goto cleanup;
+    }
+
+    unsigned char *command = kb_linux_block_request_command(request);
+    unsigned char *buffer = (unsigned char *)raw_buffer + BUFFER_OFFSET;
+    memset(command, 0, 64);
+    command[0] = 0x02;
+
+    if (kb_blk_rq_map_kern(NULL, request, buffer, PAGE_SIZE * 512u, 0) != -95 ||
+        backend.page_map_call_count != 0 || backend.single_map_call_count != 0 ||
+        backend.mapping_count != 0 || backend.unmap_count != 0 ||
+        read_u64le(command + 24) != 0 || read_u64le(command + 32) != 0)
+    {
+        result = 2;
+        goto cleanup;
+    }
+
+    backend.fail_single_map = 1;
+    if (kb_blk_rq_map_kern(NULL, request, buffer, BUFFER_SIZE, 0) == 0 ||
+        backend.page_map_call_count != 1 || backend.single_map_call_count != 1 ||
+        backend.mapping_count != 1 || backend.unmap_count != 1 ||
+        backend.unmap_order[0] != 0 || backend.mappings[0].unmap_count != 1 ||
+        read_u64le(command + 24) != 0 || read_u64le(command + 32) != 0)
+    {
+        result = 3;
+        goto cleanup;
+    }
+
+    memset(backend.mappings, 0, sizeof(backend.mappings));
+    memset(backend.page_dma, 0, sizeof(backend.page_dma));
+    memset(backend.unmap_order, 0, sizeof(backend.unmap_order));
+    backend.mapping_count = 0;
+    backend.page_map_call_count = 0;
+    backend.single_map_call_count = 0;
+    backend.page_count = 0;
+    backend.unmap_count = 0;
+    backend.fail_single_map = 0;
+    if (kb_blk_rq_map_kern(NULL, request, buffer, BUFFER_SIZE, 0) != 0) {
+        result = 4;
+        goto cleanup;
+    }
+    if (backend.page_map_call_count != 1 || backend.single_map_call_count != 1 ||
+        backend.page_count != 4 || backend.mapping_count != 2 ||
+        read_u64le(command + 24) != backend.page_dma[0] ||
+        read_u64le(command + 32) != backend.mappings[1].dma_addr)
+    {
+        result = 5;
+        goto cleanup;
+    }
+
+    size_t prp_list_available = 0;
+    const uint64_t *prp_list = kb_subsystem_dma_cpu_addr(read_u64le(command + 32), &prp_list_available);
+    if (prp_list == NULL || prp_list_available < 3u * sizeof(*prp_list) ||
+        prp_list[0] != backend.page_dma[1] ||
+        prp_list[1] != backend.page_dma[2] ||
+        prp_list[2] != backend.page_dma[3] ||
+        prp_list[1] == prp_list[0] + PAGE_SIZE ||
+        backend.mappings[0].size != BUFFER_SIZE ||
+        backend.mappings[1].size != 3u * sizeof(uint64_t) ||
+        backend.mappings[0].direction != KB_DMA_FROM_DEVICE ||
+        backend.mappings[1].direction != KB_DMA_TO_DEVICE)
+    {
+        result = 6;
+        goto cleanup;
+    }
+
+cleanup:
+    if (request != NULL) {
+        kb_blk_mq_free_request(request);
+    }
+    free(raw_buffer);
+    if (result == 0) {
+        static const unsigned int expected_unmap_order[] = {1, 0};
+        if (backend.unmap_count != 2 ||
+            memcmp(backend.unmap_order, expected_unmap_order, sizeof(expected_unmap_order)) != 0)
+        {
+            result = 7;
+        }
+        for (unsigned int i = 0; result == 0 && i < backend.mapping_count; i++) {
+            size_t available = 1;
+            if (backend.mappings[i].unmap_count != 1 ||
+                kb_subsystem_dma_cpu_addr(backend.mappings[i].dma_addr, &available) != NULL ||
+                available != 0)
+            {
+                result = 8;
+            }
+        }
+    }
+    kb_block_subsystem_tagset_free(tag_set);
+    kb_shim_set_device_backend(NULL);
+    return result;
 }
 
 static void write_elf_symbol(
@@ -243,6 +530,10 @@ static int test_linux_host_interfaces(void)
 
 int main(void)
 {
+    if (getenv("KOBOX_TEST_NVME_SCATTER_ONLY") != NULL) {
+        return test_nvme_scattered_prps();
+    }
+
     kb_device_backend_t *backend = 0;
     if (kb_linux_mock_device_create(&backend) != KB_OK || backend == 0) {
         return 1;
@@ -252,6 +543,16 @@ int main(void)
     if (ops == 0) {
         kb_device_backend_destroy(backend);
         return 2;
+    }
+    const unsigned encoded_msix =
+        (KB_DEVICE_IRQ_BACKEND_KIND_MSIX << KB_DEVICE_IRQ_BACKEND_KIND_SHIFT) | 15u;
+    if (kb_device_irq_backend_kind(encoded_msix) != KB_DEVICE_IRQ_BACKEND_KIND_MSIX ||
+        kb_device_irq_backend_vector(encoded_msix) != 15u ||
+        KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT != 16 ||
+        ops->msix_delivery_vector != 0)
+    {
+        kb_device_backend_destroy(backend);
+        return 32;
     }
 
     size_t count = 0;
@@ -514,6 +815,11 @@ int main(void)
     if (test_linux_host_interfaces() != 0) {
         kb_device_backend_destroy(backend);
         return 41;
+    }
+
+    if (test_nvme_scattered_prps() != 0) {
+        kb_device_backend_destroy(backend);
+        return 42;
     }
 
     kb_device_backend_destroy(backend);
