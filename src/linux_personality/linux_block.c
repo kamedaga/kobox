@@ -6,9 +6,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef KOBOX_FILE_READ_BULK_BYTES
+#define KOBOX_FILE_READ_BULK_BYTES (512u * 1024u)
+#endif
 
 kb_device_backend_t *kb_shim_current_device_backend(void);
 
@@ -26,6 +31,7 @@ typedef struct shim_linux_queue_data {
 
 enum {
     KB_LINUX_BLK_MQ_OPS_QUEUE_RQ_OFFSET = 0x00,
+    KB_LINUX_BLK_MQ_OPS_COMMIT_RQS_OFFSET = 0x08,
     KB_LINUX_BLK_MQ_TAG_SET_OPS_OFFSET = 0x00,
     KB_LINUX_BLK_MQ_TAG_SET_DRIVER_DATA_OFFSET = 0x58,
     KB_LINUX_BLK_MQ_TAG_SET_TAGS_OFFSET = 0x60,
@@ -52,6 +58,7 @@ enum {
     KB_SHIM_REQUEST_PRP_LIST_LEN_OFFSET = 0xa20,
     KB_SHIM_REQUEST_OWNS_QUEUE_OFFSET = 0xa24,
     KB_LINUX_BLOCK_MAX_DRIVER_OPS = 8,
+    KB_LINUX_BLOCK_REQUEST_CACHE_MAX = 8,
 };
 
 typedef struct shim_linux_request {
@@ -88,13 +95,292 @@ typedef struct shim_linux_request {
     kb_dma_dir_t prp_list_dma_dir;
     const kb_linux_block_driver_ops_t *driver_ops;
     uint32_t started;
-    uint32_t reserved_a44;
+    uint32_t prp_list_cached;
     kb_device_backend_t *dma_backend;
     kb_device_t *dma_device;
     kb_device_backend_t *prp_list_backend;
     kb_device_t *prp_list_device;
     unsigned char reserved_a68[KB_SHIM_REQUEST_SIZE - 0xa68];
 } shim_linux_request_t;
+
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+static kb_linux_block_profile_t linux_block_profile;
+#endif
+
+typedef struct kb_linux_dma_read_scope {
+    uintptr_t target_start;
+    size_t target_size;
+    unsigned char *staging_buffer;
+    size_t staging_size;
+    uint8_t active;
+} kb_linux_dma_read_scope_t;
+
+enum {
+    KB_LINUX_DMA_READ_STAGING_SIZE = KOBOX_FILE_READ_BULK_BYTES,
+    KB_LINUX_DMA_READ_BATCH_DEPTH = 4u,
+    KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE =
+        KB_LINUX_DMA_READ_STAGING_SIZE * KB_LINUX_DMA_READ_BATCH_DEPTH,
+    KB_LINUX_DMA_PAGE_SIZE = 4096u,
+};
+
+_Static_assert(KB_LINUX_DMA_READ_STAGING_SIZE >= KB_LINUX_DMA_PAGE_SIZE,
+    "DMA read staging must cover at least one page");
+_Static_assert((KB_LINUX_DMA_READ_STAGING_SIZE % KB_LINUX_DMA_PAGE_SIZE) == 0,
+    "DMA read staging must be page aligned");
+_Static_assert(
+    KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE <=
+        KB_DEVICE_DMA_MAPPING_MAX_PAGES * KB_LINUX_DMA_PAGE_SIZE,
+    "DMA read staging exceeds the NVMe PRP page capacity");
+
+static kb_linux_dma_read_scope_t dma_read_scope;
+static unsigned char *dma_read_staging_buffer;
+static shim_linux_request_t *cached_requests[KB_LINUX_BLOCK_REQUEST_CACHE_MAX];
+static size_t cached_request_count;
+static atomic_flag cached_request_lock = ATOMIC_FLAG_INIT;
+
+static void cached_request_lock_acquire(void)
+{
+    while (atomic_flag_test_and_set_explicit(
+        &cached_request_lock, memory_order_acquire))
+    {
+    }
+}
+
+static void cached_request_lock_release(void)
+{
+    atomic_flag_clear_explicit(&cached_request_lock, memory_order_release);
+}
+
+static shim_linux_request_t *cached_request_take(void)
+{
+    shim_linux_request_t *request = NULL;
+    cached_request_lock_acquire();
+    if (cached_request_count != 0) {
+        request = cached_requests[--cached_request_count];
+        cached_requests[cached_request_count] = NULL;
+    }
+    cached_request_lock_release();
+    return request;
+}
+
+static int cached_request_store(shim_linux_request_t *request)
+{
+    int stored = 0;
+    cached_request_lock_acquire();
+    if (cached_request_count < KB_LINUX_BLOCK_REQUEST_CACHE_MAX) {
+        cached_requests[cached_request_count++] = request;
+        stored = 1;
+    }
+    cached_request_lock_release();
+    return stored;
+}
+
+static void cached_request_discard_all(void)
+{
+    cached_request_lock_acquire();
+    while (cached_request_count != 0) {
+        free(cached_requests[--cached_request_count]);
+        cached_requests[cached_request_count] = NULL;
+    }
+    cached_request_lock_release();
+}
+
+typedef struct kb_linux_cached_aux_dma {
+    kb_device_backend_t *backend;
+    kb_device_t *device;
+    void *cpu_addr;
+    uint64_t dma_addr;
+    void *owner;
+} kb_linux_cached_aux_dma_t;
+
+enum {
+    KB_LINUX_CACHED_AUX_DMA_SIZE = 4096u,
+    KB_LINUX_CACHED_AUX_DMA_MAX = 64u,
+};
+
+static kb_linux_cached_aux_dma_t
+    cached_aux_dma[KB_LINUX_CACHED_AUX_DMA_MAX];
+
+static void cached_aux_dma_discard_unused(void)
+{
+    for (size_t i = 0; i < KB_LINUX_CACHED_AUX_DMA_MAX; i++) {
+        kb_linux_cached_aux_dma_t *entry = &cached_aux_dma[i];
+        if (entry->owner != NULL || entry->cpu_addr == NULL) {
+            continue;
+        }
+        kb_subsystem_dma_free(
+            entry->backend,
+            KB_LINUX_CACHED_AUX_DMA_SIZE,
+            entry->cpu_addr,
+            entry->dma_addr);
+        memset(entry, 0, sizeof(*entry));
+    }
+}
+
+uint64_t kb_linux_block_profile_begin(void)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE && defined(__x86_64__)
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | lo;
+#else
+    return 0;
+#endif
+}
+
+void kb_linux_block_profile_record(
+    kb_linux_block_profile_stage_t stage,
+    uint64_t start,
+    uint64_t bytes)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    const uint64_t end = kb_linux_block_profile_begin();
+    if ((unsigned)stage >= KB_LINUX_BLOCK_PROFILE_STAGE_COUNT ||
+        start == 0 || end < start)
+    {
+        return;
+    }
+    __atomic_fetch_add(&linux_block_profile.cycles[stage], end - start, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&linux_block_profile.calls[stage], 1u, __ATOMIC_RELAXED);
+    if (stage == KB_LINUX_BLOCK_PROFILE_DISK_IO_TOTAL && bytes != 0) {
+        __atomic_fetch_add(&linux_block_profile.disk_read_bytes, bytes, __ATOMIC_RELAXED);
+    }
+#else
+    (void)stage;
+    (void)start;
+    (void)bytes;
+#endif
+}
+
+void kb_linux_block_profile_snapshot(kb_linux_block_profile_t *out_profile)
+{
+    if (out_profile == NULL) {
+        return;
+    }
+    memset(out_profile, 0, sizeof(*out_profile));
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    for (size_t i = 0; i < KB_LINUX_BLOCK_PROFILE_STAGE_COUNT; i++) {
+        out_profile->cycles[i] =
+            __atomic_load_n(&linux_block_profile.cycles[i], __ATOMIC_RELAXED);
+        out_profile->calls[i] =
+            __atomic_load_n(&linux_block_profile.calls[i], __ATOMIC_RELAXED);
+    }
+    out_profile->disk_read_bytes =
+        __atomic_load_n(&linux_block_profile.disk_read_bytes, __ATOMIC_RELAXED);
+#endif
+}
+
+int kb_linux_block_dma_read_window_begin(void *buffer, size_t length)
+{
+    if (buffer == NULL || length == 0 ||
+        ((uintptr_t)buffer & (KB_LINUX_DMA_PAGE_SIZE - 1u)) != 0 ||
+        (uintptr_t)buffer > UINTPTR_MAX - length ||
+        dma_read_scope.active)
+    {
+        return -22;
+    }
+    kb_device_backend_t *backend = kb_shim_current_device_backend();
+    if (backend == NULL) {
+        return -19;
+    }
+    kb_device_t *device = kb_subsystem_dma_default_device(backend);
+    if (device == NULL) {
+        return -19;
+    }
+    if (dma_read_staging_buffer == NULL) {
+        dma_read_staging_buffer = aligned_alloc(
+            KB_LINUX_DMA_PAGE_SIZE,
+            KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE);
+        if (dma_read_staging_buffer == NULL) {
+            return -12;
+        }
+    }
+    size_t staging_size = length < KB_LINUX_DMA_READ_STAGING_SIZE ?
+        length : KB_LINUX_DMA_READ_STAGING_SIZE;
+    staging_size = (staging_size + KB_LINUX_DMA_PAGE_SIZE - 1u) &
+        ~(size_t)(KB_LINUX_DMA_PAGE_SIZE - 1u);
+    const kb_status_t status = kb_subsystem_dma_cached_window_begin(
+        backend,
+        device,
+        dma_read_staging_buffer,
+        KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE,
+        KB_DMA_FROM_DEVICE);
+    if (status != KB_OK) {
+        return -5;
+    }
+    dma_read_scope.target_start = (uintptr_t)buffer;
+    dma_read_scope.target_size = length;
+    dma_read_scope.staging_buffer = dma_read_staging_buffer;
+    dma_read_scope.staging_size = staging_size;
+    dma_read_scope.active = 1;
+    return 0;
+}
+
+void kb_linux_block_dma_read_window_end(void)
+{
+    if (!dma_read_scope.active) {
+        return;
+    }
+    kb_subsystem_dma_cached_window_end();
+    memset(&dma_read_scope, 0, sizeof(dma_read_scope));
+}
+
+/* Borrow the staging buffer for a read that has no scope of its own.  The
+ * staging mapping is derived once and stays cached, so metadata and ordinary
+ * file reads stop paying a device mapping derive each time.  Returns 0 when the
+ * read was served here, or -95 when the caller must issue it directly. */
+static int block_staged_read_borrow(
+    const kb_linux_block_driver_ops_t *ops,
+    void *queue,
+    uint64_t sector,
+    void *buffer,
+    size_t byte_count,
+    int *out_status)
+{
+    if (ops == NULL || ops->disk_read == NULL || buffer == NULL ||
+        byte_count == 0 || byte_count > KB_LINUX_DMA_READ_STAGING_SIZE)
+    {
+        return -95;
+    }
+    kb_device_backend_t *backend = kb_shim_current_device_backend();
+    if (backend == NULL) {
+        return -95;
+    }
+    kb_device_t *device = kb_subsystem_dma_default_device(backend);
+    if (device == NULL) {
+        return -95;
+    }
+    if (dma_read_staging_buffer == NULL) {
+        dma_read_staging_buffer = aligned_alloc(
+            KB_LINUX_DMA_PAGE_SIZE,
+            KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE);
+        if (dma_read_staging_buffer == NULL) {
+            return -95;
+        }
+    }
+    if (kb_subsystem_dma_cached_window_begin(
+            backend,
+            device,
+            dma_read_staging_buffer,
+            KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE,
+            KB_DMA_FROM_DEVICE) != KB_OK)
+    {
+        return -95;
+    }
+    const int status = ops->disk_read(
+        queue, sector, dma_read_staging_buffer, byte_count);
+    if (status == 0) {
+        const uint64_t copy_start = kb_linux_block_profile_begin();
+        memcpy(buffer, dma_read_staging_buffer, byte_count);
+        const uint64_t copy_end = kb_linux_block_profile_begin();
+        kb_subsystem_dma_window_profile_record_staging(
+            byte_count, copy_end >= copy_start ? copy_end - copy_start : 0);
+    }
+    kb_subsystem_dma_cached_window_end();
+    *out_status = status;
+    return 0;
+}
 
 _Static_assert(offsetof(shim_linux_request_t, hctx) == KB_LINUX_REQUEST_HCTX_OFFSET, "request.hctx offset");
 _Static_assert(offsetof(shim_linux_request_t, queue) == KB_LINUX_REQUEST_QUEUE_OFFSET, "request.queue offset");
@@ -116,6 +402,7 @@ _Static_assert(offsetof(shim_linux_request_t, prp_list_len) == KB_SHIM_REQUEST_P
 _Static_assert(offsetof(shim_linux_request_t, owns_queue) == KB_SHIM_REQUEST_OWNS_QUEUE_OFFSET, "shim owns_queue offset");
 _Static_assert(offsetof(shim_linux_request_t, driver_ops) == 0xa38, "shim driver_ops offset");
 _Static_assert(offsetof(shim_linux_request_t, started) == 0xa40, "shim started offset");
+_Static_assert(offsetof(shim_linux_request_t, prp_list_cached) == 0xa44, "shim prp_list_cached offset");
 _Static_assert(offsetof(shim_linux_request_t, dma_backend) == 0xa48, "shim dma_backend offset");
 _Static_assert(offsetof(shim_linux_request_t, dma_device) == 0xa50, "shim dma_device offset");
 _Static_assert(offsetof(shim_linux_request_t, prp_list_backend) == 0xa58, "shim prp_list_backend offset");
@@ -209,7 +496,111 @@ static int shim_blk_disk_read(void *ctx, uint64_t sector, void *buffer, size_t b
     if (ops == NULL || ops->disk_read == NULL) {
         return -95;
     }
+    const uintptr_t request_start = (uintptr_t)buffer;
+    if (dma_read_scope.active &&
+        byte_count <= dma_read_scope.staging_size &&
+        request_start <= UINTPTR_MAX - byte_count)
+    {
+        const uintptr_t request_end = request_start + byte_count;
+        const uintptr_t target_end =
+            dma_read_scope.target_start + dma_read_scope.target_size;
+        if (request_start >= dma_read_scope.target_start && request_end <= target_end) {
+            const int status = ops->disk_read(
+                queue,
+                sector,
+                dma_read_scope.staging_buffer,
+                byte_count);
+            if (status == 0) {
+                const uint64_t copy_start = kb_linux_block_profile_begin();
+                memcpy(buffer, dma_read_scope.staging_buffer, byte_count);
+                const uint64_t copy_end = kb_linux_block_profile_begin();
+                kb_subsystem_dma_window_profile_record_staging(
+                    byte_count,
+                    copy_end >= copy_start ? copy_end - copy_start : 0);
+            }
+            return status;
+        }
+    }
+    if (!dma_read_scope.active) {
+        int staged_status = 0;
+        if (block_staged_read_borrow(
+                ops, queue, sector, buffer, byte_count, &staged_status) == 0)
+        {
+            return staged_status;
+        }
+    }
     return ops->disk_read(queue, sector, buffer, byte_count);
+}
+
+static int shim_blk_disk_read_batch(
+    void *ctx,
+    const kb_block_disk_read_request_t *requests,
+    size_t request_count)
+{
+    void *queue = NULL;
+    const kb_linux_block_driver_ops_t *ops = block_driver_ops_for_disk(ctx, &queue);
+    if (requests == NULL || request_count < 2 ||
+        request_count > KB_LINUX_DMA_READ_BATCH_DEPTH)
+    {
+        return -22;
+    }
+    if (ops == NULL || ops->disk_read_batch == NULL || !dma_read_scope.active) {
+        for (size_t i = 0; i < request_count; ++i) {
+            const int status = shim_blk_disk_read(
+                ctx,
+                requests[i].sector,
+                requests[i].buffer,
+                requests[i].byte_count);
+            if (status != 0) {
+                return status;
+            }
+        }
+        return 0;
+    }
+    const uintptr_t target_end =
+        dma_read_scope.target_start + dma_read_scope.target_size;
+    if (target_end < dma_read_scope.target_start) {
+        return -95;
+    }
+    kb_linux_block_read_request_t batch[KB_LINUX_DMA_READ_BATCH_DEPTH];
+    for (size_t i = 0; i < request_count; ++i) {
+        const uintptr_t request_start = (uintptr_t)requests[i].buffer;
+        if (requests[i].byte_count == 0 ||
+            requests[i].byte_count > dma_read_scope.staging_size ||
+            request_start > UINTPTR_MAX - requests[i].byte_count ||
+            request_start < dma_read_scope.target_start ||
+            request_start + requests[i].byte_count > target_end)
+        {
+            for (size_t j = 0; j < request_count; ++j) {
+                const int fallback_status = shim_blk_disk_read(
+                    ctx,
+                    requests[j].sector,
+                    requests[j].buffer,
+                    requests[j].byte_count);
+                if (fallback_status != 0) {
+                    return fallback_status;
+                }
+            }
+            return 0;
+        }
+        batch[i].sector = requests[i].sector;
+        batch[i].buffer = dma_read_scope.staging_buffer +
+            i * KB_LINUX_DMA_READ_STAGING_SIZE;
+        batch[i].byte_count = requests[i].byte_count;
+    }
+    const int status = ops->disk_read_batch(queue, batch, request_count);
+    if (status != 0) {
+        return status;
+    }
+    for (size_t i = 0; i < request_count; ++i) {
+        const uint64_t copy_start = kb_linux_block_profile_begin();
+        memcpy(requests[i].buffer, batch[i].buffer, requests[i].byte_count);
+        const uint64_t copy_end = kb_linux_block_profile_begin();
+        kb_subsystem_dma_window_profile_record_staging(
+            requests[i].byte_count,
+            copy_end >= copy_start ? copy_end - copy_start : 0);
+    }
+    return 0;
 }
 
 static int shim_blk_disk_write(void *ctx, uint64_t sector, const void *buffer, size_t byte_count)
@@ -230,6 +621,7 @@ static void shim_blk_disk_attach_io(void *disk)
         return;
     }
     kb_block_subsystem_disk_set_io(disk, disk, shim_blk_disk_read, shim_blk_disk_write);
+    kb_block_subsystem_disk_set_read_batch(disk, shim_blk_disk_read_batch);
 }
 
 void *kb_linux_block_tag_set_driver_data(void *tag_set)
@@ -310,7 +702,10 @@ static shim_linux_request_t *shim_blk_request_alloc(
         return NULL;
     }
 
-    shim_linux_request_t *request = calloc(1, sizeof(*request));
+    shim_linux_request_t *request = owns_queue ? NULL : cached_request_take();
+    if (request == NULL) {
+        request = calloc(1, sizeof(*request));
+    }
     if (request == NULL) {
         return NULL;
     }
@@ -499,6 +894,8 @@ void kb_blk_mq_free_tag_set(void *tag_set)
         fprintf(stderr, "kobox blk-mq: free_tag_set tag_set=%p\n", tag_set);
     }
     kb_block_subsystem_tagset_free(tag_set);
+    cached_aux_dma_discard_unused();
+    cached_request_discard_all();
 }
 
 void kb_blk_mq_destroy_queue(void *queue)
@@ -811,13 +1208,108 @@ int kb_linux_block_request_map_owned_aux_dma(
     return 0;
 }
 
+int kb_linux_block_request_map_cached_aux_dma(
+    void *request,
+    const void *data,
+    uint32_t length,
+    kb_dma_dir_t direction,
+    uint64_t *out_dma)
+{
+    shim_linux_request_t *rq = request;
+    if (rq == NULL || data == NULL || length == 0 ||
+        length > KB_LINUX_CACHED_AUX_DMA_SIZE || out_dma == NULL ||
+        direction != KB_DMA_TO_DEVICE)
+    {
+        return -22;
+    }
+    kb_linux_block_request_unmap_owned_aux_dma(request);
+
+    kb_device_backend_t *backend = kb_shim_current_device_backend();
+    kb_device_t *device = kb_subsystem_dma_default_device(backend);
+    if (backend == NULL || device == NULL) {
+        return -19;
+    }
+
+    kb_linux_cached_aux_dma_t *entry = NULL;
+    const uint64_t profile_cache_start = KB_LINUX_BLOCK_PROFILE_BEGIN();
+    for (size_t i = 0; i < KB_LINUX_CACHED_AUX_DMA_MAX; i++) {
+        if (cached_aux_dma[i].owner == NULL &&
+            cached_aux_dma[i].cpu_addr != NULL &&
+            cached_aux_dma[i].backend == backend &&
+            cached_aux_dma[i].device == device)
+        {
+            entry = &cached_aux_dma[i];
+            break;
+        }
+    }
+    if (entry != NULL) {
+        KB_LINUX_BLOCK_PROFILE_RECORD(
+            KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_HIT,
+            profile_cache_start,
+            0);
+    } else {
+        for (size_t i = 0; i < KB_LINUX_CACHED_AUX_DMA_MAX; i++) {
+            if (cached_aux_dma[i].cpu_addr == NULL) {
+                entry = &cached_aux_dma[i];
+                break;
+            }
+        }
+        if (entry != NULL) {
+            uint64_t dma_addr = 0;
+            void *cpu_addr = kb_subsystem_dma_alloc(
+                backend,
+                device,
+                KB_LINUX_CACHED_AUX_DMA_SIZE,
+                &dma_addr);
+            if (cpu_addr == NULL || dma_addr == 0) {
+                entry = NULL;
+            } else {
+                entry->backend = backend;
+                entry->device = device;
+                entry->cpu_addr = cpu_addr;
+                entry->dma_addr = dma_addr;
+            }
+        }
+        KB_LINUX_BLOCK_PROFILE_RECORD(
+            KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_MISS,
+            profile_cache_start,
+            0);
+    }
+    if (entry == NULL) {
+        return -12;
+    }
+
+    memcpy(entry->cpu_addr, data, length);
+    atomic_thread_fence(memory_order_seq_cst);
+    entry->owner = rq;
+    rq->prp_list_cpu = entry->cpu_addr;
+    rq->prp_list_dma = entry->dma_addr;
+    rq->prp_list_len = length;
+    rq->prp_list_dma_dir = direction;
+    rq->prp_list_backend = backend;
+    rq->prp_list_device = device;
+    rq->prp_list_cached = 1;
+    *out_dma = entry->dma_addr;
+    return 0;
+}
+
 void kb_linux_block_request_unmap_owned_aux_dma(void *request)
 {
     shim_linux_request_t *rq = request;
     if (rq == NULL || rq->prp_list_cpu == NULL) {
         return;
     }
-    if (rq->prp_list_dma != 0 && rq->prp_list_len != 0) {
+    if (rq->prp_list_cached) {
+        for (size_t i = 0; i < KB_LINUX_CACHED_AUX_DMA_MAX; i++) {
+            if (cached_aux_dma[i].owner == rq &&
+                cached_aux_dma[i].cpu_addr == rq->prp_list_cpu &&
+                cached_aux_dma[i].dma_addr == rq->prp_list_dma)
+            {
+                cached_aux_dma[i].owner = NULL;
+                break;
+            }
+        }
+    } else if (rq->prp_list_dma != 0 && rq->prp_list_len != 0) {
         kb_subsystem_dma_unmap(
             rq->prp_list_backend,
             rq->prp_list_device,
@@ -825,10 +1317,13 @@ void kb_linux_block_request_unmap_owned_aux_dma(void *request)
             rq->prp_list_len,
             rq->prp_list_dma_dir);
     }
-    free(rq->prp_list_cpu);
+    if (!rq->prp_list_cached) {
+        free(rq->prp_list_cpu);
+    }
     rq->prp_list_cpu = NULL;
     rq->prp_list_dma = 0;
     rq->prp_list_len = 0;
+    rq->prp_list_cached = 0;
     rq->prp_list_backend = NULL;
     rq->prp_list_device = NULL;
 }
@@ -896,16 +1391,29 @@ void kb_blk_mq_free_request(void *request)
     }
 
     shim_linux_request_t *rq = request;
+    const uint64_t profile_free_start = KB_LINUX_BLOCK_PROFILE_BEGIN();
     shim_blk_tagset_unbind_request(rq);
+    const uint64_t profile_unmap_start = KB_LINUX_BLOCK_PROFILE_BEGIN();
     kb_linux_block_request_unmap_owned_aux_dma(rq);
     kb_linux_block_request_unmap_dma(rq);
+    KB_LINUX_BLOCK_PROFILE_RECORD(
+        KB_LINUX_BLOCK_PROFILE_DMA_UNMAP_COPYBACK,
+        profile_unmap_start,
+        0);
+    const int cacheable = rq->owns_queue == 0;
     if (rq->owns_queue) {
         kb_block_subsystem_object_free(rq->queue);
     }
-    free(request);
+    if (!cacheable || !cached_request_store(rq)) {
+        free(request);
+    }
+    KB_LINUX_BLOCK_PROFILE_RECORD(
+        KB_LINUX_BLOCK_PROFILE_REQUEST_FREE_TOTAL,
+        profile_free_start,
+        0);
 }
 
-int kb_blk_execute_rq(void *request, int at_head)
+static int kb_blk_submit_rq_internal(void *request, int at_head, int last)
 {
     (void)at_head;
     if (request == NULL) {
@@ -931,7 +1439,12 @@ int kb_blk_execute_rq(void *request, int at_head)
     }
 
     if (rq->driver_ops != NULL && rq->driver_ops->before_execute != NULL) {
+        const uint64_t profile_before_start = KB_LINUX_BLOCK_PROFILE_BEGIN();
         int result = rq->driver_ops->before_execute(request);
+        KB_LINUX_BLOCK_PROFILE_RECORD(
+            KB_LINUX_BLOCK_PROFILE_BEFORE_EXECUTE,
+            profile_before_start,
+            0);
         if (result != 0) {
             return result;
         }
@@ -939,10 +1452,17 @@ int kb_blk_execute_rq(void *request, int at_head)
 
     shim_linux_queue_data_t *bd = &rq->queue_data;
     bd->rq = rq;
-    bd->last = 1;
+    void (*commit_rqs)(void *hctx) =
+        (void (*)(void *))read_ptr(ops + KB_LINUX_BLK_MQ_OPS_COMMIT_RQS_OFFSET);
+    bd->last = last || commit_rqs == NULL ? 1 : 0;
 
     shim_blk_tagset_bind_request(rq, tag_set);
+    const uint64_t profile_submit_start = KB_LINUX_BLOCK_PROFILE_BEGIN();
     int result = queue_rq(hctx, bd);
+    KB_LINUX_BLOCK_PROFILE_RECORD(
+        KB_LINUX_BLOCK_PROFILE_QUEUE_SUBMIT,
+        profile_submit_start,
+        0);
     if (trace_block_enabled()) {
         fprintf(
             stderr,
@@ -958,13 +1478,72 @@ int kb_blk_execute_rq(void *request, int at_head)
         return result;
     }
 
+    return 0;
+}
+
+int kb_blk_submit_rq(void *request, int at_head)
+{
+    return kb_blk_submit_rq_internal(request, at_head, 1);
+}
+
+int kb_blk_submit_rq_batch(void *request, int at_head, int last)
+{
+    return kb_blk_submit_rq_internal(request, at_head, last);
+}
+
+int kb_blk_commit_rqs(void *request)
+{
+    if (request == NULL) {
+        return -22;
+    }
+
+    shim_linux_request_t *rq = request;
+    shim_linux_hctx_t *hctx = rq->hctx;
+    void *tag_set = kb_block_subsystem_queue_tag_set(rq->queue);
+    if (hctx == NULL || tag_set == NULL) {
+        return -22;
+    }
+
+    unsigned char *ops = read_ptr(
+        (unsigned char *)tag_set + KB_LINUX_BLK_MQ_TAG_SET_OPS_OFFSET);
+    if (ops == NULL) {
+        return -22;
+    }
+    void (*commit_rqs)(void *hctx) =
+        (void (*)(void *))read_ptr(ops + KB_LINUX_BLK_MQ_OPS_COMMIT_RQS_OFFSET);
+    if (commit_rqs != NULL) {
+        commit_rqs(hctx);
+    }
+    return 0;
+}
+
+int kb_blk_complete_rq(void *request)
+{
+    if (request == NULL) {
+        return -22;
+    }
+    shim_linux_request_t *rq = request;
+    int result = 0;
+
     if (rq->driver_ops != NULL && rq->driver_ops->complete_execute != NULL) {
-        return rq->driver_ops->complete_execute(request);
+        const uint64_t profile_wait_start = KB_LINUX_BLOCK_PROFILE_BEGIN();
+        result = rq->driver_ops->complete_execute(request);
+        KB_LINUX_BLOCK_PROFILE_RECORD(
+            KB_LINUX_BLOCK_PROFILE_COMPLETION_WAIT,
+            profile_wait_start,
+            0);
+        return result;
     }
     if (rq->completed) {
         return rq->end_status == 0 ? 0 : -5;
     }
     return -95;
+}
+
+int kb_blk_execute_rq(void *request, int at_head)
+{
+    const int submit_status = kb_blk_submit_rq(request, at_head);
+    return submit_status != 0 ? submit_status : kb_blk_complete_rq(request);
 }
 
 int kb_blk_status_to_errno(unsigned int status)
