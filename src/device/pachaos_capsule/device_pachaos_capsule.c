@@ -51,9 +51,12 @@ struct kb_pachaos_dma_mapping {
     struct pacha_capsule_dma dma;
     void *cpu_addr;
     void *mapped_cpu_addr;
+    void *vmo_mapping;
     void *alloc_addr;
+    uint64_t vmo_mapping_size;
     uint64_t alloc_size;
     uint64_t size;
+    int vmo_fd;
     kb_dma_dir_t direction;
     int owns_cpu_addr;
     int owns_mapped_cpu_addr;
@@ -509,6 +512,14 @@ static void release_dma_mapping(kb_pachaos_dma_mapping_t *mapping, int copy_back
     if (pacha_capsule_is_fd(mapping->dma.fd)) {
         (void)pacha_capsule_close(mapping->dma.fd);
     }
+#if defined(__pachaos__)
+    if (mapping->vmo_mapping != NULL && mapping->vmo_mapping_size != 0) {
+        (void)pacha_munmap(mapping->vmo_mapping, mapping->vmo_mapping_size);
+    }
+    if (mapping->vmo_fd >= 16) {
+        (void)pacha_fd_close(mapping->vmo_fd);
+    }
+#endif
     if (mapping->alloc_addr != NULL) {
         free_aligned_zeroed(mapping->alloc_addr, mapping->alloc_size);
     } else if (mapping->owns_cpu_addr) {
@@ -742,13 +753,38 @@ static kb_status_t pachaos_capsule_dma_alloc(
     if (!is_power_of_two_u64(effective_alignment)) {
         return KB_ERR_INVALID;
     }
+#if defined(__pachaos__)
+    if (effective_alignment > page_size) {
+        return KB_ERR_INVALID;
+    }
+#endif
     const uint64_t alloc_size = align_up_u64(size, effective_alignment);
+#if defined(__pachaos__)
+    if (alloc_size == 0) {
+        return KB_ERR_INVALID;
+    }
+    const int vmo_fd = pacha_vmo_create_contiguous(alloc_size, 0, 0);
+    if (vmo_fd < 16) {
+        return KB_ERR_NOMEM;
+    }
+    void *ptr = pacha_mmap(
+        vmo_fd,
+        alloc_size,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (ptr == NULL) {
+        (void)pacha_fd_close(vmo_fd);
+        return KB_ERR_NOMEM;
+    }
+#else
     void *alloc_addr = NULL;
     uint64_t raw_size = 0;
     void *ptr = alloc_aligned_zeroed(alloc_size, effective_alignment, &alloc_addr, &raw_size);
     if (ptr == NULL) {
         return KB_ERR_NOMEM;
     }
+#endif
 
     struct pacha_capsule_dma dma = {0};
     const int status = pacha_capsule_device_derive_dma_buffer(
@@ -767,7 +803,12 @@ static kb_status_t pachaos_capsule_dma_alloc(
                 (unsigned long long)effective_alignment,
                 status);
         }
+#if defined(__pachaos__)
+        (void)pacha_munmap(ptr, alloc_size);
+        (void)pacha_fd_close(vmo_fd);
+#else
         free_aligned_zeroed(alloc_addr, raw_size);
+#endif
         return status_from_pacha(status);
     }
     if (trace_pachaos_dma_enabled()) {
@@ -785,11 +826,19 @@ static kb_status_t pachaos_capsule_dma_alloc(
         .dma = dma,
         .cpu_addr = ptr,
         .mapped_cpu_addr = ptr,
+#if defined(__pachaos__)
+        .vmo_mapping = ptr,
+        .vmo_mapping_size = alloc_size,
+        .vmo_fd = vmo_fd,
+#else
         .alloc_addr = alloc_addr,
         .alloc_size = raw_size,
+#endif
         .size = alloc_size,
         .direction = direction,
+#if !defined(__pachaos__)
         .owns_cpu_addr = 1,
+#endif
         .owns_mapped_cpu_addr = 0,
     };
     kb_status_t remember_status = remember_dma_mapping(device->backend, &mapping);
@@ -802,7 +851,12 @@ static kb_status_t pachaos_capsule_dma_alloc(
                 remember_status);
         }
         (void)pacha_capsule_close(dma.fd);
+#if defined(__pachaos__)
+        (void)pacha_munmap(ptr, alloc_size);
+        (void)pacha_fd_close(vmo_fd);
+#else
         free_aligned_zeroed(alloc_addr, raw_size);
+#endif
         return remember_status;
     }
 
