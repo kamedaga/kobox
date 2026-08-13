@@ -46,6 +46,38 @@ typedef struct kb_block_disk_snapshot {
 
 typedef int (*kb_block_disk_read_fn)(void *ctx, uint64_t sector, void *buffer, size_t byte_count);
 typedef int (*kb_block_disk_write_fn)(void *ctx, uint64_t sector, const void *buffer, size_t byte_count);
+typedef int (*kb_block_disk_write_flags_fn)(
+    void *ctx,
+    uint64_t sector,
+    const void *buffer,
+    size_t byte_count,
+    uint32_t flags);
+typedef int (*kb_block_disk_flush_fn)(void *ctx);
+
+enum {
+    KB_BLOCK_DISK_WRITE_FUA = 1u << 0,
+};
+
+typedef struct kb_block_disk_read_request {
+    uint64_t sector;
+    void *buffer;
+    size_t byte_count;
+} kb_block_disk_read_request_t;
+
+typedef struct kb_block_disk_write_request {
+    uint64_t sector;
+    const void *buffer;
+    size_t byte_count;
+} kb_block_disk_write_request_t;
+
+typedef int (*kb_block_disk_read_batch_fn)(
+    void *ctx,
+    const kb_block_disk_read_request_t *requests,
+    size_t request_count);
+typedef int (*kb_block_disk_write_batch_fn)(
+    void *ctx,
+    const kb_block_disk_write_request_t *requests,
+    size_t request_count);
 
 typedef struct kb_block_tagset_snapshot {
     void *tag_set;
@@ -98,8 +130,35 @@ void kb_block_subsystem_disk_set_io(
     void *ctx,
     kb_block_disk_read_fn read_fn,
     kb_block_disk_write_fn write_fn);
+void kb_block_subsystem_disk_set_read_batch(
+    void *disk,
+    kb_block_disk_read_batch_fn read_batch_fn);
+void kb_block_subsystem_disk_set_write_batch(
+    void *disk,
+    kb_block_disk_write_batch_fn write_batch_fn);
+void kb_block_subsystem_disk_set_write_flags(
+    void *disk,
+    kb_block_disk_write_flags_fn write_flags_fn);
+void kb_block_subsystem_disk_set_flush(
+    void *disk,
+    kb_block_disk_flush_fn flush_fn);
 int kb_block_subsystem_disk_read(void *disk, uint64_t sector, void *buffer, size_t byte_count);
+int kb_block_subsystem_disk_read_batch(
+    void *disk,
+    const kb_block_disk_read_request_t *requests,
+    size_t request_count);
+int kb_block_subsystem_disk_write_batch(
+    void *disk,
+    const kb_block_disk_write_request_t *requests,
+    size_t request_count);
 int kb_block_subsystem_disk_write(void *disk, uint64_t sector, const void *buffer, size_t byte_count);
+int kb_block_subsystem_disk_write_flags(
+    void *disk,
+    uint64_t sector,
+    const void *buffer,
+    size_t byte_count,
+    uint32_t flags);
+int kb_block_subsystem_disk_flush(void *disk);
 
 void *kb_block_subsystem_block_device_alloc(void);
 void kb_block_subsystem_object_free(void *object);

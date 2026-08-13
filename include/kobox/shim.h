@@ -25,7 +25,49 @@ void *kb_kmem_cache_create_args(const char *name, unsigned int object_size, void
 void kb_kmem_cache_destroy(void *cache);
 void *kb_kmem_cache_alloc(void *cache, unsigned int flags);
 void kb_kmem_cache_free(void *cache, void *ptr);
+void *kb_mempool_create_node(
+    int minimum,
+    void *(*alloc_fn)(unsigned int gfp, void *pool_data),
+    void (*free_fn)(void *element, void *pool_data),
+    void *pool_data,
+    unsigned int gfp,
+    int node_id);
+void *kb_mempool_create(
+    int minimum,
+    void *(*alloc_fn)(unsigned int gfp, void *pool_data),
+    void (*free_fn)(void *element, void *pool_data),
+    void *pool_data);
+void *kb_mempool_alloc(void *pool, unsigned int gfp);
+void kb_mempool_free(void *element, void *pool);
+void kb_mempool_destroy(void *pool);
+void *kb_mempool_alloc_slab(unsigned int gfp, void *pool_data);
+void kb_mempool_free_slab(void *element, void *pool_data);
+void *kb_mempool_kmalloc(unsigned int gfp, void *pool_data);
+void kb_mempool_kfree(void *element, void *pool_data);
+void *kb_shrinker_alloc(unsigned int flags, const char *format, ...);
+void kb_shrinker_register(void *shrinker);
+void kb_shrinker_free(void *shrinker);
+unsigned long kb_shrinker_reclaim(unsigned long nr_to_scan, unsigned int gfp_mask);
 void kb_kfree(void *ptr);
+
+typedef struct kb_memory_hotpath_profile {
+    uint64_t kmalloc_calls;
+    uint64_t kmalloc_cycles;
+    uint64_t kzalloc_calls;
+    uint64_t kzalloc_cycles;
+    uint64_t kfree_calls;
+    uint64_t kfree_cycles;
+    uint64_t cache_alloc_calls;
+    uint64_t cache_alloc_cycles;
+    uint64_t cache_free_calls;
+    uint64_t cache_free_cycles;
+    uint64_t arena_free_search_steps;
+    uint64_t arena_chunk_search_steps;
+    uint64_t allocation_search_steps;
+} kb_memory_hotpath_profile_t;
+
+void kb_memory_hotpath_profile_reset(void);
+void kb_memory_hotpath_profile_snapshot(kb_memory_hotpath_profile_t *out_profile);
 void *kb_krealloc_managed(void *ptr, size_t size, unsigned int flags);
 size_t kb_kmalloc_usable_size(const void *ptr);
 extern const int kb_sysctl_vals[];
@@ -50,6 +92,7 @@ unsigned long kb_shim_current_kernel_gs(void);
 int kb_shim_enter_kernel_gs(unsigned long kernel_gs, unsigned long *out_old_gs);
 void kb_shim_leave_kernel_gs(unsigned long old_gs);
 void *kb_module_lookup_exported_symbol(const char *name);
+void *kb_module_shared_blockdev_superblock(void);
 unsigned long kb_module_kernel_gs_for_address(const void *address);
 int kb_module_is_executable_address(const void *address);
 void *kb_module_make_gs_call_stub(const void *target, unsigned long caller_gs);
@@ -58,6 +101,12 @@ unsigned long kb_module_current_external_call_caller_gs(void);
 unsigned long kb_module_current_external_call_callee_gs(void);
 void kb_linux_call_void_ptr(void (*fn)(void *), void *arg);
 void kb_linux_call_void_ptr_gs(void (*fn)(void *), void *arg, unsigned long kernel_gs);
+void kb_linux_call_void_ptr_int(void (*fn)(void *, int), void *arg0, int arg1);
+void kb_linux_call_void_ptr_int_gs(
+    void (*fn)(void *, int),
+    void *arg0,
+    int arg1,
+    unsigned long kernel_gs);
 void kb_linux_call_void_ulong(void (*fn)(unsigned long), unsigned long arg);
 void kb_linux_call_void_ulong_gs(void (*fn)(unsigned long), unsigned long arg, unsigned long kernel_gs);
 void *kb_linux_call_ptr_ptr(void *(*fn)(void *), void *arg0);
@@ -131,6 +180,9 @@ int kb_irq_allocate_mapping(unsigned int backend_kind, unsigned int backend_vect
 unsigned int kb_irq_backend_vector(unsigned int linux_irq);
 void kb_irq_clear_mappings(void);
 int kb_queue_work_on(int cpu, void *wq, void *work);
+void *kb_alloc_workqueue(const char *name, unsigned int flags, int max_active, ...);
+void kb_flush_workqueue(void *wq);
+void kb_destroy_workqueue(void *wq);
 int kb_kblockd_schedule_work(void *work);
 int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay);
 int kb_mod_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay);
@@ -146,15 +198,10 @@ int kb_mod_timer(void *timer, unsigned long expires);
 void kb_add_timer(void *timer);
 int kb_timer_delete(void *timer);
 unsigned long kb_schedule_timeout(unsigned long timeout);
+void kb_schedule(void);
 void kb_run_deferred_work(void);
 void kb_run_deferred_bottom_halves(void);
 int kb_deferred_work_is_draining(void);
-void kb_jbd2_progress_registered_journals(void);
-void *kb_jbd2_journal_init_stub(void);
-void *kb_jbd2_journal_start_stub(void);
-int kb_jbd2_journal_stop_stub(void *handle);
-int kb_jbd2_journal_blocks_per_page_stub(void);
-void kb_jbd2_journal_destroy_stub(void *journal);
 void kb_register_jiffies_storage(void *storage);
 unsigned long kb_msecs_to_jiffies(unsigned int msecs);
 unsigned long kb_usecs_to_jiffies(unsigned int usecs);
@@ -173,6 +220,15 @@ void kb_usleep_range_state(unsigned long min, unsigned long max, unsigned int st
 void kb_udelay(unsigned long usecs);
 void kb_const_udelay(unsigned long xloops);
 void kb_ndelay(unsigned long nsecs);
+uint32_t kb_crc32_le(uint32_t crc, const void *data, size_t len);
+uint32_t kb_crc32_be(uint32_t crc, const void *data, size_t len);
+void *kb_memchr_inv(const void *start, int value, size_t bytes);
+void kb_rcu_read_lock(void);
+void kb_rcu_read_unlock(void);
+void kb_call_rcu(void *head, void (*callback)(void *head));
+void kb_kvfree_call_rcu(void *head, void *ptr);
+void kb_synchronize_rcu(void);
+void kb_rcu_barrier(void);
 void *kb_find_vpid(int nr);
 void kb_clear_current_signal_pending(void);
 
@@ -302,6 +358,13 @@ int kb_input_mt_init_slots(void *dev, unsigned int num_slots, unsigned int flags
 void kb_cond_resched(void);
 void *kb_alloc_percpu_gfp(size_t size, size_t align, unsigned int flags);
 void kb_free_percpu(void *ptr);
+int kb_percpu_init_rwsem(void *sem, const char *name, void *key);
+void kb_percpu_free_rwsem(void *sem);
+int kb_percpu_down_read(void *sem, int try_lock);
+void kb_percpu_up_read(void *sem);
+int kb_percpu_is_read_locked(void *sem);
+void kb_percpu_down_write(void *sem);
+void kb_percpu_up_write(void *sem);
 int kb_rtnl_link_register(void *ops);
 void kb_rtnl_link_unregister(void *ops);
 void kb_rtnl_lock(void);
@@ -338,8 +401,11 @@ uint64_t kb_dev_lstats_read(void *dev, uint64_t *packets, uint64_t *bytes);
 int kb_ethtool_op_get_ts_info(void *dev, void *info);
 void kb_init_rwsem(void *sem);
 void kb_down_read(void *sem);
+int kb_down_read_trylock(void *sem);
 void kb_up_read(void *sem);
 void kb_down_write(void *sem);
+int kb_down_write_trylock(void *sem);
+void kb_downgrade_write(void *sem);
 void kb_up_write(void *sem);
 unsigned long kb_find_next_bit(const unsigned long *addr, unsigned long size, unsigned long offset);
 unsigned long kb_find_next_zero_bit(const unsigned long *addr, unsigned long size, unsigned long offset);
@@ -394,14 +460,32 @@ int kb_prepare_to_wait_exclusive(void *wq_head, void *wq_entry, int state);
 long kb_prepare_to_wait_event(void *wq_head, void *wq_entry, int state);
 void kb_finish_wait(void *wq_head, void *wq_entry);
 void kb_init_wait_entry(void *wq_entry, int flags);
+void *kb_var_waitqueue(void *var);
+void *kb_bit_waitqueue(void *word, int bit);
+void kb_init_wait_var_entry(void *wait_entry, void *var, int flags);
+void kb_wake_up_var(void *var);
 int kb_default_wake_function(void *wq_entry, unsigned mode, int sync, void *key);
 int kb_autoremove_wake_function(void *wq_entry, unsigned mode, int sync, void *key);
 long kb_wait_woken(void *wq_entry, unsigned mode, long timeout);
 int kb_woken_wake_function(void *wq_entry, unsigned mode, int sync, void *key);
 int kb_wake_up_waitqueue(void *wq_head, unsigned mode, int nr, void *key);
+int kb_out_of_line_wait_on_bit(
+    void *word,
+    int bit,
+    int (*action)(void *, int),
+    unsigned int mode);
+int kb_out_of_line_wait_on_bit_lock(
+    void *word,
+    int bit,
+    int (*action)(void *, int),
+    unsigned int mode);
+int kb_bit_wait_action(void *key, int mode);
+int kb_bit_wake_function(void *wq_entry, unsigned mode, int sync, void *key);
+void kb_wake_up_bit(void *word, int bit);
 unsigned long kb_wait_for_completion(void *completion);
 unsigned long kb_wait_for_completion_io_timeout(void *completion, unsigned long timeout);
 void kb_noop_stub(void);
+void kb_static_call_preserve_noop(void);
 void kb_stackleak_track_stack_stub(void);
 int kb_return_zero(void);
 int kb_return_one(void);
@@ -434,6 +518,7 @@ unsigned int kb_kfifo_out(void *fifo, void *buffer, unsigned int len);
 int kb_kfifo_to_user(void *fifo, void *to, unsigned int len, unsigned int *copied);
 void kb_kfifo_free(void *fifo);
 void *kb_find_vpid(int nr);
+void kb_put_pid(void *pid);
 void *kb_pid_task(void *pid, int type);
 int kb_pid_vnr(void *pid);
 int kb_match_token(char *string, const void *table, void *args);
@@ -461,6 +546,13 @@ void *kb_rb_first(void *root);
 void *kb_rb_next(void *node);
 void *kb_rb_prev(void *node);
 void *kb_kthread_create_on_node(int (*threadfn)(void *data), void *data, int node, const char *namefmt, ...);
+int kb_kthread_should_stop(void);
+int kb_kthread_stop(void *task);
+int kb_kthread_yield_current(void);
+void kb_kthread_run_ready(void);
+void *kb_kthread_current_task(void);
+void kb_kthread_prepare_wait(void *task);
+void kb_kthread_finish_wait(void *task);
 int kb_wake_up_process(void *task);
 int kb_ida_alloc_range(void *ida, unsigned int min, unsigned int max, unsigned int flags);
 void kb_ida_free(void *ida, unsigned int id);
@@ -474,6 +566,7 @@ void kb_free_cpumask_var(void *mask);
 void *kb_alloc_stub(void);
 void kb_free_first_arg_stub(void *ptr, void *ignored);
 int kb_percpu_counter_init_many_stub(void *counters, long amount, unsigned int batch, unsigned int count, void *key);
+void kb_percpu_counter_destroy_many(void *counters, unsigned int count);
 void kb_percpu_counter_add_batch_stub(void *counter, int64_t amount, int32_t batch);
 int64_t kb_percpu_counter_sum_stub(void *counter);
 void *kb_crypto_alloc_shash_stub(const char *alg_name, unsigned int type, unsigned int mask);
@@ -518,6 +611,10 @@ void kb_blk_mq_destroy_queue(void *queue);
 void *kb_blk_mq_alloc_request(void *queue, unsigned int op, unsigned int flags);
 int kb_blk_rq_map_kern(void *queue, void *request, void *buffer, unsigned int length, unsigned int gfp);
 int kb_blk_execute_rq(void *request, int at_head);
+int kb_blk_submit_rq(void *request, int at_head);
+int kb_blk_submit_rq_batch(void *request, int at_head, int last);
+int kb_blk_commit_rqs(void *request);
+int kb_blk_complete_rq(void *request);
 void kb_blk_mq_start_request(void *request);
 void kb_blk_mq_complete_request(void *request);
 int kb_blk_mq_complete_request_remote(void *request);

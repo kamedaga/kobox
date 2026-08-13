@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <string.h>
 
+static unsigned int smoke_write_batch_calls;
+
 static int smoke_disk_read(void *ctx, uint64_t sector, void *buffer, size_t byte_count)
 {
     unsigned char *backing = ctx;
@@ -14,6 +16,28 @@ static int smoke_disk_write(void *ctx, uint64_t sector, const void *buffer, size
 {
     unsigned char *backing = ctx;
     memcpy(backing + sector * 512u, buffer, byte_count);
+    return 0;
+}
+
+static int smoke_disk_write_batch(
+    void *ctx,
+    const kb_block_disk_write_request_t *requests,
+    size_t request_count)
+{
+    if (requests == NULL || request_count != 2) {
+        return -22;
+    }
+    smoke_write_batch_calls++;
+    for (size_t i = 0; i < request_count; ++i) {
+        const int status = smoke_disk_write(
+            ctx,
+            requests[i].sector,
+            requests[i].buffer,
+            requests[i].byte_count);
+        if (status != 0) {
+            return status;
+        }
+    }
     return 0;
 }
 
@@ -46,6 +70,45 @@ int main(void)
         tagset_snapshot.wait_completed_count != 1)
     {
         return 3;
+    }
+
+    void *tag_requests[63] = {0};
+    uint32_t allocated_tags[63] = {0};
+    for (size_t i = 0; i < 63; ++i) {
+        tag_requests[i] = &tag_requests[i];
+        allocated_tags[i] = kb_block_subsystem_tagset_alloc_tag(tag_set, 0);
+        if (allocated_tags[i] == UINT32_MAX || allocated_tags[i] == 0 ||
+            kb_block_subsystem_tagset_bind_request(
+                tag_set,
+                0,
+                allocated_tags[i],
+                tag_requests[i]) != 0)
+        {
+            return 16;
+        }
+    }
+    if (kb_block_subsystem_tagset_alloc_tag(tag_set, 0) != UINT32_MAX) {
+        return 17;
+    }
+    kb_block_subsystem_tagset_unbind_request(
+        tag_set,
+        0,
+        allocated_tags[17],
+        tag_requests[17]);
+    const uint32_t reused_tag =
+        kb_block_subsystem_tagset_alloc_tag(tag_set, 0);
+    if (reused_tag != allocated_tags[17]) {
+        return 18;
+    }
+    for (size_t i = 0; i < 63; ++i) {
+        if (i == 17) {
+            continue;
+        }
+        kb_block_subsystem_tagset_unbind_request(
+            tag_set,
+            0,
+            allocated_tags[i],
+            tag_requests[i]);
     }
 
     kb_block_subsystem_queue_set_logical_block_size(queue, 4096);
@@ -95,11 +158,37 @@ int main(void)
         read_buffer[i] = 0;
     }
     kb_block_subsystem_disk_set_io(disk, backing, smoke_disk_read, smoke_disk_write);
+    kb_block_subsystem_disk_set_write_batch(disk, smoke_disk_write_batch);
     if (kb_block_subsystem_disk_write(disk, 8, write_buffer, sizeof(write_buffer)) != 0 ||
         kb_block_subsystem_disk_read(disk, 8, read_buffer, sizeof(read_buffer)) != 0 ||
         memcmp(write_buffer, read_buffer, sizeof(write_buffer)) != 0)
     {
         return 30;
+    }
+    unsigned char batch_read_a[4096];
+    unsigned char batch_read_b[4096];
+    memset(batch_read_a, 0, sizeof(batch_read_a));
+    memset(batch_read_b, 0, sizeof(batch_read_b));
+    kb_block_disk_read_request_t batch_reads[2] = {
+        { .sector = 8, .buffer = batch_read_a, .byte_count = sizeof(batch_read_a) },
+        { .sector = 8, .buffer = batch_read_b, .byte_count = sizeof(batch_read_b) },
+    };
+    if (kb_block_subsystem_disk_read_batch(disk, batch_reads, 2) != 0 ||
+        memcmp(write_buffer, batch_read_a, sizeof(write_buffer)) != 0 ||
+        memcmp(write_buffer, batch_read_b, sizeof(write_buffer)) != 0)
+    {
+        return 32;
+    }
+    kb_block_disk_write_request_t batch_writes[2] = {
+        { .sector = 16, .buffer = write_buffer, .byte_count = sizeof(write_buffer) },
+        { .sector = 24, .buffer = write_buffer, .byte_count = sizeof(write_buffer) },
+    };
+    if (kb_block_subsystem_disk_write_batch(disk, batch_writes, 2) != 0 ||
+        smoke_write_batch_calls != 1 ||
+        memcmp(backing + 16u * 512u, write_buffer, sizeof(write_buffer)) != 0 ||
+        memcmp(backing + 24u * 512u, write_buffer, sizeof(write_buffer)) != 0)
+    {
+        return 33;
     }
     kb_block_subsystem_disk_set_read_only(disk, 1);
     if (kb_block_subsystem_disk_write(disk, 8, write_buffer, sizeof(write_buffer)) != -30) {
@@ -129,10 +218,11 @@ int main(void)
         snapshot.zoned_model != 2 ||
         snapshot.readahead_update_count != 1 ||
         snapshot.zone_revalidate_count != 1 ||
-        snapshot.read_count != 1 ||
-        snapshot.write_count != 1 ||
-        snapshot.bytes_read != sizeof(read_buffer) ||
-        snapshot.bytes_written != sizeof(write_buffer))
+        snapshot.read_count != 3 ||
+        snapshot.write_count != 3 ||
+        snapshot.bytes_read != sizeof(read_buffer) +
+            sizeof(batch_read_a) + sizeof(batch_read_b) ||
+        snapshot.bytes_written != sizeof(write_buffer) * 3u)
     {
         return 12;
     }

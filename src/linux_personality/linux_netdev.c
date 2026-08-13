@@ -1,18 +1,12 @@
 #include "kobox/shim.h"
 #include "linux_subsystem/net/net_device.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef struct kb_rwsem_record {
-    void *sem;
-    unsigned int readers;
-    unsigned int writer;
-    struct kb_rwsem_record *next;
-} kb_rwsem_record_t;
 
 static unsigned long possible_cpu_mask_storage = 1;
 unsigned long *__cpu_possible_mask = &possible_cpu_mask_storage;
@@ -25,17 +19,19 @@ typedef struct kb_percpu_alloc_record {
 } kb_percpu_alloc_record_t;
 
 static kb_percpu_alloc_record_t percpu_alloc_records[256];
-static atomic_flag rwsem_records_lock = ATOMIC_FLAG_INIT;
-static kb_rwsem_record_t *rwsem_records;
+enum {
+    KB_PERCPU_RWSEM_READ_COUNT_OFFSET = 0x30,
+    KB_PERCPU_RWSEM_WRITER_OFFSET = 0x38,
+    KB_PERCPU_RWSEM_WAITERS_OFFSET = 0x40,
+    KB_PERCPU_RWSEM_BLOCK_OFFSET = 0x58,
+};
 
-static void rwsem_write_state(void *sem, const kb_rwsem_record_t *record)
-{
-    unsigned long state = 0;
-    if (record != NULL && (record->writer != 0 || record->readers != 0)) {
-        state = 1;
-    }
-    memcpy(sem, &state, sizeof(state));
-}
+static const unsigned long kb_rwsem_writer_locked = 1ul << 0;
+static const unsigned long kb_rwsem_flag_waiters = 1ul << 1;
+static const unsigned long kb_rwsem_flag_handoff = 1ul << 2;
+static const unsigned long kb_rwsem_reader_bias = 1ul << 8;
+static const unsigned long kb_rwsem_readfail =
+    1ul << (sizeof(unsigned long) * 8u - 1u);
 
 static int trace_lock_enabled(void)
 {
@@ -48,33 +44,30 @@ static int trace_lock_enabled(void)
     return cached;
 }
 
-static void rwsem_table_lock(void)
+static unsigned long kb_rwsem_read_failed_mask(void)
 {
-    while (atomic_flag_test_and_set_explicit(&rwsem_records_lock, memory_order_acquire)) {
-    }
+    return kb_rwsem_writer_locked |
+        kb_rwsem_flag_waiters |
+        kb_rwsem_flag_handoff |
+        kb_rwsem_readfail;
 }
 
-static void rwsem_table_unlock(void)
+static void kb_rwsem_report_long_wait(
+    const char *operation,
+    void *sem,
+    unsigned long state,
+    unsigned long attempts,
+    void *caller)
 {
-    atomic_flag_clear_explicit(&rwsem_records_lock, memory_order_release);
-}
-
-static kb_rwsem_record_t *rwsem_record_get_locked(void *sem)
-{
-    for (kb_rwsem_record_t *record = rwsem_records; record != NULL; record = record->next) {
-        if (record->sem == sem) {
-            return record;
-        }
+    if (attempts != 1) {
+        return;
     }
-
-    kb_rwsem_record_t *record = calloc(1, sizeof(*record));
-    if (record == NULL) {
-        return NULL;
-    }
-    record->sem = sem;
-    record->next = rwsem_records;
-    rwsem_records = record;
-    return record;
+    fprintf(stderr,
+        "kobox rwsem: long wait op=%s sem=%p state=%#lx caller=%p\n",
+        operation,
+        sem,
+        state,
+        caller);
 }
 
 void kb_cond_resched(void)
@@ -131,6 +124,118 @@ void kb_free_percpu(void *ptr)
             return;
         }
     }
+}
+
+static void *percpu_allocation_base(void *relative)
+{
+    if (relative == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(percpu_alloc_records) / sizeof(percpu_alloc_records[0]); i++) {
+        if (percpu_alloc_records[i].relative == relative) {
+            return percpu_alloc_records[i].base;
+        }
+    }
+    return relative;
+}
+
+int kb_percpu_init_rwsem(void *sem, const char *name, void *key)
+{
+    (void)name;
+    (void)key;
+    if (sem == NULL) {
+        return -22;
+    }
+    uint32_t *read_count = kb_alloc_percpu_gfp(sizeof(*read_count), _Alignof(uint32_t), 0);
+    if (read_count == NULL) {
+        return -12;
+    }
+    memcpy((uint8_t *)sem + KB_PERCPU_RWSEM_READ_COUNT_OFFSET, &read_count, sizeof(read_count));
+
+    void *rss_waiters = (uint8_t *)sem + 0x10;
+    memcpy((uint8_t *)sem + 0x10, &rss_waiters, sizeof(rss_waiters));
+    memcpy((uint8_t *)sem + 0x18, &rss_waiters, sizeof(rss_waiters));
+    void *waiters = (uint8_t *)sem + KB_PERCPU_RWSEM_WAITERS_OFFSET + 8u;
+    memcpy((uint8_t *)sem + KB_PERCPU_RWSEM_WAITERS_OFFSET + 8u, &waiters, sizeof(waiters));
+    memcpy((uint8_t *)sem + KB_PERCPU_RWSEM_WAITERS_OFFSET + 16u, &waiters, sizeof(waiters));
+    memset((uint8_t *)sem + KB_PERCPU_RWSEM_WRITER_OFFSET, 0, sizeof(void *));
+    uint32_t block = 0;
+    memcpy((uint8_t *)sem + KB_PERCPU_RWSEM_BLOCK_OFFSET, &block, sizeof(block));
+    return 0;
+}
+
+void kb_percpu_free_rwsem(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    void *read_count = NULL;
+    memcpy(&read_count, (uint8_t *)sem + KB_PERCPU_RWSEM_READ_COUNT_OFFSET, sizeof(read_count));
+    if (read_count != NULL) {
+        kb_free_percpu(read_count);
+        read_count = NULL;
+        memcpy((uint8_t *)sem + KB_PERCPU_RWSEM_READ_COUNT_OFFSET, &read_count, sizeof(read_count));
+    }
+}
+
+int kb_percpu_down_read(void *sem, int try_lock)
+{
+    (void)try_lock;
+    if (sem == NULL) {
+        return 0;
+    }
+    void *relative = NULL;
+    memcpy(&relative, (uint8_t *)sem + KB_PERCPU_RWSEM_READ_COUNT_OFFSET, sizeof(relative));
+    uint32_t *read_count = percpu_allocation_base(relative);
+    if (read_count == NULL) {
+        return 0;
+    }
+    (*read_count)++;
+    return 1;
+}
+
+void kb_percpu_up_read(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    void *relative = NULL;
+    memcpy(&relative, (uint8_t *)sem + KB_PERCPU_RWSEM_READ_COUNT_OFFSET, sizeof(relative));
+    uint32_t *read_count = percpu_allocation_base(relative);
+    if (read_count != NULL && *read_count != 0) {
+        (*read_count)--;
+    }
+}
+
+int kb_percpu_is_read_locked(void *sem)
+{
+    if (sem == NULL) {
+        return 0;
+    }
+    void *relative = NULL;
+    memcpy(&relative, (uint8_t *)sem + KB_PERCPU_RWSEM_READ_COUNT_OFFSET, sizeof(relative));
+    const uint32_t *read_count = percpu_allocation_base(relative);
+    uint32_t block = 0;
+    memcpy(&block, (uint8_t *)sem + KB_PERCPU_RWSEM_BLOCK_OFFSET, sizeof(block));
+    return read_count != NULL && *read_count != 0 && block == 0;
+}
+
+void kb_percpu_down_write(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    uint32_t block = 1;
+    memcpy((uint8_t *)sem + KB_PERCPU_RWSEM_BLOCK_OFFSET, &block, sizeof(block));
+}
+
+void kb_percpu_up_write(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    uint32_t block = 0;
+    memcpy((uint8_t *)sem + KB_PERCPU_RWSEM_BLOCK_OFFSET, &block, sizeof(block));
 }
 
 int kb_rtnl_link_register(void *ops)
@@ -303,14 +408,7 @@ void kb_init_rwsem(void *sem)
     if (sem == NULL) {
         return;
     }
-    rwsem_table_lock();
-    kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
-    if (record != NULL) {
-        record->readers = 0;
-        record->writer = 0;
-        rwsem_write_state(sem, record);
-    }
-    rwsem_table_unlock();
+    __atomic_store_n((unsigned long *)sem, 0ul, __ATOMIC_RELEASE);
     if (trace_lock_enabled()) {
         fprintf(stderr, "kobox lock: init_rwsem sem=%p\n", sem);
     }
@@ -321,22 +419,51 @@ void kb_down_read(void *sem)
     if (sem == NULL) {
         return;
     }
+    unsigned long attempts = 0;
+    void *caller = __builtin_return_address(0);
     for (;;) {
-        rwsem_table_lock();
-        kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
-        if (record == NULL || record->writer == 0) {
-            if (record != NULL) {
-                record->readers++;
-                rwsem_write_state(sem, record);
-            }
-            rwsem_table_unlock();
+        unsigned long observed = __atomic_load_n(
+            (unsigned long *)sem, __ATOMIC_RELAXED);
+        if ((observed & kb_rwsem_read_failed_mask()) == 0 &&
+            observed <= ULONG_MAX - kb_rwsem_reader_bias &&
+            __atomic_compare_exchange_n(
+                (unsigned long *)sem,
+                &observed,
+                observed + kb_rwsem_reader_bias,
+                0,
+                __ATOMIC_ACQUIRE,
+                __ATOMIC_RELAXED))
+        {
             if (trace_lock_enabled()) {
                 fprintf(stderr, "kobox lock: down_read sem=%p\n", sem);
             }
             return;
         }
-        rwsem_table_unlock();
+        attempts++;
+        kb_rwsem_report_long_wait(
+            "read", sem, observed, attempts, caller);
+        if (!kb_kthread_yield_current()) {
+            kb_kthread_run_ready();
+        }
     }
+}
+
+int kb_down_read_trylock(void *sem)
+{
+    if (sem == NULL) {
+        return 0;
+    }
+    unsigned long observed = __atomic_load_n(
+        (unsigned long *)sem, __ATOMIC_RELAXED);
+    return (observed & kb_rwsem_read_failed_mask()) == 0 &&
+        observed <= ULONG_MAX - kb_rwsem_reader_bias &&
+        __atomic_compare_exchange_n(
+            (unsigned long *)sem,
+            &observed,
+            observed + kb_rwsem_reader_bias,
+            0,
+            __ATOMIC_ACQUIRE,
+            __ATOMIC_RELAXED);
 }
 
 void kb_up_read(void *sem)
@@ -344,13 +471,22 @@ void kb_up_read(void *sem)
     if (sem == NULL) {
         return;
     }
-    rwsem_table_lock();
-    kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
-    if (record != NULL && record->readers > 0) {
-        record->readers--;
+    unsigned long observed = __atomic_load_n(
+        (unsigned long *)sem, __ATOMIC_RELAXED);
+    while ((observed & ~(kb_rwsem_reader_bias - 1ul)) >=
+        kb_rwsem_reader_bias)
+    {
+        if (__atomic_compare_exchange_n(
+                (unsigned long *)sem,
+                &observed,
+                observed - kb_rwsem_reader_bias,
+                0,
+                __ATOMIC_RELEASE,
+                __ATOMIC_RELAXED))
+        {
+            break;
+        }
     }
-    rwsem_write_state(sem, record);
-    rwsem_table_unlock();
     if (trace_lock_enabled()) {
         fprintf(stderr, "kobox lock: up_read sem=%p\n", sem);
     }
@@ -361,21 +497,80 @@ void kb_down_write(void *sem)
     if (sem == NULL) {
         return;
     }
+    unsigned long attempts = 0;
+    void *caller = __builtin_return_address(0);
     for (;;) {
-        rwsem_table_lock();
-        kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
-        if (record == NULL || (record->writer == 0 && record->readers == 0)) {
-            if (record != NULL) {
-                record->writer = 1;
-                rwsem_write_state(sem, record);
+        unsigned long expected = __atomic_load_n(
+            (unsigned long *)sem, __ATOMIC_RELAXED);
+        if ((expected & ~(kb_rwsem_flag_waiters |
+                          kb_rwsem_flag_handoff)) == 0)
+        {
+            unsigned long desired = kb_rwsem_writer_locked;
+            if (__atomic_compare_exchange_n(
+                    (unsigned long *)sem,
+                    &expected,
+                    desired,
+                    0,
+                    __ATOMIC_ACQUIRE,
+                    __ATOMIC_RELAXED))
+            {
+                if (trace_lock_enabled()) {
+                    fprintf(stderr, "kobox lock: down_write sem=%p\n", sem);
+                }
+                return;
             }
-            rwsem_table_unlock();
-            if (trace_lock_enabled()) {
-                fprintf(stderr, "kobox lock: down_write sem=%p\n", sem);
-            }
-            return;
+        } else if ((expected & kb_rwsem_flag_waiters) == 0) {
+            (void)__atomic_fetch_or(
+                (unsigned long *)sem,
+                kb_rwsem_flag_waiters,
+                __ATOMIC_ACQ_REL);
+            expected |= kb_rwsem_flag_waiters;
         }
-        rwsem_table_unlock();
+        attempts++;
+        kb_rwsem_report_long_wait(
+            "write", sem, expected, attempts, caller);
+        if (!kb_kthread_yield_current()) {
+            kb_kthread_run_ready();
+        }
+    }
+}
+
+int kb_down_write_trylock(void *sem)
+{
+    if (sem == NULL) {
+        return 0;
+    }
+    unsigned long expected = 0;
+    return __atomic_compare_exchange_n(
+        (unsigned long *)sem,
+        &expected,
+        kb_rwsem_writer_locked,
+        0,
+        __ATOMIC_ACQUIRE,
+        __ATOMIC_RELAXED);
+}
+
+void kb_downgrade_write(void *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    unsigned long observed = __atomic_load_n(
+        (unsigned long *)sem, __ATOMIC_RELAXED);
+    while ((observed & kb_rwsem_writer_locked) != 0) {
+        unsigned long desired =
+            (observed & (kb_rwsem_flag_waiters | kb_rwsem_flag_handoff)) |
+            kb_rwsem_reader_bias;
+        if (__atomic_compare_exchange_n(
+                (unsigned long *)sem,
+                &observed,
+                desired,
+                0,
+                __ATOMIC_RELEASE,
+                __ATOMIC_RELAXED))
+        {
+            break;
+        }
     }
 }
 
@@ -384,13 +579,10 @@ void kb_up_write(void *sem)
     if (sem == NULL) {
         return;
     }
-    rwsem_table_lock();
-    kb_rwsem_record_t *record = rwsem_record_get_locked(sem);
-    if (record != NULL) {
-        record->writer = 0;
-    }
-    rwsem_write_state(sem, record);
-    rwsem_table_unlock();
+    (void)__atomic_fetch_and(
+        (unsigned long *)sem,
+        ~kb_rwsem_writer_locked,
+        __ATOMIC_RELEASE);
     if (trace_lock_enabled()) {
         fprintf(stderr, "kobox lock: up_write sem=%p\n", sem);
     }

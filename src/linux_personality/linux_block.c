@@ -100,7 +100,8 @@ typedef struct shim_linux_request {
     kb_device_t *dma_device;
     kb_device_backend_t *prp_list_backend;
     kb_device_t *prp_list_device;
-    unsigned char reserved_a68[KB_SHIM_REQUEST_SIZE - 0xa68];
+    uint32_t dma_preallocated;
+    unsigned char reserved_a6c[KB_SHIM_REQUEST_SIZE - 0xa6c];
 } shim_linux_request_t;
 
 #if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
@@ -117,9 +118,10 @@ typedef struct kb_linux_dma_read_scope {
 
 enum {
     KB_LINUX_DMA_READ_STAGING_SIZE = KOBOX_FILE_READ_BULK_BYTES,
-    KB_LINUX_DMA_READ_BATCH_DEPTH = 4u,
+    KB_LINUX_DMA_READ_BATCH_DEPTH = 128u,
     KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE =
-        KB_LINUX_DMA_READ_STAGING_SIZE * KB_LINUX_DMA_READ_BATCH_DEPTH,
+        KB_LINUX_DMA_READ_STAGING_SIZE * 4u,
+    KB_LINUX_DMA_WRITE_STAGING_SIZE = KOBOX_FILE_READ_BULK_BYTES,
     KB_LINUX_DMA_PAGE_SIZE = 4096u,
 };
 
@@ -131,9 +133,10 @@ _Static_assert(
     KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE <=
         KB_DEVICE_DMA_MAPPING_MAX_PAGES * KB_LINUX_DMA_PAGE_SIZE,
     "DMA read staging exceeds the NVMe PRP page capacity");
-
 static kb_linux_dma_read_scope_t dma_read_scope;
 static unsigned char *dma_read_staging_buffer;
+static unsigned char *dma_write_staging_buffer;
+static uint64_t dma_write_staging_handle;
 static shim_linux_request_t *cached_requests[KB_LINUX_BLOCK_REQUEST_CACHE_MAX];
 static size_t cached_request_count;
 static atomic_flag cached_request_lock = ATOMIC_FLAG_INIT;
@@ -200,9 +203,24 @@ enum {
 
 static kb_linux_cached_aux_dma_t
     cached_aux_dma[KB_LINUX_CACHED_AUX_DMA_MAX];
+static atomic_flag cached_aux_dma_lock = ATOMIC_FLAG_INIT;
+
+static void cached_aux_dma_lock_acquire(void)
+{
+    while (atomic_flag_test_and_set_explicit(
+        &cached_aux_dma_lock, memory_order_acquire))
+    {
+    }
+}
+
+static void cached_aux_dma_lock_release(void)
+{
+    atomic_flag_clear_explicit(&cached_aux_dma_lock, memory_order_release);
+}
 
 static void cached_aux_dma_discard_unused(void)
 {
+    cached_aux_dma_lock_acquire();
     for (size_t i = 0; i < KB_LINUX_CACHED_AUX_DMA_MAX; i++) {
         kb_linux_cached_aux_dma_t *entry = &cached_aux_dma[i];
         if (entry->owner != NULL || entry->cpu_addr == NULL) {
@@ -215,6 +233,7 @@ static void cached_aux_dma_discard_unused(void)
             entry->dma_addr);
         memset(entry, 0, sizeof(*entry));
     }
+    cached_aux_dma_lock_release();
 }
 
 uint64_t kb_linux_block_profile_begin(void)
@@ -268,6 +287,136 @@ void kb_linux_block_profile_snapshot(kb_linux_block_profile_t *out_profile)
     }
     out_profile->disk_read_bytes =
         __atomic_load_n(&linux_block_profile.disk_read_bytes, __ATOMIC_RELAXED);
+    for (size_t i = 0; i < 8u; i++) {
+        out_profile->disk_read_command_calls[i] = __atomic_load_n(
+            &linux_block_profile.disk_read_command_calls[i], __ATOMIC_RELAXED);
+        out_profile->disk_read_command_bytes[i] = __atomic_load_n(
+            &linux_block_profile.disk_read_command_bytes[i], __ATOMIC_RELAXED);
+        out_profile->disk_write_command_calls[i] = __atomic_load_n(
+            &linux_block_profile.disk_write_command_calls[i], __ATOMIC_RELAXED);
+        out_profile->disk_write_command_bytes[i] = __atomic_load_n(
+            &linux_block_profile.disk_write_command_bytes[i], __ATOMIC_RELAXED);
+    }
+    out_profile->disk_read_command_count = __atomic_load_n(
+        &linux_block_profile.disk_read_command_count, __ATOMIC_RELAXED);
+    out_profile->disk_write_command_count = __atomic_load_n(
+        &linux_block_profile.disk_write_command_count, __ATOMIC_RELAXED);
+    out_profile->native_fua_commands = __atomic_load_n(
+        &linux_block_profile.native_fua_commands, __ATOMIC_RELAXED);
+    for (size_t i = 0; i < 64u; i++) {
+        out_profile->disk_read_command_sectors[i] = __atomic_load_n(
+            &linux_block_profile.disk_read_command_sectors[i], __ATOMIC_RELAXED);
+        out_profile->disk_read_command_lengths[i] = __atomic_load_n(
+            &linux_block_profile.disk_read_command_lengths[i], __ATOMIC_RELAXED);
+        out_profile->disk_write_command_sectors[i] = __atomic_load_n(
+            &linux_block_profile.disk_write_command_sectors[i], __ATOMIC_RELAXED);
+        out_profile->disk_write_command_lengths[i] = __atomic_load_n(
+            &linux_block_profile.disk_write_command_lengths[i], __ATOMIC_RELAXED);
+        out_profile->disk_write_command_flags[i] = __atomic_load_n(
+            &linux_block_profile.disk_write_command_flags[i], __ATOMIC_RELAXED);
+    }
+#endif
+}
+
+void kb_linux_block_profile_record_native_fua(void)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    __atomic_fetch_add(
+        &linux_block_profile.native_fua_commands,
+        1u,
+        __ATOMIC_RELAXED);
+#endif
+}
+
+void kb_linux_block_profile_record_read_command(
+    uint64_t sector,
+    size_t byte_count)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    size_t bucket = 7u;
+    switch (byte_count) {
+    case 4u * 1024u: bucket = 0u; break;
+    case 16u * 1024u: bucket = 1u; break;
+    case 32u * 1024u: bucket = 2u; break;
+    case 64u * 1024u: bucket = 3u; break;
+    case 128u * 1024u: bucket = 4u; break;
+    case 256u * 1024u: bucket = 5u; break;
+    case 512u * 1024u: bucket = 6u; break;
+    default: break;
+    }
+    __atomic_fetch_add(
+        &linux_block_profile.disk_read_command_calls[bucket],
+        1u,
+        __ATOMIC_RELAXED);
+    __atomic_fetch_add(
+        &linux_block_profile.disk_read_command_bytes[bucket],
+        byte_count,
+        __ATOMIC_RELAXED);
+    const uint64_t command_index = __atomic_fetch_add(
+        &linux_block_profile.disk_read_command_count,
+        1u,
+        __ATOMIC_RELAXED);
+    const size_t slot = (size_t)(command_index % 64u);
+    __atomic_store_n(
+        &linux_block_profile.disk_read_command_sectors[slot],
+        sector,
+        __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &linux_block_profile.disk_read_command_lengths[slot],
+        byte_count,
+        __ATOMIC_RELAXED);
+#else
+    (void)sector;
+    (void)byte_count;
+#endif
+}
+
+void kb_linux_block_profile_record_write_command(
+    uint64_t sector,
+    size_t byte_count,
+    uint32_t flags)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    size_t bucket = 7u;
+    switch (byte_count) {
+    case 4u * 1024u: bucket = 0u; break;
+    case 16u * 1024u: bucket = 1u; break;
+    case 32u * 1024u: bucket = 2u; break;
+    case 64u * 1024u: bucket = 3u; break;
+    case 128u * 1024u: bucket = 4u; break;
+    case 256u * 1024u: bucket = 5u; break;
+    case 512u * 1024u: bucket = 6u; break;
+    default: break;
+    }
+    __atomic_fetch_add(
+        &linux_block_profile.disk_write_command_calls[bucket],
+        1u,
+        __ATOMIC_RELAXED);
+    __atomic_fetch_add(
+        &linux_block_profile.disk_write_command_bytes[bucket],
+        byte_count,
+        __ATOMIC_RELAXED);
+    const uint64_t command_index = __atomic_fetch_add(
+        &linux_block_profile.disk_write_command_count,
+        1u,
+        __ATOMIC_RELAXED);
+    const size_t slot = (size_t)(command_index % 64u);
+    __atomic_store_n(
+        &linux_block_profile.disk_write_command_sectors[slot],
+        sector,
+        __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &linux_block_profile.disk_write_command_lengths[slot],
+        byte_count,
+        __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &linux_block_profile.disk_write_command_flags[slot],
+        flags,
+        __ATOMIC_RELAXED);
+#else
+    (void)sector;
+    (void)byte_count;
+    (void)flags;
 #endif
 }
 
@@ -544,7 +693,7 @@ static int shim_blk_disk_read_batch(
     {
         return -22;
     }
-    if (ops == NULL || ops->disk_read_batch == NULL || !dma_read_scope.active) {
+    if (ops == NULL || ops->disk_read_batch == NULL) {
         for (size_t i = 0; i < request_count; ++i) {
             const int status = shim_blk_disk_read(
                 ctx,
@@ -557,39 +706,71 @@ static int shim_blk_disk_read_batch(
         }
         return 0;
     }
-    const uintptr_t target_end =
-        dma_read_scope.target_start + dma_read_scope.target_size;
-    if (target_end < dma_read_scope.target_start) {
-        return -95;
+    kb_device_backend_t *backend = kb_shim_current_device_backend();
+    kb_device_t *device = backend == NULL ? NULL :
+        kb_subsystem_dma_default_device(backend);
+    if (backend == NULL || device == NULL) {
+        return -19;
+    }
+    if (dma_read_staging_buffer == NULL) {
+        dma_read_staging_buffer = aligned_alloc(
+            KB_LINUX_DMA_PAGE_SIZE,
+            KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE);
+        if (dma_read_staging_buffer == NULL) {
+            return -12;
+        }
+    }
+    size_t stride = 0;
+    for (size_t i = 0; i < request_count; ++i) {
+        if (requests[i].buffer == NULL || requests[i].byte_count == 0 ||
+            requests[i].byte_count > KB_LINUX_DMA_READ_STAGING_SIZE)
+        {
+            return -22;
+        }
+        if (requests[i].byte_count > stride) {
+            stride = requests[i].byte_count;
+        }
+    }
+    stride = (stride + KB_LINUX_DMA_PAGE_SIZE - 1u) &
+        ~(size_t)(KB_LINUX_DMA_PAGE_SIZE - 1u);
+    if (stride == 0 ||
+        request_count > KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE / stride)
+    {
+        for (size_t i = 0; i < request_count; ++i) {
+            const int status = shim_blk_disk_read(
+                ctx,
+                requests[i].sector,
+                requests[i].buffer,
+                requests[i].byte_count);
+            if (status != 0) {
+                return status;
+            }
+        }
+        return 0;
+    }
+    const int borrowed_window = !dma_read_scope.active;
+    if (borrowed_window &&
+        kb_subsystem_dma_cached_window_begin(
+            backend,
+            device,
+            dma_read_staging_buffer,
+            KB_LINUX_DMA_READ_STAGING_TOTAL_SIZE,
+            KB_DMA_FROM_DEVICE) != KB_OK)
+    {
+        return -5;
     }
     kb_linux_block_read_request_t batch[KB_LINUX_DMA_READ_BATCH_DEPTH];
     for (size_t i = 0; i < request_count; ++i) {
-        const uintptr_t request_start = (uintptr_t)requests[i].buffer;
-        if (requests[i].byte_count == 0 ||
-            requests[i].byte_count > dma_read_scope.staging_size ||
-            request_start > UINTPTR_MAX - requests[i].byte_count ||
-            request_start < dma_read_scope.target_start ||
-            request_start + requests[i].byte_count > target_end)
-        {
-            for (size_t j = 0; j < request_count; ++j) {
-                const int fallback_status = shim_blk_disk_read(
-                    ctx,
-                    requests[j].sector,
-                    requests[j].buffer,
-                    requests[j].byte_count);
-                if (fallback_status != 0) {
-                    return fallback_status;
-                }
-            }
-            return 0;
-        }
         batch[i].sector = requests[i].sector;
-        batch[i].buffer = dma_read_scope.staging_buffer +
-            i * KB_LINUX_DMA_READ_STAGING_SIZE;
+        batch[i].buffer = dma_read_staging_buffer +
+            i * stride;
         batch[i].byte_count = requests[i].byte_count;
     }
     const int status = ops->disk_read_batch(queue, batch, request_count);
     if (status != 0) {
+        if (borrowed_window) {
+            kb_subsystem_dma_cached_window_end();
+        }
         return status;
     }
     for (size_t i = 0; i < request_count; ++i) {
@@ -599,6 +780,9 @@ static int shim_blk_disk_read_batch(
         kb_subsystem_dma_window_profile_record_staging(
             requests[i].byte_count,
             copy_end >= copy_start ? copy_end - copy_start : 0);
+    }
+    if (borrowed_window) {
+        kb_subsystem_dma_cached_window_end();
     }
     return 0;
 }
@@ -613,6 +797,127 @@ static int shim_blk_disk_write(void *ctx, uint64_t sector, const void *buffer, s
     return ops->disk_write(queue, sector, buffer, byte_count);
 }
 
+static int shim_blk_disk_write_flags(
+    void *ctx,
+    uint64_t sector,
+    const void *buffer,
+    size_t byte_count,
+    uint32_t flags)
+{
+    void *queue = NULL;
+    const kb_linux_block_driver_ops_t *ops =
+        block_driver_ops_for_disk(ctx, &queue);
+    if (ops == NULL ||
+        (flags & ~KB_BLOCK_DISK_WRITE_FUA) != 0 ||
+        ops->disk_write == NULL)
+    {
+        return -95;
+    }
+    if ((flags & KB_BLOCK_DISK_WRITE_FUA) != 0) {
+        kb_block_queue_limits_t limits;
+        if (ops->disk_write_flags != NULL &&
+            kb_block_subsystem_queue_limits(queue, &limits) == 0 &&
+            limits.fua)
+        {
+            return ops->disk_write_flags(
+                queue,
+                sector,
+                buffer,
+                byte_count,
+                KB_LINUX_BLOCK_WRITE_FUA);
+        }
+    }
+    int status = ops->disk_write(queue, sector, buffer, byte_count);
+    if (status == 0 && (flags & KB_BLOCK_DISK_WRITE_FUA) != 0) {
+        status = ops->disk_flush == NULL ? -95 : ops->disk_flush(queue);
+    }
+    return status;
+}
+
+static int shim_blk_disk_write_batch(
+    void *ctx,
+    const kb_block_disk_write_request_t *requests,
+    size_t request_count)
+{
+    enum { KB_LINUX_BLOCK_WRITE_BATCH_MAX = 128 };
+    void *queue = NULL;
+    const kb_linux_block_driver_ops_t *ops = block_driver_ops_for_disk(ctx, &queue);
+    if (requests == NULL || request_count < 2 ||
+        request_count > KB_LINUX_BLOCK_WRITE_BATCH_MAX)
+    {
+        return -22;
+    }
+    if (ops == NULL || ops->disk_write_batch == NULL) {
+        for (size_t i = 0; i < request_count; ++i) {
+            const int status = shim_blk_disk_write(
+                ctx,
+                requests[i].sector,
+                requests[i].buffer,
+                requests[i].byte_count);
+            if (status != 0) {
+                return status;
+            }
+        }
+        return 0;
+    }
+    kb_linux_block_write_request_t batch[KB_LINUX_BLOCK_WRITE_BATCH_MAX];
+    int can_stage = 1;
+    size_t staged_bytes = 0;
+    for (size_t i = 0; i < request_count; ++i) {
+        if (requests[i].buffer == NULL || requests[i].byte_count == 0 ||
+            requests[i].byte_count >
+                KB_LINUX_DMA_WRITE_STAGING_SIZE - staged_bytes)
+        {
+            can_stage = 0;
+            break;
+        }
+        staged_bytes += requests[i].byte_count;
+    }
+    kb_device_backend_t *backend = can_stage ?
+        kb_shim_current_device_backend() : NULL;
+    kb_device_t *device = backend == NULL ? NULL :
+        kb_subsystem_dma_default_device(backend);
+    if (backend != NULL && device != NULL) {
+        if (dma_write_staging_buffer == NULL) {
+            dma_write_staging_buffer = kb_subsystem_dma_alloc(
+                backend,
+                device,
+                KB_LINUX_DMA_WRITE_STAGING_SIZE,
+                &dma_write_staging_handle);
+        }
+        if (dma_write_staging_buffer != NULL) {
+            size_t offset = 0;
+            for (size_t i = 0; i < request_count; ++i) {
+                memcpy(
+                    dma_write_staging_buffer + offset,
+                    requests[i].buffer,
+                    requests[i].byte_count);
+                batch[i].sector = requests[i].sector;
+                batch[i].buffer = dma_write_staging_buffer + offset;
+                batch[i].byte_count = requests[i].byte_count;
+                offset += requests[i].byte_count;
+            }
+            return ops->disk_write_batch(queue, batch, request_count);
+        }
+    }
+    for (size_t i = 0; i < request_count; ++i) {
+        batch[i].sector = requests[i].sector;
+        batch[i].buffer = requests[i].buffer;
+        batch[i].byte_count = requests[i].byte_count;
+    }
+    return ops->disk_write_batch(queue, batch, request_count);
+}
+
+static int shim_blk_disk_flush(void *ctx)
+{
+    void *queue = NULL;
+    const kb_linux_block_driver_ops_t *ops = block_driver_ops_for_disk(ctx, &queue);
+    if (ops == NULL) {
+        return -19;
+    }
+    return ops->disk_flush == NULL ? 0 : ops->disk_flush(queue);
+}
+
 static void shim_blk_disk_attach_io(void *disk)
 {
     void *queue = NULL;
@@ -622,6 +927,9 @@ static void shim_blk_disk_attach_io(void *disk)
     }
     kb_block_subsystem_disk_set_io(disk, disk, shim_blk_disk_read, shim_blk_disk_write);
     kb_block_subsystem_disk_set_read_batch(disk, shim_blk_disk_read_batch);
+    kb_block_subsystem_disk_set_write_batch(disk, shim_blk_disk_write_batch);
+    kb_block_subsystem_disk_set_write_flags(disk, shim_blk_disk_write_flags);
+    kb_block_subsystem_disk_set_flush(disk, shim_blk_disk_flush);
 }
 
 void *kb_linux_block_tag_set_driver_data(void *tag_set)
@@ -711,6 +1019,10 @@ static shim_linux_request_t *shim_blk_request_alloc(
     }
 
     shim_blk_request_init(request, queue, ctrl, driver_data, op, owns_queue, driver_ops);
+    if (request->tag == UINT32_MAX) {
+        free(request);
+        return NULL;
+    }
     return request;
 }
 
@@ -1004,7 +1316,8 @@ uint8_t kb_linux_block_request_generation(const void *request)
 int kb_linux_block_request_completed(const void *request)
 {
     const shim_linux_request_t *rq = request;
-    return rq != NULL && rq->completed != 0;
+    return rq != NULL &&
+        __atomic_load_n(&rq->completed, __ATOMIC_ACQUIRE) != 0;
 }
 
 unsigned int kb_linux_block_request_end_status(const void *request)
@@ -1030,8 +1343,8 @@ void kb_linux_block_request_mark_complete(void *request, unsigned int status)
     }
 
     shim_linux_request_t *rq = request;
-    rq->completed = 1;
     rq->end_status = status;
+    __atomic_store_n(&rq->completed, 1u, __ATOMIC_RELEASE);
     if (trace_block_enabled()) {
         fprintf(stderr, "kobox blk-mq: request complete request=%p status=0x%x\n", request, status);
     }
@@ -1124,7 +1437,18 @@ int kb_linux_block_request_map_dma_pages(
         return -19;
     }
 
-    const kb_status_t dma_status = kb_subsystem_dma_map_pages(
+    kb_status_t dma_status = kb_subsystem_dma_preallocated_pages(
+        device, cpu_addr, length, out_page_dma, out_capacity);
+    if (dma_status == KB_OK) {
+        rq->dma_addr = out_page_dma[0];
+        rq->dma_len = length;
+        rq->dma_dir = direction;
+        rq->dma_backend = backend;
+        rq->dma_device = device;
+        rq->dma_preallocated = 1;
+        return 0;
+    }
+    dma_status = kb_subsystem_dma_map_pages(
         backend,
         device,
         cpu_addr,
@@ -1161,7 +1485,7 @@ void kb_linux_block_request_unmap_dma(void *request)
     if (rq == NULL) {
         return;
     }
-    if (rq->dma_len != 0) {
+    if (rq->dma_len != 0 && !rq->dma_preallocated) {
         kb_subsystem_dma_unmap(
             rq->dma_backend,
             rq->dma_device,
@@ -1173,6 +1497,7 @@ void kb_linux_block_request_unmap_dma(void *request)
     rq->dma_len = 0;
     rq->dma_backend = NULL;
     rq->dma_device = NULL;
+    rq->dma_preallocated = 0;
 }
 
 int kb_linux_block_request_map_owned_aux_dma(
@@ -1232,6 +1557,7 @@ int kb_linux_block_request_map_cached_aux_dma(
 
     kb_linux_cached_aux_dma_t *entry = NULL;
     const uint64_t profile_cache_start = KB_LINUX_BLOCK_PROFILE_BEGIN();
+    cached_aux_dma_lock_acquire();
     for (size_t i = 0; i < KB_LINUX_CACHED_AUX_DMA_MAX; i++) {
         if (cached_aux_dma[i].owner == NULL &&
             cached_aux_dma[i].cpu_addr != NULL &&
@@ -1276,6 +1602,7 @@ int kb_linux_block_request_map_cached_aux_dma(
             0);
     }
     if (entry == NULL) {
+        cached_aux_dma_lock_release();
         return -12;
     }
 
@@ -1290,6 +1617,7 @@ int kb_linux_block_request_map_cached_aux_dma(
     rq->prp_list_device = device;
     rq->prp_list_cached = 1;
     *out_dma = entry->dma_addr;
+    cached_aux_dma_lock_release();
     return 0;
 }
 
@@ -1300,6 +1628,7 @@ void kb_linux_block_request_unmap_owned_aux_dma(void *request)
         return;
     }
     if (rq->prp_list_cached) {
+        cached_aux_dma_lock_acquire();
         for (size_t i = 0; i < KB_LINUX_CACHED_AUX_DMA_MAX; i++) {
             if (cached_aux_dma[i].owner == rq &&
                 cached_aux_dma[i].cpu_addr == rq->prp_list_cpu &&
@@ -1309,6 +1638,7 @@ void kb_linux_block_request_unmap_owned_aux_dma(void *request)
                 break;
             }
         }
+        cached_aux_dma_lock_release();
     } else if (rq->prp_list_dma != 0 && rq->prp_list_len != 0) {
         kb_subsystem_dma_unmap(
             rq->prp_list_backend,
@@ -1349,7 +1679,7 @@ void kb_blk_mq_start_request(void *request)
         return;
     }
     rq->started = 1;
-    rq->completed = 0;
+    __atomic_store_n(&rq->completed, 0u, __ATOMIC_RELEASE);
     rq->end_status = 0;
 }
 
@@ -1534,7 +1864,7 @@ int kb_blk_complete_rq(void *request)
             0);
         return result;
     }
-    if (rq->completed) {
+    if (kb_linux_block_request_completed(rq)) {
         return rq->end_status == 0 ? 0 : -5;
     }
     return -95;

@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,16 +38,30 @@ typedef struct kb_kthread_record {
     void *task;
     int (*threadfn)(void *data);
     void *data;
+    kb_module_t *owner;
+    void *stack;
+    size_t stack_size;
+    jmp_buf context;
+    uintptr_t saved_context_rsp;
+    uintptr_t saved_context_rip;
+    uint64_t context_generation;
     int node;
     int activated;
+    int wait_prepared;
+    int wake_pending;
+    int started;
+    int finished;
+    int stop_requested;
+    int result;
     char name[64];
     struct kb_kthread_record *next;
 } kb_kthread_record_t;
 
-typedef struct kb_jbd2_journal_record {
-    void *journal;
-    struct kb_jbd2_journal_record *next;
-} kb_jbd2_journal_record_t;
+typedef struct kb_kthread_dispatch_frame {
+    kb_kthread_record_t *record;
+    jmp_buf context;
+    struct kb_kthread_dispatch_frame *previous;
+} kb_kthread_dispatch_frame_t;
 
 typedef struct kb_pending_pgrp_signal {
     void *pgrp;
@@ -72,6 +87,7 @@ typedef struct kb_stub_pid {
     int nr;
     uint32_t reserved1;
     void *task;
+    uint64_t last_used;
 } kb_stub_pid_t;
 
 typedef struct kb_sysctl_registration {
@@ -85,7 +101,8 @@ typedef struct kb_sysctl_registration {
 
 static kb_ida_record_t *ida_records;
 static kb_kthread_record_t *kthread_records;
-static kb_jbd2_journal_record_t *jbd2_journal_records;
+static kb_kthread_record_t *active_kthread;
+static kb_kthread_dispatch_frame_t *kthread_dispatch_frame;
 static kb_sysctl_registration_t *sysctl_registrations;
 static kb_pending_pgrp_signal_t pending_pgrp_signals[64];
 static kb_pending_task_signal_t pending_task_signals[64];
@@ -93,6 +110,7 @@ static kb_stub_pid_t stub_pids[64];
 static uint64_t sysctl_registration_sequence;
 static uint64_t pending_pgrp_signal_sequence;
 static uint64_t pending_task_signal_sequence;
+static uint64_t stub_pid_use_sequence;
 
 enum {
     KB_DRM_DEVICE_BYTES = 0x610,
@@ -192,9 +210,8 @@ static void kb_mark_task_signal_pending(void *task)
     memcpy((uint8_t *)task + KB_STUB_TASK_FLAGS_OFFSET, &flags, sizeof(flags));
 }
 
-void kb_clear_current_signal_pending(void)
+static void kb_clear_task_signal_pending(void *task)
 {
-    void *task = kb_loader_module_current_task(kb_loader_active_module());
     if (task == NULL) {
         return;
     }
@@ -202,6 +219,12 @@ void kb_clear_current_signal_pending(void)
     memcpy(&flags, (const uint8_t *)task + KB_STUB_TASK_FLAGS_OFFSET, sizeof(flags));
     flags &= ~(1ul << KB_STUB_TIF_SIGPENDING_BIT);
     memcpy((uint8_t *)task + KB_STUB_TASK_FLAGS_OFFSET, &flags, sizeof(flags));
+}
+
+void kb_clear_current_signal_pending(void)
+{
+    kb_clear_task_signal_pending(
+        kb_loader_module_current_task(kb_loader_active_module()));
 }
 
 static int trace_dma_enabled(void)
@@ -237,12 +260,9 @@ static uint64_t page_phys_from_struct_page(void *page)
 }
 
 enum {
-    KB_JBD2_JOURNAL_SUPERBLOCK_OFFSET = 0x3b0,
-    KB_JBD2_JOURNAL_COMMIT_SEQUENCE_OFFSET = 0x428,
-    KB_JBD2_JOURNAL_COMMIT_REQUEST_OFFSET = 0x42c,
-    KB_JBD2_JOURNAL_TASK_OFFSET = 0x440,
     KB_PERCPU_COUNTER_STRIDE = 0x28,
     KB_PERCPU_COUNTER_COUNT_OFFSET = 0x8,
+    KB_PERCPU_COUNTER_POINTER_OFFSET = 0x20,
     KB_KFIFO_IN_OFFSET = 0,
     KB_KFIFO_OUT_OFFSET = 4,
     KB_KFIFO_MASK_OFFSET = 8,
@@ -253,6 +273,23 @@ enum {
 void kb_noop_stub(void)
 {
 }
+
+/*
+ * A Linux static-call nop is an instruction-level no-op: callers may keep a
+ * value in any volatile register across it.  A normal C function is not an
+ * equivalent replacement because its generated body may clobber those
+ * registers (notably %rax in jbd2_journal_grab_journal_head()).
+ */
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((naked)) void kb_static_call_preserve_noop(void)
+{
+    __asm__ volatile("ret");
+}
+#else
+void kb_static_call_preserve_noop(void)
+{
+}
+#endif
 
 const int kb_sysctl_vals[] = {0, 1, 2, 3, 4, 100, 200, 1000, 3000, INT32_MAX, 65535, -1};
 
@@ -711,9 +748,9 @@ static void kb_drm_copy_version_string(size_t *length, char *destination, const 
 
 long kb_drm_ioctl(void *linux_file, unsigned int command, unsigned long argument)
 {
+    static const unsigned int DRM_IOCTL_VERSION = 0xc0406400u;
+    static const unsigned int DRM_IOCTL_GET_CAP = 0xc010640cu;
     enum {
-        DRM_IOCTL_VERSION = 0xc0406400u,
-        DRM_IOCTL_GET_CAP = 0xc010640cu,
         DRM_CAP_DUMB_BUFFER = 1,
     };
     kb_drm_file_record_t *record = kb_drm_find_file(linux_file);
@@ -869,9 +906,9 @@ int kb_take_pending_pgrp_signal(uint64_t since, int *out_pgrp, int *out_sig, uin
     *out_sig = 0;
     *out_sequence = pending_pgrp_signal_sequence;
 
-    const kb_pending_pgrp_signal_t *selected = NULL;
+    kb_pending_pgrp_signal_t *selected = NULL;
     for (size_t i = 0; i < pending_pgrp_signal_count(); i++) {
-        const kb_pending_pgrp_signal_t *candidate = &pending_pgrp_signals[i];
+        kb_pending_pgrp_signal_t *candidate = &pending_pgrp_signals[i];
         if (candidate->sequence == 0 || candidate->sequence <= since) {
             continue;
         }
@@ -891,6 +928,8 @@ int kb_take_pending_pgrp_signal(uint64_t since, int *out_pgrp, int *out_sig, uin
     *out_pgrp = record->nr;
     *out_sig = selected->sig;
     *out_sequence = selected->sequence;
+    kb_clear_task_signal_pending(record->task);
+    memset(selected, 0, sizeof(*selected));
     return 1;
 }
 
@@ -1099,6 +1138,7 @@ void *kb_find_vpid(int nr)
     }
     for (size_t i = 0; i < sizeof(stub_pids) / sizeof(stub_pids[0]); i++) {
         if (stub_pids[i].nr == nr) {
+            stub_pids[i].last_used = ++stub_pid_use_sequence;
             if (stub_pids[i].task == NULL) {
                 stub_pids[i].task = kb_loader_module_current_task(kb_loader_active_module());
             }
@@ -1112,11 +1152,83 @@ void *kb_find_vpid(int nr)
                 .level = 0,
                 .nr = nr,
                 .task = kb_loader_module_current_task(kb_loader_active_module()),
+                .last_used = ++stub_pid_use_sequence,
             };
             return &stub_pids[i];
         }
     }
+
+    /*
+     * find_vpid() itself does not acquire a reference.  Keep a bounded cache
+     * for the synthetic pid objects and recycle only an old registry-only
+     * entry.  Linux-held tty/session references raise count through get_pid()
+     * and are released through kb_put_pid(), so they are never selected here.
+     * A task PID link is an uncounted Linux reference, so every link must also
+     * have moved to a newer record before an entry is eligible for reuse.
+     */
+    kb_stub_pid_t *reclaim = NULL;
+    for (size_t i = 0; i < sizeof(stub_pids) / sizeof(stub_pids[0]); i++) {
+        kb_stub_pid_t *candidate = &stub_pids[i];
+        if (__atomic_load_n(&candidate->count, __ATOMIC_RELAXED) != 1) {
+            continue;
+        }
+        int linked = 0;
+        for (size_t type = 0; type < KB_STUB_PID_TYPE_COUNT; type++) {
+            if (candidate->tasks[type] != NULL) {
+                linked = 1;
+                break;
+            }
+        }
+        if (linked) {
+            continue;
+        }
+        int pending = 0;
+        for (size_t signal_index = 0;
+             signal_index < pending_pgrp_signal_count();
+             signal_index++)
+        {
+            if (pending_pgrp_signals[signal_index].sequence != 0 &&
+                pending_pgrp_signals[signal_index].pgrp == candidate)
+            {
+                pending = 1;
+                break;
+            }
+        }
+        if (pending || (reclaim != NULL && reclaim->last_used <= candidate->last_used)) {
+            continue;
+        }
+        reclaim = candidate;
+    }
+    if (reclaim != NULL) {
+        *reclaim = (kb_stub_pid_t){
+            .count = 1,
+            .level = 0,
+            .nr = nr,
+            .task = kb_loader_module_current_task(kb_loader_active_module()),
+            .last_used = ++stub_pid_use_sequence,
+        };
+        return reclaim;
+    }
     return NULL;
+}
+
+void kb_put_pid(void *pid)
+{
+    kb_stub_pid_t *record = (kb_stub_pid_t *)pid;
+    if (record == NULL) {
+        return;
+    }
+    int count = __atomic_load_n(&record->count, __ATOMIC_RELAXED);
+    while (count > 1 &&
+           !__atomic_compare_exchange_n(
+               &record->count,
+               &count,
+               count - 1,
+               0,
+               __ATOMIC_RELEASE,
+               __ATOMIC_RELAXED))
+    {
+    }
 }
 
 void *kb_pid_task(void *pid, int type)
@@ -1326,9 +1438,26 @@ void kb_memcpy_and_pad(void *dest, size_t dest_len, const void *src, size_t coun
 
 int64_t kb_vfs_setpos(void *file, int64_t offset, int64_t maxsize)
 {
-    (void)file;
-    if (offset < 0 || offset > maxsize) {
+    enum {
+        FILE_MODE_OFFSET = 0x0c,
+        FILE_VERSION_OFFSET = 0x30,
+        FILE_POSITION_OFFSET = 0x70,
+        FMODE_UNSIGNED_OFFSET = 0x2000,
+    };
+    if (file == NULL) {
         return -22;
+    }
+    uint32_t mode = 0;
+    memcpy(&mode, (const unsigned char *)file + FILE_MODE_OFFSET, sizeof(mode));
+    if ((offset < 0 && (mode & FMODE_UNSIGNED_OFFSET) == 0) || offset > maxsize) {
+        return -22;
+    }
+    int64_t current = 0;
+    memcpy(&current, (const unsigned char *)file + FILE_POSITION_OFFSET, sizeof(current));
+    if (current != offset) {
+        memcpy((unsigned char *)file + FILE_POSITION_OFFSET, &offset, sizeof(offset));
+        const uint64_t version = 0;
+        memcpy((unsigned char *)file + FILE_VERSION_OFFSET, &version, sizeof(version));
     }
     return offset;
 }
@@ -1367,125 +1496,6 @@ static int low_or_error_ptr(const void *ptr)
 {
     uintptr_t value = (uintptr_t)ptr;
     return value < 4096u || value >= UINTPTR_MAX - 4095u;
-}
-
-static int jbd2_trace_enabled(void)
-{
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached;
-    }
-    const char *value = getenv("KOBOX_TRACE_JBD2");
-    cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
-    return cached;
-}
-
-static void register_jbd2_journal(void *journal)
-{
-    if (low_or_error_ptr(journal)) {
-        return;
-    }
-    for (kb_jbd2_journal_record_t *record = jbd2_journal_records; record != NULL; record = record->next) {
-        if (record->journal == journal) {
-            return;
-        }
-    }
-    kb_jbd2_journal_record_t *record = calloc(1, sizeof(*record));
-    if (record == NULL) {
-        return;
-    }
-    record->journal = journal;
-    record->next = jbd2_journal_records;
-    jbd2_journal_records = record;
-    if (jbd2_trace_enabled()) {
-        fprintf(stderr, "kobox jbd2: register journal=%p\n", journal);
-    }
-}
-
-void kb_jbd2_progress_registered_journals(void)
-{
-    for (kb_jbd2_journal_record_t *record = jbd2_journal_records; record != NULL; record = record->next) {
-        unsigned char *journal = record->journal;
-        if (low_or_error_ptr(journal)) {
-            continue;
-        }
-        uint32_t commit_sequence = 0;
-        uint32_t commit_request = 0;
-        memcpy(&commit_sequence, journal + KB_JBD2_JOURNAL_COMMIT_SEQUENCE_OFFSET, sizeof(commit_sequence));
-        memcpy(&commit_request, journal + KB_JBD2_JOURNAL_COMMIT_REQUEST_OFFSET, sizeof(commit_request));
-        if ((int32_t)(commit_request - commit_sequence) <= 0) {
-            continue;
-        }
-        memcpy(journal + KB_JBD2_JOURNAL_COMMIT_SEQUENCE_OFFSET, &commit_request, sizeof(commit_request));
-        if (jbd2_trace_enabled()) {
-            fprintf(stderr,
-                "kobox jbd2: progress journal=%p commit_sequence=%u commit_request=%u\n",
-                (void *)journal,
-                commit_sequence,
-                commit_request);
-        }
-    }
-}
-
-void *kb_jbd2_journal_init_stub(void)
-{
-    void *journal = kb_kzalloc(2048, 0);
-    void *superblock = kb_kzalloc(1024, 0);
-    if (journal != NULL && superblock != NULL) {
-        uint32_t compatible_features = 0x100u;
-        ((unsigned char *)journal)[0] = 0x20u;
-        memcpy((unsigned char *)superblock + 0x30, &compatible_features, sizeof(compatible_features));
-        memcpy((unsigned char *)journal + KB_JBD2_JOURNAL_SUPERBLOCK_OFFSET, &superblock, sizeof(superblock));
-    } else {
-        kb_kfree(journal);
-        kb_kfree(superblock);
-        journal = NULL;
-    }
-    register_jbd2_journal(journal);
-    if (jbd2_trace_enabled()) {
-        fprintf(stderr, "kobox jbd2: init journal=%p superblock=%p\n", journal, superblock);
-    }
-    return journal;
-}
-
-void *kb_jbd2_journal_start_stub(void)
-{
-    void *handle = (void *)1;
-    if (jbd2_trace_enabled()) {
-        fprintf(stderr, "kobox jbd2: start handle=%p\n", handle);
-    }
-    return handle;
-}
-
-int kb_jbd2_journal_stop_stub(void *handle)
-{
-    if (!low_or_error_ptr(handle)) {
-        kb_kfree(handle);
-    }
-    if (jbd2_trace_enabled()) {
-        fprintf(stderr, "kobox jbd2: stop handle=%p\n", handle);
-    }
-    return 0;
-}
-
-int kb_jbd2_journal_blocks_per_page_stub(void)
-{
-    return 1;
-}
-
-void kb_jbd2_journal_destroy_stub(void *journal)
-{
-    if (!low_or_error_ptr(journal)) {
-        void *superblock = NULL;
-        memcpy(&superblock, (unsigned char *)journal + KB_JBD2_JOURNAL_SUPERBLOCK_OFFSET, sizeof(superblock));
-        if (!low_or_error_ptr(superblock)) {
-            kb_kfree(superblock);
-        }
-        kb_kfree(journal);
-    }
-    if (jbd2_trace_enabled()) {
-        fprintf(stderr, "kobox jbd2: destroy journal=%p\n", journal);
-    }
 }
 
 int kb_list_add_valid_or_report(void *new_entry, void *prev, void *next)
@@ -1565,18 +1575,264 @@ void kb_list_del(void *entry)
     memcpy((unsigned char *)entry + sizeof(void *), &entry, sizeof(entry));
 }
 
+enum {
+    KB_KTHREAD_TASK_BYTES = 4096,
+    KB_KTHREAD_STACK_BYTES = 256 * 1024,
+};
+
+static void kb_kthread_finish_active(int result) __attribute__((noreturn));
+
+static void kb_kthread_finish_active(int result)
+{
+    kb_kthread_dispatch_frame_t *frame = kthread_dispatch_frame;
+    if (frame != NULL && frame->record != NULL) {
+        frame->record->result = result;
+        frame->record->finished = 1;
+        frame->record->activated = 0;
+    }
+    if (frame == NULL) {
+        abort();
+    }
+    longjmp(frame->context, 1);
+}
+
+static void kb_kthread_bootstrap(kb_kthread_record_t *record) __attribute__((noreturn));
+
+static void kb_kthread_bootstrap(kb_kthread_record_t *record)
+{
+    if (record == NULL || record->threadfn == NULL) {
+        kb_kthread_finish_active(-22);
+    }
+    const int result = record->threadfn(record->data);
+    kb_kthread_finish_active(result);
+}
+
+static void kb_kthread_start_on_stack(kb_kthread_record_t *record) __attribute__((noreturn, noinline));
+
+static void kb_kthread_start_on_stack(kb_kthread_record_t *record)
+{
+#if defined(__x86_64__) && !defined(_MSC_VER)
+    uintptr_t stack_top = (uintptr_t)record->stack + record->stack_size;
+    stack_top &= ~(uintptr_t)15u;
+    void (*entry)(kb_kthread_record_t *) = kb_kthread_bootstrap;
+    __asm__ volatile(
+        "mov %[stack_top], %%rsp\n\t"
+        "mov %[record], %%rdi\n\t"
+        "call *%[entry]\n\t"
+        "ud2\n\t"
+        :
+        : [stack_top] "r"(stack_top),
+          [record] "r"(record),
+          [entry] "r"(entry)
+        : "memory", "rdi");
+    __builtin_unreachable();
+#else
+    (void)record;
+    kb_kthread_finish_active(-95);
+#endif
+}
+
+int kb_kthread_yield_current(void)
+{
+    if (active_kthread == NULL || kthread_dispatch_frame == NULL ||
+        kb_loader_current_task() != active_kthread->task)
+    {
+        return 0;
+    }
+    if (setjmp(active_kthread->context) == 0) {
+        const uintptr_t *context_words =
+            (const uintptr_t *)(const void *)active_kthread->context;
+        active_kthread->saved_context_rsp = context_words[6];
+        active_kthread->saved_context_rip = context_words[7];
+        active_kthread->context_generation++;
+        longjmp(kthread_dispatch_frame->context, 1);
+    }
+    return 1;
+}
+
+void kb_schedule(void)
+{
+    if (active_kthread == NULL || kthread_dispatch_frame == NULL ||
+        kb_loader_current_task() != active_kthread->task)
+    {
+        kb_run_deferred_work();
+        return;
+    }
+
+    /*
+     * schedule() only blocks a task after a wait primitive changed its
+     * state away from TASK_RUNNING.  Kobox does not expose Linux task state
+     * to the host scheduler, so prepare_to_wait*() records that transition
+     * explicitly.  A plain schedule() remains a cooperative yield.
+     *
+     * A wake between prepare_to_wait*() and schedule() must not be lost.
+     * In that case Linux would observe TASK_RUNNING and schedule() may return
+     * immediately, which is exactly what the wake_pending branch models.
+     */
+    if (active_kthread->wait_prepared) {
+        if (active_kthread->wake_pending) {
+            active_kthread->wait_prepared = 0;
+            active_kthread->wake_pending = 0;
+            return;
+        }
+        active_kthread->activated = 0;
+    }
+
+    (void)kb_kthread_yield_current();
+    active_kthread->wait_prepared = 0;
+    active_kthread->wake_pending = 0;
+}
+
+void *kb_kthread_current_task(void)
+{
+    return kb_loader_current_task();
+}
+
+void kb_kthread_prepare_wait(void *task)
+{
+    for (kb_kthread_record_t *record = kthread_records; record != NULL; record = record->next) {
+        if (record->task == task) {
+            record->wait_prepared = 1;
+            record->wake_pending = 0;
+            return;
+        }
+    }
+}
+
+void kb_kthread_finish_wait(void *task)
+{
+    for (kb_kthread_record_t *record = kthread_records; record != NULL; record = record->next) {
+        if (record->task == task) {
+            record->wait_prepared = 0;
+            record->wake_pending = 0;
+            return;
+        }
+    }
+}
+
+static void kb_kthread_run_one(kb_kthread_record_t *record)
+{
+    if (record == NULL || !record->activated || record->finished) {
+        return;
+    }
+    for (kb_kthread_dispatch_frame_t *frame = kthread_dispatch_frame;
+         frame != NULL;
+         frame = frame->previous)
+    {
+        if (frame->record == record) {
+            return;
+        }
+    }
+    void *previous_task = kb_loader_current_task();
+    kb_module_t *previous_module = kb_loader_active_module();
+    kb_kthread_record_t *previous_active = active_kthread;
+    kb_kthread_dispatch_frame_t frame = {
+        .record = record,
+        .previous = kthread_dispatch_frame,
+    };
+    const unsigned long kernel_gs =
+        kb_module_kernel_gs_for_address((const void *)record->threadfn);
+    unsigned long old_gs = 0;
+    const int has_gs = kernel_gs != 0 &&
+        kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
+    if (kernel_gs != 0 && !has_gs) {
+        record->result = -95;
+        record->finished = 1;
+        record->activated = 0;
+        return;
+    }
+    active_kthread = record;
+    kthread_dispatch_frame = &frame;
+    kb_loader_set_current_task_for_all_modules(record->task);
+    kb_loader_set_active_module(record->owner);
+    if (setjmp(frame.context) == 0) {
+        if (!record->started) {
+            record->started = 1;
+            kb_kthread_start_on_stack(record);
+        }
+        const uintptr_t *context_words =
+            (const uintptr_t *)(const void *)record->context;
+        if (record->context_generation == 0 ||
+            context_words[6] != record->saved_context_rsp ||
+            context_words[7] != record->saved_context_rip)
+        {
+            fprintf(
+                stderr,
+                "kobox kthread: corrupt resume context name=%s record=%p task=%p "
+                "threadfn=%p generation=%llu rsp=%p expected_rsp=%p "
+                "rip=%p expected_rip=%p\n",
+                record->name,
+                (void *)record,
+                record->task,
+                (void *)record->threadfn,
+                (unsigned long long)record->context_generation,
+                (void *)context_words[6],
+                (void *)record->saved_context_rsp,
+                (void *)context_words[7],
+                (void *)record->saved_context_rip);
+            record->result = -14;
+            record->finished = 1;
+            record->activated = 0;
+            longjmp(frame.context, 1);
+        }
+        longjmp(record->context, 1);
+    }
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+    kb_loader_set_active_module(previous_module);
+    kb_loader_set_current_task_for_all_modules(previous_task);
+    kthread_dispatch_frame = frame.previous;
+    active_kthread = previous_active;
+}
+
+void kb_kthread_run_ready(void)
+{
+    for (kb_kthread_record_t *record = kthread_records; record != NULL; record = record->next) {
+        kb_kthread_run_one(record);
+    }
+}
+
+int kb_kthread_should_stop(void)
+{
+    return active_kthread != NULL &&
+        kb_loader_current_task() == active_kthread->task &&
+        active_kthread->stop_requested;
+}
+
+int kb_kthread_stop(void *task)
+{
+    for (kb_kthread_record_t *record = kthread_records; record != NULL; record = record->next) {
+        if (record->task != task) {
+            continue;
+        }
+        record->stop_requested = 1;
+        record->activated = 1;
+        for (unsigned int i = 0; i < 1024 && !record->finished; ++i) {
+            kb_kthread_run_one(record);
+        }
+        return record->finished ? record->result : -16;
+    }
+    return -22;
+}
+
 void *kb_kthread_create_on_node(int (*threadfn)(void *data), void *data, int node, const char *namefmt, ...)
 {
     kb_kthread_record_t *record = calloc(1, sizeof(*record));
-    void *task = calloc(1, 64);
-    if (record == NULL || task == NULL) {
+    void *task = kb_loader_clone_execution_task();
+    void *stack = calloc(1, KB_KTHREAD_STACK_BYTES);
+    if (record == NULL || task == NULL || stack == NULL) {
         free(record);
         free(task);
+        free(stack);
         return NULL;
     }
     record->task = task;
     record->threadfn = threadfn;
     record->data = data;
+    record->owner = kb_module_find_owner_for_address((const void *)threadfn);
+    record->stack = stack;
+    record->stack_size = KB_KTHREAD_STACK_BYTES;
     record->node = node;
     if (namefmt != NULL) {
         va_list ap;
@@ -1595,18 +1851,10 @@ int kb_wake_up_process(void *task)
         if (record->task != task) {
             continue;
         }
-        record->activated = 1;
-        /*
-         * jbd2's thread function records current in journal->j_task before
-         * entering its scheduler loop. The runtime does not yet host a real
-         * kernel thread, so expose the same started state without running the
-         * endless journal daemon body.
-         */
-        if (record->data != NULL && strncmp(record->name, "jbd2/", 5) == 0) {
-            void *current = task;
-            memcpy((unsigned char *)record->data + KB_JBD2_JOURNAL_TASK_OFFSET, &current, sizeof(current));
-            register_jbd2_journal(record->data);
+        if (record->wait_prepared) {
+            record->wake_pending = 1;
         }
+        record->activated = 1;
         return 1;
     }
     return task != NULL ? 1 : 0;
@@ -1982,17 +2230,44 @@ int kb_percpu_counter_init_many_stub(void *counters, long amount, unsigned int b
 {
     (void)batch;
     (void)key;
-    if (counters != NULL) {
-        for (unsigned int i = 0; i < count; i++) {
-            int64_t value = (int64_t)amount;
-            uint8_t *counter = (uint8_t *)counters + (size_t)i * KB_PERCPU_COUNTER_STRIDE;
-            memcpy(counter + KB_PERCPU_COUNTER_COUNT_OFFSET, &value, sizeof(value));
-        }
+    if (counters == NULL || count == 0) {
+        return -22;
+    }
+    int32_t *local_counts = kb_kzalloc((size_t)count * sizeof(*local_counts), 0);
+    if (local_counts == NULL) {
+        void *none = NULL;
+        memcpy((uint8_t *)counters + KB_PERCPU_COUNTER_POINTER_OFFSET, &none, sizeof(none));
+        return -12;
+    }
+    for (unsigned int i = 0; i < count; i++) {
+        int64_t value = (int64_t)amount;
+        uint8_t *counter = (uint8_t *)counters + (size_t)i * KB_PERCPU_COUNTER_STRIDE;
+        int32_t *local_count = &local_counts[i];
+        memcpy(counter + KB_PERCPU_COUNTER_COUNT_OFFSET, &value, sizeof(value));
+        memcpy(counter + KB_PERCPU_COUNTER_POINTER_OFFSET, &local_count, sizeof(local_count));
     }
     if (crypto_trace_enabled()) {
         fprintf(stderr, "kobox-core: percpu_counter_init_many amount=%ld batch=%u count=%u\n", amount, batch, count);
     }
     return 0;
+}
+
+void kb_percpu_counter_destroy_many(void *counters, unsigned int count)
+{
+    if (counters == NULL || count == 0) {
+        return;
+    }
+    int32_t *local_counts = NULL;
+    memcpy(
+        &local_counts,
+        (const uint8_t *)counters + KB_PERCPU_COUNTER_POINTER_OFFSET,
+        sizeof(local_counts));
+    for (unsigned int i = 0; i < count; i++) {
+        uint8_t *counter = (uint8_t *)counters + (size_t)i * KB_PERCPU_COUNTER_STRIDE;
+        void *none = NULL;
+        memcpy(counter + KB_PERCPU_COUNTER_POINTER_OFFSET, &none, sizeof(none));
+    }
+    kb_kfree(local_counts);
 }
 
 void kb_percpu_counter_add_batch_stub(void *counter, int64_t amount, int32_t batch)
@@ -2030,7 +2305,7 @@ void *kb_crypto_alloc_shash_stub(const char *alg_name, unsigned int type, unsign
     return tfm;
 }
 
-static uint32_t crc32c_update(uint32_t crc, const unsigned char *data, size_t len)
+static uint32_t crc32c_update_software(uint32_t crc, const unsigned char *data, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
@@ -2040,6 +2315,105 @@ static uint32_t crc32c_update(uint32_t crc, const unsigned char *data, size_t le
         }
     }
     return crc;
+}
+
+#if defined(__x86_64__)
+static int crc32c_hardware_available(void)
+{
+    static int cached = -1;
+    int available = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (available >= 0) {
+        return available;
+    }
+    uint32_t eax = 1;
+    uint32_t ebx = 0;
+    uint32_t ecx = 0;
+    uint32_t edx = 0;
+    __asm__ __volatile__(
+        "cpuid"
+        : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    (void)ebx;
+    (void)edx;
+    available = (ecx & (UINT32_C(1) << 20)) != 0;
+    __atomic_store_n(&cached, available, __ATOMIC_RELEASE);
+    return available;
+}
+
+static uint32_t crc32c_update_hardware(uint32_t crc, const unsigned char *data, size_t len)
+{
+    uint64_t accumulator = crc;
+    while (len >= sizeof(uint64_t)) {
+        uint64_t word = 0;
+        memcpy(&word, data, sizeof(word));
+        __asm__ __volatile__("crc32q %1, %0" : "+r"(accumulator) : "rm"(word));
+        data += sizeof(word);
+        len -= sizeof(word);
+    }
+    crc = (uint32_t)accumulator;
+    while (len != 0) {
+        const uint8_t byte = *data++;
+        __asm__ __volatile__("crc32b %1, %0" : "+r"(crc) : "rm"(byte));
+        --len;
+    }
+    return crc;
+}
+#endif
+
+static uint32_t crc32c_update(uint32_t crc, const unsigned char *data, size_t len)
+{
+#if defined(__x86_64__)
+    if (crc32c_hardware_available()) {
+        return crc32c_update_hardware(crc, data, len);
+    }
+#endif
+    return crc32c_update_software(crc, data, len);
+}
+
+uint32_t kb_crc32_le(uint32_t crc, const void *data, size_t len)
+{
+    const unsigned char *bytes = data;
+    if (bytes == NULL && len != 0) {
+        return crc;
+    }
+    for (size_t i = 0; i < len; i++) {
+        crc ^= bytes[i];
+        for (unsigned int bit = 0; bit < 8; bit++) {
+            uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1) ^ (0xedb88320u & mask);
+        }
+    }
+    return crc;
+}
+
+uint32_t kb_crc32_be(uint32_t crc, const void *data, size_t len)
+{
+    const unsigned char *bytes = data;
+    if (bytes == NULL && len != 0) {
+        return crc;
+    }
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint32_t)bytes[i] << 24;
+        for (unsigned int bit = 0; bit < 8; bit++) {
+            uint32_t mask = 0u - (crc >> 31);
+            crc = (crc << 1) ^ (0x04c11db7u & mask);
+        }
+    }
+    return crc;
+}
+
+void *kb_memchr_inv(const void *start, int value, size_t bytes)
+{
+    if (start == NULL) {
+        return NULL;
+    }
+    const unsigned char expected = (unsigned char)value;
+    const unsigned char *cursor = start;
+    for (size_t i = 0; i < bytes; i++) {
+        if (cursor[i] != expected) {
+            return (void *)(cursor + i);
+        }
+    }
+    return NULL;
 }
 
 static int crypto_trace_enabled(void)

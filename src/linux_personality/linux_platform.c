@@ -1,6 +1,6 @@
 #include "kobox/shim.h"
-
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,16 +167,46 @@ void kb_irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set
 
 void kb_raw_spin_lock(void *lock)
 {
-    if (lock != NULL) {
-        uint32_t locked = 1;
-        memcpy(lock, &locked, sizeof(locked));
+    const uintptr_t value = (uintptr_t)lock;
+    if (lock == NULL) {
+        return;
     }
+#if defined(__x86_64__)
+    if (value > UINT64_C(0x00007fffffffffff) &&
+        value < UINT64_C(0xffff800000000000))
+    {
+        fprintf(stderr,
+            "kobox-lock-diag: reject noncanonical lock=%p caller=%p\n",
+            lock,
+            __builtin_return_address(0));
+        return;
+    }
+#endif
+    uint32_t expected;
+    do {
+        expected = 0;
+    } while (!__atomic_compare_exchange_n(
+        (uint32_t *)lock,
+        &expected,
+        1u,
+        0,
+        __ATOMIC_ACQUIRE,
+        __ATOMIC_RELAXED));
 }
 
 int kb_raw_spin_trylock(void *lock)
 {
-    kb_raw_spin_lock(lock);
-    return 1;
+    if (lock == NULL) {
+        return 0;
+    }
+    uint32_t expected = 0;
+    return __atomic_compare_exchange_n(
+        (uint32_t *)lock,
+        &expected,
+        1u,
+        0,
+        __ATOMIC_ACQUIRE,
+        __ATOMIC_RELAXED);
 }
 
 unsigned long kb_raw_spin_lock_irqsave(void *lock)
@@ -187,16 +217,24 @@ unsigned long kb_raw_spin_lock_irqsave(void *lock)
 
 void kb_raw_spin_unlock(void *lock)
 {
-    if (lock != NULL) {
-        uint32_t unlocked = 0;
-        memcpy(lock, &unlocked, sizeof(unlocked));
+    const uintptr_t value = (uintptr_t)lock;
+    if (lock == NULL) {
+        return;
     }
+#if defined(__x86_64__)
+    if (value > UINT64_C(0x00007fffffffffff) &&
+        value < UINT64_C(0xffff800000000000))
+    {
+        return;
+    }
+#endif
+    __atomic_store_n((uint32_t *)lock, 0u, __ATOMIC_RELEASE);
 }
 
 void kb_raw_spin_unlock_irqrestore(void *lock, unsigned long flags)
 {
-    (void)lock;
     (void)flags;
+    kb_raw_spin_unlock(lock);
 }
 
 int kb_atomic_notifier_chain_register(void *list, void *notifier)

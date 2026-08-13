@@ -3,6 +3,7 @@
 #endif
 
 #include "kobox/shim.h"
+#include "loader/module_context.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -42,6 +43,7 @@ enum {
     KB_LINUX_TIMER_FUNCTION_OFFSET = 24,
     KB_DEFERRED_DRAIN_LIMIT = 1024,
     KB_DEFERRED_LIST_WALK_LIMIT = 65536,
+    KB_WORK_CONTEXT_MAX_DEPTH = 16,
     KB_JIFFIES_STORAGE_MAX = 64,
     KB_WORK_STRUCT_PENDING_BIT = 0,
     KB_TASKLET_STATE_SCHED = 0,
@@ -53,14 +55,32 @@ typedef enum kb_deferred_kind {
     KB_DEFERRED_TIMER,
 } kb_deferred_kind_t;
 
+typedef enum kb_work_run_result {
+    KB_WORK_RUN_RETRY = -1,
+    KB_WORK_RUN_SKIPPED = 0,
+    KB_WORK_RUN_EXECUTED = 1,
+} kb_work_run_result_t;
+
 typedef struct kb_deferred_item {
     kb_deferred_kind_t kind;
     void *object;
+    void *workqueue;
+    uint64_t sequence;
     uint64_t due_ns;
     kb_device_backend_t *backend;
     unsigned long kernel_gs;
     struct kb_deferred_item *next;
 } kb_deferred_item_t;
+
+typedef struct kb_workqueue {
+    uint64_t magic;
+    unsigned int flags;
+    int max_active;
+    int destroying;
+    struct kb_workqueue *next;
+} kb_workqueue_t;
+
+#define KB_WORKQUEUE_MAGIC UINT64_C(0x4b42575155455545)
 
 typedef struct kb_deferred_item_block {
     struct kb_deferred_item_block *next;
@@ -73,10 +93,16 @@ static kb_deferred_item_t *deferred_head;
 static kb_deferred_item_t *deferred_tail;
 static kb_deferred_item_t *deferred_free_list;
 static kb_deferred_item_block_t *deferred_blocks;
+static kb_workqueue_t *workqueues;
+static uint64_t deferred_sequence;
 static unsigned int draining_deferred_depth;
 static uint64_t time_base_ns;
 static unsigned long linux_jiffies;
 static void *jiffies_storages[KB_JIFFIES_STORAGE_MAX];
+static void *worker_tasks[KB_WORK_CONTEXT_MAX_DEPTH];
+static void *active_work_stack[KB_WORK_CONTEXT_MAX_DEPTH];
+static unsigned char worker_task_poisoned[KB_WORK_CONTEXT_MAX_DEPTH];
+static unsigned int active_work_depth;
 
 static int trace_work_enabled(void)
 {
@@ -299,6 +325,7 @@ static void write_ulong(void *base, size_t offset, unsigned long value)
 }
 
 static void refresh_deferred_tail(void);
+static int run_work(void *work, unsigned long fallback_gs);
 
 static void repair_deferred_tail(const char *op)
 {
@@ -328,6 +355,16 @@ static int deferred_contains(kb_deferred_kind_t kind, void *object)
             return 0;
         }
         if (item->kind == kind && item->object == object) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int work_is_active(const void *work)
+{
+    for (unsigned int depth = 0; depth < active_work_depth; depth++) {
+        if (active_work_stack[depth] == work) {
             return 1;
         }
     }
@@ -413,6 +450,18 @@ static void release_deferred_item(kb_deferred_item_t *item)
     deferred_free_list = item;
 }
 
+static void prepend_deferred_item(kb_deferred_item_t *item)
+{
+    if (item == NULL) {
+        return;
+    }
+    item->next = deferred_head;
+    deferred_head = item;
+    if (deferred_tail == NULL) {
+        deferred_tail = item;
+    }
+}
+
 static int remove_deferred(kb_deferred_kind_t kind, void *object)
 {
     kb_deferred_item_t **cursor = &deferred_head;
@@ -431,29 +480,32 @@ static int remove_deferred(kb_deferred_kind_t kind, void *object)
     return removed;
 }
 
-static int remove_due_deferred(kb_deferred_kind_t kind, void *object)
+static kb_deferred_item_t *take_deferred_work(void *object, int require_due)
 {
+    if (object == NULL || work_is_active(object)) {
+        return NULL;
+    }
     const uint64_t now_ns = elapsed_ns();
     kb_deferred_item_t **cursor = &deferred_head;
-    int removed = 0;
     while (*cursor != NULL) {
         kb_deferred_item_t *item = *cursor;
-        if (item->kind == kind &&
+        if (item->kind == KB_DEFERRED_WORK &&
             item->object == object &&
-            (item->due_ns == 0 || item->due_ns <= now_ns))
+            (!require_due || item->due_ns == 0 || item->due_ns <= now_ns))
         {
             *cursor = item->next;
-            release_deferred_item(item);
-            removed = 1;
-            continue;
+            if (deferred_tail == item) {
+                refresh_deferred_tail();
+            }
+            item->next = NULL;
+            return item;
         }
         cursor = &item->next;
     }
-    refresh_deferred_tail();
-    return removed;
+    return NULL;
 }
 
-static int queue_deferred(kb_deferred_kind_t kind, void *object, uint64_t due_ns)
+static int queue_deferred(kb_deferred_kind_t kind, void *object, void *workqueue, uint64_t due_ns)
 {
     if (object == NULL) {
         return 0;
@@ -488,6 +540,12 @@ static int queue_deferred(kb_deferred_kind_t kind, void *object, uint64_t due_ns
     }
     item->kind = kind;
     item->object = object;
+    item->workqueue = workqueue;
+    deferred_sequence++;
+    if (deferred_sequence == 0) {
+        deferred_sequence++;
+    }
+    item->sequence = deferred_sequence;
     item->due_ns = due_ns;
     item->backend = kb_shim_current_device_backend();
     item->kernel_gs = kb_shim_current_kernel_gs();
@@ -536,6 +594,7 @@ static kb_deferred_item_t *pop_due_deferred(int include_work)
     while (*cursor != NULL) {
         kb_deferred_item_t *item = *cursor;
         if ((include_work || item->kind != KB_DEFERRED_WORK) &&
+            (item->kind != KB_DEFERRED_WORK || !work_is_active(item->object)) &&
             (item->due_ns == 0 || item->due_ns <= now_ns))
         {
             *cursor = item->next;
@@ -548,6 +607,114 @@ static kb_deferred_item_t *pop_due_deferred(int include_work)
         cursor = &item->next;
     }
     return NULL;
+}
+
+static kb_deferred_item_t *pop_workqueue_deferred(void *workqueue, uint64_t through_sequence)
+{
+    kb_deferred_item_t **cursor = &deferred_head;
+    while (*cursor != NULL) {
+        kb_deferred_item_t *item = *cursor;
+        if (item->kind == KB_DEFERRED_WORK &&
+            item->workqueue == workqueue &&
+            !work_is_active(item->object) &&
+            item->sequence <= through_sequence)
+        {
+            *cursor = item->next;
+            if (deferred_tail == item) {
+                refresh_deferred_tail();
+            }
+            item->next = NULL;
+            return item;
+        }
+        cursor = &item->next;
+    }
+    return NULL;
+}
+
+static kb_workqueue_t *find_workqueue(void *workqueue)
+{
+    for (kb_workqueue_t *record = workqueues; record != NULL; record = record->next) {
+        if ((void *)record == workqueue && record->magic == KB_WORKQUEUE_MAGIC) {
+            return record;
+        }
+    }
+    return NULL;
+}
+
+void *kb_alloc_workqueue(const char *name, unsigned int flags, int max_active, ...)
+{
+    (void)name;
+    kb_workqueue_t *record = kb_kzalloc(sizeof(*record), 0);
+    if (record == NULL) {
+        return NULL;
+    }
+    record->magic = KB_WORKQUEUE_MAGIC;
+    record->flags = flags;
+    record->max_active = max_active;
+    record->next = workqueues;
+    workqueues = record;
+    return record;
+}
+
+void kb_flush_workqueue(void *workqueue)
+{
+    /*
+     * Linux flushes the work items queued before the flush began.  Work
+     * callbacks may enqueue another generation without making this call
+     * spin forever, so retain the same boundary in the cooperative runner.
+     * Delayed work in that generation is made runnable by an explicit flush.
+     */
+    const uint64_t through_sequence = deferred_sequence;
+    if (draining_deferred_depth >= 8) {
+        return;
+    }
+    draining_deferred_depth++;
+    for (unsigned int count = 0; count < KB_DEFERRED_DRAIN_LIMIT; count++) {
+        kb_deferred_item_t *item = pop_workqueue_deferred(workqueue, through_sequence);
+        if (item == NULL) {
+            break;
+        }
+        kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+        kb_shim_set_device_backend(item->backend);
+        refresh_linux_jiffies();
+        const int run_result = run_work(item->object, item->kernel_gs);
+        refresh_linux_jiffies();
+        kb_shim_set_device_backend(old_backend);
+        if (run_result == KB_WORK_RUN_RETRY) {
+            prepend_deferred_item(item);
+            break;
+        }
+        release_deferred_item(item);
+    }
+    draining_deferred_depth--;
+}
+
+void kb_destroy_workqueue(void *workqueue)
+{
+    kb_workqueue_t **cursor = &workqueues;
+    while (*cursor != NULL && (void *)*cursor != workqueue) {
+        cursor = &(*cursor)->next;
+    }
+    kb_workqueue_t *record = *cursor;
+    if (record == NULL || record->magic != KB_WORKQUEUE_MAGIC) {
+        return;
+    }
+
+    /* Reject requeue from callbacks while draining the final generation. */
+    record->destroying = 1;
+    kb_flush_workqueue(workqueue);
+    for (kb_deferred_item_t *item = deferred_head; item != NULL; item = item->next) {
+        if (item->kind == KB_DEFERRED_WORK && item->workqueue == workqueue) {
+            record->destroying = 0;
+            if (trace_work_enabled()) {
+                fprintf(stderr, "kobox work: destroy left queued work wq=%p\n", workqueue);
+            }
+            return;
+        }
+    }
+    *cursor = record->next;
+    record->magic = 0;
+    kb_kfree(record);
 }
 
 static unsigned long read_work_data(void *work)
@@ -706,10 +873,59 @@ static int run_work(void *work, unsigned long fallback_gs)
     }
 
     void (*func)(void *) = (void (*)(void *))read_pointer(work, KB_LINUX_WORK_FUNC_OFFSET);
-    clear_work_pending(work);
     if (!work_function_usable(work, func, "run")) {
+        clear_work_pending(work);
         return 0;
     }
+    if (work_is_active(work)) {
+        if (trace_work_or_pachaos_enabled()) {
+            fprintf(stderr, "kobox work: defer active work=%p func=%p\n", work, (void *)func);
+        }
+        return KB_WORK_RUN_RETRY;
+    }
+    if (active_work_depth >= KB_WORK_CONTEXT_MAX_DEPTH) {
+        fprintf(
+            stderr,
+            "kobox work: execution context depth exceeded work=%p func=%p depth=%u\n",
+            work,
+            (void *)func,
+            active_work_depth);
+        return KB_WORK_RUN_RETRY;
+    }
+    const unsigned int context_depth = active_work_depth;
+    if (worker_task_poisoned[context_depth]) {
+        fprintf(
+            stderr,
+            "kobox work: refusing poisoned execution context work=%p func=%p depth=%u\n",
+            work,
+            (void *)func,
+            context_depth);
+        return KB_WORK_RUN_RETRY;
+    }
+    if (worker_tasks[context_depth] == NULL) {
+        worker_tasks[context_depth] = kb_loader_clone_execution_task();
+    }
+    void *worker_task = worker_tasks[context_depth];
+    if (worker_task == NULL) {
+        fprintf(stderr, "kobox work: execution task allocation failed depth=%u\n", context_depth);
+        return KB_WORK_RUN_RETRY;
+    }
+    void *worker_journal_before = kb_loader_task_journal_info(worker_task);
+    if (worker_journal_before != NULL) {
+        worker_task_poisoned[context_depth] = 1;
+        fprintf(
+            stderr,
+            "kobox work: dirty execution task before callback task=%p journal_info=%p "
+            "work=%p func=%p depth=%u\n",
+            worker_task,
+            worker_journal_before,
+            work,
+            (void *)func,
+            context_depth);
+        return KB_WORK_RUN_RETRY;
+    }
+
+    clear_work_pending(work);
     if (is_usb_lpm_work_function(func)) {
         if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: skip usb lpm work=%p func=%p\n", work, (void *)func);
@@ -726,16 +942,63 @@ static int run_work(void *work, unsigned long fallback_gs)
         return 1;
     }
     unsigned long kernel_gs = callback_kernel_gs((const void *)func, fallback_gs);
+    void *previous_task = kb_loader_current_task();
+    void *previous_journal = kb_loader_task_journal_info(previous_task);
+    kb_module_t *previous_module = kb_loader_active_module();
+    kb_module_t *callback_module = kb_module_find_owner_for_address((const void *)func);
+    active_work_stack[context_depth] = work;
+    active_work_depth++;
+    kb_loader_set_current_task_for_all_modules(worker_task);
+    kb_loader_set_active_module(callback_module);
     unsigned long old_gs = 0;
     int has_gs = enter_callback_gs(kernel_gs, &old_gs);
+    if (kernel_gs != 0 && !has_gs) {
+        kb_loader_set_active_module(previous_module);
+        kb_loader_set_current_task_for_all_modules(previous_task);
+        active_work_depth--;
+        active_work_stack[context_depth] = NULL;
+        set_work_pending(work);
+        fprintf(
+            stderr,
+            "kobox work: callback GS switch failed work=%p func=%p gs=0x%lx depth=%u\n",
+            work,
+            (void *)func,
+            kernel_gs,
+            context_depth);
+        return KB_WORK_RUN_RETRY;
+    }
     kb_linux_call_void_ptr_gs(func, work, kernel_gs);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
+    void *worker_journal_after = kb_loader_task_journal_info(worker_task);
+    kb_loader_set_active_module(previous_module);
+    kb_loader_set_current_task_for_all_modules(previous_task);
+    active_work_depth--;
+    active_work_stack[context_depth] = NULL;
+    void *previous_journal_after = kb_loader_task_journal_info(previous_task);
+    if (worker_journal_after != NULL || previous_journal_after != previous_journal) {
+        worker_task_poisoned[context_depth] = 1;
+        fprintf(
+            stderr,
+            "kobox work: execution task invariant failed task=%p journal_before=%p "
+            "journal_after=%p outer_task=%p outer_before=%p outer_after=%p "
+            "work=%p func=%p depth=%u\n",
+            worker_task,
+            worker_journal_before,
+            worker_journal_after,
+            previous_task,
+            previous_journal,
+            previous_journal_after,
+            work,
+            (void *)func,
+            context_depth);
+        return KB_WORK_RUN_EXECUTED;
+    }
     if (trace_work_or_pachaos_enabled()) {
         fprintf(stderr, "kobox work: done work=%p func=%p\n", work, (void *)func);
     }
-    return 1;
+    return KB_WORK_RUN_EXECUTED;
 }
 
 static int run_timer(void *timer, unsigned long fallback_gs)
@@ -853,9 +1116,10 @@ static void run_deferred_items(int include_work)
         kb_device_backend_t *old_backend = kb_shim_current_device_backend();
         kb_shim_set_device_backend(item->backend);
         refresh_linux_jiffies();
+        int run_result = KB_WORK_RUN_EXECUTED;
         switch (item->kind) {
         case KB_DEFERRED_WORK:
-            (void)run_work(item->object, item->kernel_gs);
+            run_result = run_work(item->object, item->kernel_gs);
             break;
         case KB_DEFERRED_TASKLET:
             (void)run_tasklet(item->object, item->kernel_gs);
@@ -866,6 +1130,10 @@ static void run_deferred_items(int include_work)
         }
         refresh_linux_jiffies();
         kb_shim_set_device_backend(old_backend);
+        if (run_result == KB_WORK_RUN_RETRY) {
+            prepend_deferred_item(item);
+            break;
+        }
         release_deferred_item(item);
     }
     draining_deferred_depth--;
@@ -873,9 +1141,12 @@ static void run_deferred_items(int include_work)
 
 void kb_run_deferred_work(void)
 {
-    kb_jbd2_progress_registered_journals();
+    if (kb_kthread_yield_current()) {
+        return;
+    }
+    kb_kthread_run_ready();
     run_deferred_items(1);
-    kb_jbd2_progress_registered_journals();
+    kb_kthread_run_ready();
 }
 
 void kb_run_deferred_bottom_halves(void)
@@ -891,7 +1162,10 @@ int kb_deferred_work_is_draining(void)
 int kb_queue_work_on(int cpu, void *wq, void *work)
 {
     (void)cpu;
-    (void)wq;
+    kb_workqueue_t *record = find_workqueue(wq);
+    if (record != NULL && record->destroying) {
+        return 0;
+    }
     if (work == NULL) {
         if (trace_work_or_pachaos_enabled()) {
             fprintf(stderr, "kobox work: queue_work skip wq=%p work=%p func=%p pending=%d\n",
@@ -935,7 +1209,7 @@ int kb_queue_work_on(int cpu, void *wq, void *work)
             (void *)func);
     }
     set_work_pending(work);
-    if (!queue_deferred(KB_DEFERRED_WORK, work, 0)) {
+    if (!queue_deferred(KB_DEFERRED_WORK, work, wq, 0)) {
         clear_work_pending(work);
         return 0;
     }
@@ -950,7 +1224,10 @@ int kb_kblockd_schedule_work(void *work)
 int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay)
 {
     (void)cpu;
-    (void)wq;
+    kb_workqueue_t *record = find_workqueue(wq);
+    if (record != NULL && record->destroying) {
+        return 0;
+    }
     if (dwork == NULL) {
         return 0;
     }
@@ -984,7 +1261,7 @@ int kb_queue_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay
             (unsigned long long)due_ns,
             __builtin_return_address(0));
     }
-    if (!queue_deferred(KB_DEFERRED_WORK, dwork, due_ns)) {
+    if (!queue_deferred(KB_DEFERRED_WORK, dwork, wq, due_ns)) {
         clear_work_pending(dwork);
         return 0;
     }
@@ -1001,24 +1278,45 @@ int kb_mod_delayed_work_on(int cpu, void *wq, void *dwork, unsigned long delay)
 int kb_flush_work(void *work)
 {
     const int was_pending = work != NULL && work_pending(work);
-    const int was_queued = remove_due_deferred(KB_DEFERRED_WORK, work);
-    if (!was_pending && !was_queued) {
+    kb_deferred_item_t *item = take_deferred_work(work, 1);
+    if (!was_pending && item == NULL) {
         return 0;
     }
-    if (!was_queued) {
+    if (item == NULL) {
         return 0;
     }
-    return run_work(work, kb_shim_current_kernel_gs());
+    kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+    kb_shim_set_device_backend(item->backend);
+    const int run_result = run_work(work, item->kernel_gs);
+    kb_shim_set_device_backend(old_backend);
+    if (run_result == KB_WORK_RUN_RETRY) {
+        prepend_deferred_item(item);
+        return 0;
+    }
+    release_deferred_item(item);
+    return run_result == KB_WORK_RUN_EXECUTED;
 }
 
 int kb_flush_delayed_work(void *dwork)
 {
     const int was_pending = dwork != NULL && work_pending(dwork);
-    const int was_queued = remove_deferred(KB_DEFERRED_WORK, dwork);
-    if (!was_pending && !was_queued) {
+    kb_deferred_item_t *item = take_deferred_work(dwork, 0);
+    if (!was_pending && item == NULL) {
         return 0;
     }
-    return run_work(dwork, kb_shim_current_kernel_gs());
+    if (item == NULL) {
+        return 0;
+    }
+    kb_device_backend_t *old_backend = kb_shim_current_device_backend();
+    kb_shim_set_device_backend(item->backend);
+    const int run_result = run_work(dwork, item->kernel_gs);
+    kb_shim_set_device_backend(old_backend);
+    if (run_result == KB_WORK_RUN_RETRY) {
+        prepend_deferred_item(item);
+        return 0;
+    }
+    release_deferred_item(item);
+    return run_result == KB_WORK_RUN_EXECUTED;
 }
 
 int kb_cancel_work_sync(void *work)
@@ -1053,7 +1351,7 @@ void kb_tasklet_schedule(void *tasklet)
     unsigned long state = read_ulong(tasklet, KB_LINUX_TASKLET_STATE_OFFSET);
     state |= 1ul << KB_TASKLET_STATE_SCHED;
     write_ulong(tasklet, KB_LINUX_TASKLET_STATE_OFFSET, state);
-    (void)queue_deferred(KB_DEFERRED_TASKLET, tasklet, 0);
+    (void)queue_deferred(KB_DEFERRED_TASKLET, tasklet, NULL, 0);
 }
 
 void kb_init_timer_key(void *timer, void (*callback)(void *timer), unsigned int flags, const char *name, void *key)
@@ -1078,14 +1376,14 @@ int kb_mod_timer(void *timer, unsigned long expires)
         item->kernel_gs = kb_shim_current_kernel_gs();
         return 1;
     }
-    return queue_deferred(KB_DEFERRED_TIMER, timer, due_ns);
+    return queue_deferred(KB_DEFERRED_TIMER, timer, NULL, due_ns);
 }
 
 void kb_add_timer(void *timer)
 {
     write_pointer(timer, KB_LINUX_TIMER_ENTRY_PPREV_OFFSET, timer);
     unsigned long expires = read_ulong(timer, KB_LINUX_TIMER_EXPIRES_OFFSET);
-    (void)queue_deferred(KB_DEFERRED_TIMER, timer, jiffies_to_ns(expires));
+    (void)queue_deferred(KB_DEFERRED_TIMER, timer, NULL, jiffies_to_ns(expires));
 }
 
 int kb_timer_delete(void *timer)
@@ -1115,6 +1413,9 @@ unsigned long kb_schedule_timeout(unsigned long timeout)
     if (timeout == 0) {
         return 0;
     }
+    if (kb_kthread_yield_current()) {
+        return timeout == ULONG_MAX ? timeout : timeout - 1u;
+    }
 
     /*
      * schedule_timeout() is the sleep primitive behind wait_event_timeout().
@@ -1127,8 +1428,6 @@ unsigned long kb_schedule_timeout(unsigned long timeout)
     kb_run_deferred_work();
     (void)kb_handle_any_irq_no_work(jiffies_to_ns(1));
     kb_run_deferred_work();
-    kb_jbd2_progress_registered_journals();
-
     if (timeout == ULONG_MAX) {
         return timeout;
     }

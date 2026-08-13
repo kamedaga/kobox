@@ -256,11 +256,9 @@ add_test(NAME kobox-linux-pci-msix-table-smoke COMMAND kobox-linux-pci-msix-tabl
 
 add_executable(kobox-usb-subsystem-smoke
     tests/usb_subsystem_smoke.c
-    src/linux_personality/linux_memory.c
-    src/linux_subsystem/block/block.c
-    src/linux_subsystem/usb/storage.c
-    src/linux_subsystem/usb/usb.c
 )
+
+target_link_libraries(kobox-usb-subsystem-smoke PRIVATE kobox_runtime)
 
 target_include_directories(kobox-usb-subsystem-smoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

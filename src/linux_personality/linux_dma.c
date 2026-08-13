@@ -235,7 +235,7 @@ uint64_t kb_dma_map_page_attrs(void *dev, void *page, unsigned long offset, size
             (int)status,
             (unsigned long long)dma_addr);
     }
-    if ((status != KB_OK || dma_addr == 0) && trace_dma_enabled()) {
+    if (status != KB_OK || dma_addr == 0) {
         fprintf(stderr,
             "kobox dma: map_page failed-or-zero page=%p offset=0x%lx cpu=%p size=0x%zx dir=%d status=%d dma=0x%llx\n",
             page,
@@ -319,6 +319,15 @@ uint64_t kb_dma_map_single_attrs(void *dev, void *ptr, size_t size, int dir, uns
                 (unsigned long long)dma_addr);
         }
     }
+    if (status != KB_OK || dma_addr == 0) {
+        fprintf(stderr,
+            "kobox dma: map_single failed-or-zero cpu=%p size=0x%zx dir=%d status=%d dma=0x%llx\n",
+            ptr,
+            size,
+            dir,
+            (int)status,
+            (unsigned long long)dma_addr);
+    }
     return status == KB_OK && dma_addr != 0 ? dma_addr : KB_LINUX_DMA_MAPPING_ERROR;
 }
 
@@ -345,12 +354,21 @@ int kb_dma_mapping_error(void *dev, uint64_t dma_addr)
 {
     (void)dev;
     if (dma_addr == KB_LINUX_DMA_MAPPING_ERROR) {
+        fprintf(stderr,
+            "kobox dma: mapping_error sentinel dma=0x%llx\n",
+            (unsigned long long)dma_addr);
         return 1;
     }
     if (kb_linux_kvm_dma_addr_in_payload_arena(dma_addr, 1)) {
         return 0;
     }
-    return kb_subsystem_dma_mapping_error(dma_addr);
+    const int failed = kb_subsystem_dma_mapping_error(dma_addr);
+    if (failed) {
+        fprintf(stderr,
+            "kobox dma: mapping_error untracked dma=0x%llx\n",
+            (unsigned long long)dma_addr);
+    }
+    return failed;
 }
 
 int kb_dma_need_sync(void *dev, uint64_t dma_addr)

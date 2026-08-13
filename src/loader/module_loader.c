@@ -79,12 +79,19 @@ enum {
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_NSPROXY_OFFSET = 0x840,
     KB_LOCAL_CURRENT_TASK_REAL_CRED_OFFSET = 0x6f0,
     KB_LOCAL_CURRENT_TASK_CRED_OFFSET = 0x6f8,
+    /* Linux 6.12.93 Alpine ext4 configuration: current_fsuid() loads
+     * task_struct::cred from +0x7f0.  Keep the older layouts populated too
+     * because the storage stack currently combines 6.8 NVMe and 6.12 ext4. */
+    KB_LOCAL_LINUX_6_12_CURRENT_TASK_CRED_OFFSET = 0x7f0,
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_MM_OFFSET = 0x548,
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_REAL_CRED_OFFSET = 0x7d0,
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_CRED_OFFSET = 0x7d8,
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_COMM_OFFSET = 0x7e8,
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_SIGNAL_OFFSET = 0x848,
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_SIGHAND_OFFSET = 0x850,
+    /* Linux 6.12.93 JBD2 uses task_struct::journal_info at +0x930.  Synthetic
+     * execution contexts must never inherit an active journal handle. */
+    KB_LOCAL_LINUX_6_12_CURRENT_TASK_JOURNAL_INFO_OFFSET = 0x930,
     KB_LOCAL_NSPROXY_MNT_NS_OFFSET = 0x18,
     KB_LOCAL_CRED_UID_OFFSET = 0x08,
     KB_LOCAL_CRED_GID_OFFSET = 0x0c,
@@ -93,13 +100,17 @@ enum {
     KB_LOCAL_CRED_USER_NS_OFFSET = 0x90,
     KB_LOCAL_USB_DATA_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 11264,
     KB_LOCAL_JIFFIES_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4096,
-    KB_LOCAL_GS_SIZE = 4096,
+    /* Linux modules on one CPU share one GS base.  Module-local per-CPU
+     * sections are assigned disjoint offsets within that common area. */
+    KB_LOCAL_GS_SIZE = 1024 * 1024,
     KB_LOCAL_GS_PCPU_HOT_OFFSET = 0x100,
     KB_LOCAL_GS_STACK_CHK_GUARD_OFFSET = 0x180,
     KB_LOCAL_GS_PREEMPT_COUNT_OFFSET = 0x188,
     KB_LOCAL_GS_CPU_NUMBER_OFFSET = 0x190,
     KB_LOCAL_GS_NUMA_NODE_OFFSET = 0x198,
     KB_LOCAL_GS_CPU_INFO_OFFSET = 0x200,
+    /* First dynamically assigned module-local per-CPU offset. */
+    KB_LOCAL_GS_MODULE_PERCPU_OFFSET = 0x800,
     KB_LOCAL_USB_NUM_ONLINE_CPUS_OFFSET = 0,
     KB_LOCAL_USB_PCPU_HOT_OFFSET = 64,
     KB_LOCAL_USB_PM_SUSPEND_TARGET_STATE_OFFSET = 320,
@@ -197,7 +208,6 @@ struct kb_module {
     void *shim_const_pcpu_hot;
     void *shim_this_cpu_off;
     void *shim_per_cpu_offset;
-    void *shim_var_waitqueue;
     void *shim_pernet_ops_rwsem;
     void *shim_panic_notifier_list;
     void *shim_pv_ops;
@@ -217,16 +227,48 @@ struct kb_module {
     int (*init_module)(void);
     void (*cleanup_module)(void);
 #if !defined(_WIN32) && defined(__x86_64__)
-    uint8_t kernel_gs[KB_LOCAL_GS_SIZE];
+    uint8_t *kernel_gs;
+    uint64_t module_percpu_offset;
+    uint64_t module_percpu_size;
 #endif
     struct kb_module *next_loaded;
 };
 
 static kb_module_t *kb_active_module;
 static kb_module_t *kb_loaded_modules;
+static void *kb_published_current_task;
+static uint8_t kb_execution_task_template[4096];
+static int kb_execution_task_template_valid;
+#if !defined(_WIN32) && defined(__x86_64__)
+static _Alignas(4096) uint8_t kb_shared_kernel_gs[KB_LOCAL_GS_SIZE];
+static uint64_t kb_shared_kernel_percpu_next = KB_LOCAL_GS_MODULE_PERCPU_OFFSET;
+#endif
 uintptr_t kb_current_external_call_target;
 uintptr_t kb_current_external_call_caller_gs;
 uintptr_t kb_current_external_call_callee_gs;
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+uint64_t kb_external_cross_module_calls;
+#define KB_EXTERNAL_CROSS_PROFILE_ASM \
+    "incq kb_external_cross_module_calls(%rip)\n\t"
+#else
+#define KB_EXTERNAL_CROSS_PROFILE_ASM ""
+#endif
+
+void kb_module_external_cross_call_profile_reset(void)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    kb_external_cross_module_calls = 0;
+#endif
+}
+
+uint64_t kb_module_external_cross_call_profile_snapshot(void)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    return kb_external_cross_module_calls;
+#else
+    return 0;
+#endif
+}
 
 kb_module_t *kb_loader_active_module(void)
 {
@@ -245,7 +287,16 @@ void *kb_loader_module_current_mm(const kb_module_t *module)
 
 void *kb_loader_module_current_task(const kb_module_t *module)
 {
-    return module == NULL ? NULL : module->shim_current_task;
+    if (module == NULL) {
+        return NULL;
+    }
+#if !defined(_WIN32) && defined(__x86_64__)
+    uint64_t current = 0;
+    memcpy(&current, module->kernel_gs + KB_LOCAL_GS_PCPU_HOT_OFFSET, sizeof(current));
+    return (void *)(uintptr_t)current;
+#else
+    return module->shim_current_task;
+#endif
 }
 
 static unsigned long kb_copy_from_user(void *to, const void *from, unsigned long n)
@@ -660,6 +711,9 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "cld\n\t"
         "rep movsq\n\t"
         "mov 648(%rsp), %rdi\n\t"
+        "cmp 624(%rsp), %rdi\n\t"
+        "je 1f\n\t"
+        KB_EXTERNAL_CROSS_PROFILE_ASM
         "test %rdi, %rdi\n\t"
         "jz 1f\n\t"
         "mov $16, %eax\n\t"
@@ -682,8 +736,11 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "mov %rax, 632(%rsp)\n\t"
         "mov %rdx, 640(%rsp)\n\t"
         "mov 624(%rsp), %rdi\n\t"
+        "cmp 648(%rsp), %rdi\n\t"
+        "je 2f\n\t"
         "mov $16, %eax\n\t"
         "syscall\n\t"
+        "2:\n\t"
         "movq $0, kb_current_external_call_target(%rip)\n\t"
         "mov 632(%rsp), %rax\n\t"
         "mov 640(%rsp), %rdx\n\t"
@@ -726,6 +783,9 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "cld\n\t"
         "rep movsq\n\t"
         "mov 648(%rsp), %rsi\n\t"
+        "cmp 624(%rsp), %rsi\n\t"
+        "je 1f\n\t"
+        KB_EXTERNAL_CROSS_PROFILE_ASM
         "test %rsi, %rsi\n\t"
         "jz 1f\n\t"
         "mov $0x1001, %edi\n\t"
@@ -749,6 +809,8 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "mov %rax, 632(%rsp)\n\t"
         "mov %rdx, 640(%rsp)\n\t"
         "mov 624(%rsp), %rsi\n\t"
+        "cmp 648(%rsp), %rsi\n\t"
+        "je 2f\n\t"
         "mov $0x1001, %edi\n\t"
         "mov $158, %eax\n\t"
         "syscall\n\t"
@@ -1676,7 +1738,7 @@ static void *alloc_section_memory(uint64_t size)
         void *memory = mmap(
             (void *)hint,
             (size_t)rounded_size,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
+            PROT_READ | PROT_WRITE,
             flags,
             -1,
             0);
@@ -1690,7 +1752,7 @@ static void *alloc_section_memory(uint64_t size)
         munmap(memory, (size_t)rounded_size);
     }
 #endif
-    void *memory = mmap(0, (size_t)rounded_size, PROT_READ | PROT_WRITE | PROT_EXEC, flags, -1, 0);
+    void *memory = mmap(0, (size_t)rounded_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     return memory == MAP_FAILED ? 0 : memory;
 #endif
 }
@@ -1723,6 +1785,216 @@ static int range_fits(size_t size, uint64_t offset, uint64_t length)
 static void *lookup_shim_symbol(const char *name)
 {
     return shim_symbol_find_address(name);
+}
+
+void *kb_module_shared_blockdev_superblock(void)
+{
+    enum { KB_SHARED_BLOCKDEV_SUPERBLOCK_BYTES = 4096 };
+    static void *shared_object;
+    if (shared_object == NULL) {
+        shared_object = alloc_section_memory(KB_SHARED_BLOCKDEV_SUPERBLOCK_BYTES);
+        if (shared_object != NULL) {
+            memset(shared_object, 0, KB_SHARED_BLOCKDEV_SUPERBLOCK_BYTES);
+            /* Linux exports `struct super_block *blockdev_superblock`.
+             * Relocations address the pointer variable, while inode->i_sb
+             * stores its value.  Keep both within the shared low mapping. */
+            void *superblock_value = (uint8_t *)shared_object + 64u;
+            memcpy(shared_object, &superblock_value, sizeof(superblock_value));
+        }
+    }
+    return shared_object;
+}
+
+static void *shared_current_task(void)
+{
+    enum { KB_SHARED_CURRENT_TASK_BYTES = 4096 };
+    static void *shared_task;
+    if (shared_task == NULL) {
+        shared_task = alloc_section_memory(KB_SHARED_CURRENT_TASK_BYTES);
+        if (shared_task != NULL) {
+            memset(shared_task, 0, KB_SHARED_CURRENT_TASK_BYTES);
+        }
+    }
+    return shared_task;
+}
+
+static void *shared_tasklist_lock(void)
+{
+    enum { KB_SHARED_TASKLIST_LOCK_BYTES = 4096 };
+    static void *shared_lock;
+    if (shared_lock == NULL) {
+        shared_lock = alloc_section_memory(KB_SHARED_TASKLIST_LOCK_BYTES);
+        if (shared_lock != NULL) {
+            memset(shared_lock, 0, KB_SHARED_TASKLIST_LOCK_BYTES);
+        }
+    }
+    return shared_lock;
+}
+
+void *kb_loader_default_current_task(void)
+{
+    return shared_current_task();
+}
+
+void *kb_loader_current_task(void)
+{
+    if (kb_published_current_task == NULL) {
+        kb_published_current_task = shared_current_task();
+    }
+    return kb_published_current_task;
+}
+
+void *kb_loader_clone_execution_task(void)
+{
+    enum { KB_SYNTHETIC_TASK_BYTES = 4096 };
+    void *task = calloc(1, KB_SYNTHETIC_TASK_BYTES);
+    void *template_task = kb_execution_task_template_valid ?
+        (void *)kb_execution_task_template : shared_current_task();
+    if (task == NULL || template_task == NULL) {
+        free(task);
+        return NULL;
+    }
+    memcpy(task, template_task, KB_SYNTHETIC_TASK_BYTES);
+    memset(
+        (uint8_t *)task + KB_LOCAL_LINUX_6_12_CURRENT_TASK_JOURNAL_INFO_OFFSET,
+        0,
+        sizeof(void *));
+    write_u64le(
+        (uint8_t *)task + 0x950,
+        (uint64_t)(uintptr_t)((uint8_t *)task + 0x9b8));
+    return task;
+}
+
+void *kb_loader_task_journal_info(const void *task)
+{
+    void *journal_info = NULL;
+    if (task != NULL) {
+        memcpy(
+            &journal_info,
+            (const uint8_t *)task +
+                KB_LOCAL_LINUX_6_12_CURRENT_TASK_JOURNAL_INFO_OFFSET,
+            sizeof(journal_info));
+    }
+    return journal_info;
+}
+
+void kb_loader_set_current_task_for_all_modules(void *task)
+{
+    if (task == NULL) {
+        task = shared_current_task();
+    }
+    kb_published_current_task = task;
+    for (kb_module_t *module = kb_loaded_modules; module != NULL; module = module->next_loaded) {
+#if !defined(_WIN32) && defined(__x86_64__)
+        write_u64le(
+            module->kernel_gs + KB_LOCAL_GS_PCPU_HOT_OFFSET,
+            (uint64_t)(uintptr_t)task);
+#else
+        module->shim_current_task = task;
+#endif
+    }
+}
+
+void kb_loader_refresh_page_model_for_all_modules(void)
+{
+    const uint64_t page_offset_base =
+        (uint64_t)kb_linux_kvm_exported_page_offset_base();
+    const uint64_t vmemmap_base =
+        (uint64_t)kb_linux_kvm_exported_vmemmap_base();
+    const uint64_t phys_base = (uint64_t)kb_linux_kvm_phys_base();
+
+    for (kb_module_t *module = kb_loaded_modules; module != NULL; module = module->next_loaded) {
+        write_u64le(
+            module->shim_region + KB_LOCAL_PAGE_OFFSET_BASE_OFFSET,
+            page_offset_base);
+        write_u64le(
+            module->shim_region + KB_LOCAL_VMEMMAP_BASE_OFFSET,
+            vmemmap_base);
+        write_u64le(
+            module->shim_region + KB_LOCAL_PHYS_BASE_OFFSET,
+            phys_base);
+    }
+}
+
+static int section_protection(uint64_t flags)
+{
+    if ((flags & KB_ELF_SHF_EXECINSTR) != 0) {
+        return 2;
+    }
+    if ((flags & KB_ELF_SHF_WRITE) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+#if !defined(_WIN32)
+static int protect_section_run(kb_module_t *module, uint64_t start, uint64_t end, int protection)
+{
+    int native_prot = PROT_READ;
+    if (protection == 2) {
+        native_prot |= PROT_EXEC;
+    } else if (protection == 1) {
+        native_prot |= PROT_WRITE;
+    }
+    return mprotect(
+        (uint8_t *)module->image_base + start,
+        (size_t)(end - start),
+        native_prot);
+}
+#endif
+
+static kb_status_t finalize_section_protections(kb_module_t *module)
+{
+#if defined(_WIN32)
+    (void)module;
+    return KB_OK;
+#else
+    const uint64_t page = page_size();
+    const uint64_t rounded_size = align_up_u64(module->image_size, page);
+    if (mprotect(module->image_base, (size_t)rounded_size, PROT_READ) != 0) {
+        return KB_ERR_UNSUPPORTED;
+    }
+    uint64_t run_start = 0;
+    uint64_t run_end = 0;
+    int run_protection = -1;
+    for (size_t i = 0; i < module->section_count; i++) {
+        const loaded_section_t *section = &module->sections[i];
+        if (section->base == NULL || section->size == 0) {
+            continue;
+        }
+        const uint64_t start = section->offset & ~(page - 1);
+        const uint64_t end = align_up_u64(section->offset + section->size, page);
+        const int protection = section_protection(section->flags);
+        if (run_protection == protection && start <= run_end) {
+            if (end > run_end) {
+                run_end = end;
+            }
+            continue;
+        }
+        if (run_protection != -1 &&
+            protect_section_run(module, run_start, run_end, run_protection) != 0) {
+            return KB_ERR_UNSUPPORTED;
+        }
+        run_start = start;
+        run_end = end;
+        run_protection = protection;
+    }
+    if (run_protection != -1 &&
+        protect_section_run(module, run_start, run_end, run_protection) != 0) {
+        return KB_ERR_UNSUPPORTED;
+    }
+    if (mprotect(
+            module->shim_region,
+            (size_t)KB_LOCAL_SHIM_DATA_OFFSET,
+            PROT_READ | PROT_EXEC) != 0 ||
+        mprotect(
+            module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET,
+            (size_t)KB_LOCAL_SHIM_DATA_SIZE,
+            PROT_READ | PROT_WRITE) != 0) {
+        return KB_ERR_UNSUPPORTED;
+    }
+    return KB_OK;
+#endif
 }
 
 static int module_prefers_kvm_symbols(const kb_module_t *module)
@@ -1957,6 +2229,12 @@ static void unregister_loaded_module(kb_module_t *module)
 
 static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
 {
+    if (strcmp(name, "blockdev_superblock") == 0) {
+        return kb_module_shared_blockdev_superblock();
+    }
+    if (strcmp(name, "tasklist_lock") == 0) {
+        return shared_tasklist_lock();
+    }
     if (strcmp(name, "__num_online_cpus") == 0) {
         return module->shim_region + KB_LOCAL_USB_DATA_OFFSET + KB_LOCAL_USB_NUM_ONLINE_CPUS_OFFSET;
     }
@@ -2136,9 +2414,6 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     if (strcmp(name, "__per_cpu_offset") == 0) {
         return module->shim_per_cpu_offset;
     }
-    if (strcmp(name, "__var_waitqueue") == 0) {
-        return module->shim_var_waitqueue;
-    }
     if (strcmp(name, "pernet_ops_rwsem") == 0) {
         return module->shim_pernet_ops_rwsem;
     }
@@ -2282,7 +2557,12 @@ static kb_status_t resolve_symbol(
     }
 
     if (symbol_is_percpu_offset(module, &symbol)) {
-        *out_address = symbol.value;
+        if (module->module_percpu_offset == 0 ||
+            symbol.value > module->module_percpu_size)
+        {
+            return KB_ERR_INVALID;
+        }
+        *out_address = module->module_percpu_offset + symbol.value;
         return KB_OK;
     }
 
@@ -2352,7 +2632,11 @@ static kb_status_t register_module_exports(kb_module_t *module)
             }
 
             uint64_t address = 0;
-            status = loaded_section_address(module, symbol.section_index, symbol.value, &address);
+            status = resolve_symbol(
+                module,
+                (uint32_t)section_index,
+                (uint32_t)symbol_index,
+                &address);
             if (status != KB_OK) {
                 continue;
             }
@@ -2369,6 +2653,7 @@ static kb_status_t register_module_exports(kb_module_t *module)
 static kb_status_t load_sections(kb_module_t *module)
 {
     uint64_t image_size = 0;
+    int previous_protection = -1;
     for (size_t i = 0; i < module->section_count; i++) {
         kb_elf_section_t section;
         kb_status_t status = kb_elf_section(&module->elf, i, &section);
@@ -2379,20 +2664,49 @@ static kb_status_t load_sections(kb_module_t *module)
             continue;
         }
 
+        const int protection = section_protection(section.flags);
+        if (previous_protection != -1 && protection != previous_protection) {
+            image_size = align_up_u64(image_size, page_size());
+        }
         const uint64_t alignment = section.alignment == 0 ? 1 : section.alignment;
+        if (section.name != NULL && strcmp(section.name, ".data..percpu") == 0) {
+#if !defined(_WIN32) && defined(__x86_64__)
+            if (module->module_percpu_offset != 0) {
+                return KB_ERR_INVALID;
+            }
+            const uint64_t percpu_alignment = alignment < 8u ? 8u : alignment;
+            const uint64_t percpu_offset = align_up_u64(
+                kb_shared_kernel_percpu_next, percpu_alignment);
+            if (percpu_offset > KB_LOCAL_GS_SIZE ||
+                section.size > KB_LOCAL_GS_SIZE - percpu_offset)
+            {
+                return KB_ERR_NOMEM;
+            }
+            module->module_percpu_offset = percpu_offset;
+            module->module_percpu_size = section.size;
+            kb_shared_kernel_percpu_next = percpu_offset + section.size;
+#else
+            if (section.size != 0) {
+                return KB_ERR_UNSUPPORTED;
+            }
+#endif
+        }
         image_size = align_up_u64(image_size, alignment);
         module->sections[i].offset = image_size;
         module->sections[i].size = section.size;
         module->sections[i].alignment = alignment;
         module->sections[i].flags = section.flags;
         image_size += section.size;
+        if (section.size != 0) {
+            previous_protection = protection;
+        }
     }
 
     if (image_size == 0 || image_size > SIZE_MAX) {
         return KB_ERR_INVALID;
     }
 
-    image_size = align_up_u64(image_size, 16);
+    image_size = align_up_u64(image_size, page_size());
     const uint64_t shim_region_offset = image_size;
     image_size += KB_LOCAL_SHIM_REGION_SIZE;
 
@@ -2439,7 +2753,6 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_const_pcpu_hot = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3452;
     module->shim_this_cpu_off = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3456;
     module->shim_per_cpu_offset = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3568;
-    module->shim_var_waitqueue = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3464;
     module->shim_pernet_ops_rwsem = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3472;
     module->shim_panic_notifier_list = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3520;
     module->shim_pv_ops = module->shim_region + KB_LOCAL_SHIM_DATA_OFFSET + 3840;
@@ -2448,7 +2761,10 @@ static kb_status_t load_sections(kb_module_t *module)
     module->shim_node_states = module->shim_region + KB_LOCAL_NODE_STATES_OFFSET;
     module->shim_boot_cpu_data = module->shim_region + KB_LOCAL_BOOT_CPU_DATA_OFFSET;
     module->shim_current_mm = module->shim_region + KB_LOCAL_CURRENT_MM_OFFSET;
-    module->shim_current_task = module->shim_region + KB_LOCAL_CURRENT_TASK_OFFSET;
+    module->shim_current_task = shared_current_task();
+    if (module->shim_current_task == NULL) {
+        return KB_ERR_NOMEM;
+    }
     module->shim_current_signal = module->shim_region + KB_LOCAL_CURRENT_SIGNAL_OFFSET;
     module->shim_current_sighand = module->shim_region + KB_LOCAL_CURRENT_SIGHAND_OFFSET;
     write_u64le((uint8_t *)module->shim_cpu_possible_mask, 1);
@@ -2482,6 +2798,12 @@ static kb_status_t load_sections(kb_module_t *module)
         if (symbol == NULL) {
             return KB_ERR_INVALID;
         }
+        if (symbol->address == (void *)(uintptr_t)&kb_static_call_preserve_noop) {
+            /* Linux static-call NOPs must not cross the C ABI trampoline: the
+             * caller may keep live values in volatile registers across them. */
+            write_ret_stub(module->shim_symbol_stubs + (i * KB_LOCAL_SHIM_STUB_SIZE));
+            continue;
+        }
         if (strcmp(symbol->name, "stackleak_track_stack") == 0) {
             write_ret_stub(module->shim_symbol_stubs + (i * KB_LOCAL_SHIM_STUB_SIZE));
             continue;
@@ -2505,7 +2827,7 @@ static kb_status_t load_sections(kb_module_t *module)
     write_abs_jump_raw_stub(
         module->shim_region + KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET,
         (void *)(uintptr_t)&kb_usb_control_msg_entry);
-    const uint64_t pv_return_zero = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "crc32_le");
+    const uint64_t pv_return_zero = (uint64_t)(uintptr_t)&kb_return_zero;
     const uint64_t pv_cpuid = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "kobox_x86_cpuid");
     const uint64_t pv_read_msr = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "kobox_x86_read_msr");
     const uint64_t pv_read_msr_safe = (uint64_t)(uintptr_t)lookup_module_shim_symbol(module, "kobox_x86_read_msr_safe");
@@ -2524,7 +2846,9 @@ static kb_status_t load_sections(kb_module_t *module)
     write_u64le((uint8_t *)module->shim_pv_ops + 0xdc, pv_return_zero);
     write_u64le((uint8_t *)module->shim_pv_ops + 0xe4, pv_return_zero);
     write_u64le((uint8_t *)module->shim_pv_ops + 0xf0, pv_save_flags);
-    write_u64le(module->kernel_gs + KB_LOCAL_GS_PCPU_HOT_OFFSET, (uint64_t)(uintptr_t)module->shim_current_task);
+    write_u64le(
+        module->kernel_gs + KB_LOCAL_GS_PCPU_HOT_OFFSET,
+        (uint64_t)(uintptr_t)kb_loader_current_task());
     write_u64le(module->kernel_gs + KB_LOCAL_GS_STACK_CHK_GUARD_OFFSET, 0x6b6f626f785f7370ull);
     write_u32le(module->kernel_gs + KB_LOCAL_GS_PREEMPT_COUNT_OFFSET, 0);
     write_u32le(module->kernel_gs + KB_LOCAL_GS_CPU_NUMBER_OFFSET, 0);
@@ -2575,6 +2899,9 @@ static kb_status_t load_sections(kb_module_t *module)
         (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
     write_u64le(
         (uint8_t *)module->shim_current_task + KB_LOCAL_ARCH_6_8_CURRENT_TASK_CRED_OFFSET,
+        (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
+    write_u64le(
+        (uint8_t *)module->shim_current_task + KB_LOCAL_LINUX_6_12_CURRENT_TASK_CRED_OFFSET,
         (uint64_t)(uintptr_t)(module->shim_region + KB_LOCAL_CURRENT_CRED_OFFSET));
     write_u64le(
         module->shim_region + KB_LOCAL_CURRENT_NSPROXY_OFFSET + KB_LOCAL_NSPROXY_MNT_NS_OFFSET,
@@ -2645,7 +2972,44 @@ static kb_status_t load_sections(kb_module_t *module)
             memcpy(memory, module->elf.data + section.offset, (size_t)section.size);
         }
 
+        if (section.name != NULL && strcmp(section.name, ".data..percpu") == 0) {
+#if !defined(_WIN32) && defined(__x86_64__)
+            if (module->module_percpu_offset == 0 ||
+                section.size != module->module_percpu_size ||
+                section.size > KB_LOCAL_GS_SIZE - module->module_percpu_offset)
+            {
+                return KB_ERR_INVALID;
+            }
+            if (section.type != KB_ELF_SHT_NOBITS && section.size != 0) {
+                memcpy(
+                    module->kernel_gs + module->module_percpu_offset,
+                    module->elf.data + section.offset,
+                    (size_t)section.size);
+            }
+#else
+            if (section.size != 0) {
+                return KB_ERR_UNSUPPORTED;
+            }
+#endif
+        }
+
         module->sections[i].base = memory;
+    }
+
+    /* Capture the fully initialized, quiescent synthetic task layout while
+     * modules are being prepared.  Runtime worker/kthread contexts clone this
+     * template, never a task that may currently carry filesystem state. */
+    void *default_task = shared_current_task();
+    if (kb_loader_current_task() == default_task &&
+        kb_loader_task_journal_info(default_task) == NULL)
+    {
+        memcpy(kb_execution_task_template, default_task, sizeof(kb_execution_task_template));
+        memset(
+            kb_execution_task_template +
+                KB_LOCAL_LINUX_6_12_CURRENT_TASK_JOURNAL_INFO_OFFSET,
+            0,
+            sizeof(void *));
+        kb_execution_task_template_valid = 1;
     }
     return KB_OK;
 }
@@ -2817,7 +3181,7 @@ static void *lookup_internal_symbol_override(kb_module_t *module, const char *na
     if (strcmp(name, "_nv037805rm") == 0 || strcmp(name, "nv_kthread_q_stop") == 0 ||
         strcmp(name, "os_flush_cpu_cache") == 0 || strcmp(name, "os_flush_cpu_cache_all") == 0)
     {
-        return lookup_module_shim_symbol(module, "crc32_le");
+        return (void *)(uintptr_t)&kb_return_zero;
     }
     if (strcmp(name, "usb_enable_lpm") == 0 ||
         strcmp(name, "usb_disable_lpm") == 0 ||
@@ -2827,7 +3191,7 @@ static void *lookup_internal_symbol_override(kb_module_t *module, const char *na
         strcmp(name, "usb_enable_usb2_hardware_lpm") == 0 ||
         strcmp(name, "usb_disable_usb2_hardware_lpm") == 0)
     {
-        return lookup_module_shim_symbol(module, "crc32_le");
+        return (void *)(uintptr_t)&kb_return_zero;
     }
     if (strcmp(name, "usb_control_msg") == 0) {
         return module->shim_region + KB_LOCAL_USB_CONTROL_MSG_STUB_OFFSET;
@@ -2875,9 +3239,6 @@ static void *lookup_internal_symbol_override(kb_module_t *module, const char *na
     {
         return lookup_module_shim_symbol(module, "rep_stos_alternative");
     }
-    if (strcmp(name, "ext4_load_and_init_journal") == 0) {
-        return lookup_module_shim_symbol(module, "rep_stos_alternative");
-    }
     return 0;
 }
 
@@ -2896,47 +3257,7 @@ static int should_interpose_exported_symbol(const char *name)
            strcmp(name, "usb_unlink_urb") == 0 ||
            strcmp(name, "kvm_configure_mmu") == 0 ||
            strcmp(name, "kvm_mmu_set_me_spte_mask") == 0 ||
-           strcmp(name, "kvm_mmu_set_mmio_spte_mask") == 0 ||
-           strcmp(name, "jbd2__journal_restart") == 0 ||
-           strcmp(name, "jbd2__journal_start") == 0 ||
-           strcmp(name, "jbd2_journal_abort") == 0 ||
-           strcmp(name, "jbd2_journal_begin_ordered_truncate") == 0 ||
-           strcmp(name, "jbd2_journal_blocks_per_page") == 0 ||
-           strcmp(name, "jbd2_journal_check_available_features") == 0 ||
-           strcmp(name, "jbd2_journal_clear_err") == 0 ||
-           strcmp(name, "jbd2_journal_clear_features") == 0 ||
-           strcmp(name, "jbd2_journal_destroy") == 0 ||
-           strcmp(name, "jbd2_journal_dirty_metadata") == 0 ||
-           strcmp(name, "jbd2_journal_errno") == 0 ||
-           strcmp(name, "jbd2_journal_extend") == 0 ||
-           strcmp(name, "jbd2_journal_finish_inode_data_buffers") == 0 ||
-           strcmp(name, "jbd2_journal_flush") == 0 ||
-           strcmp(name, "jbd2_journal_force_commit") == 0 ||
-           strcmp(name, "jbd2_journal_force_commit_nested") == 0 ||
-           strcmp(name, "jbd2_journal_forget") == 0 ||
-           strcmp(name, "jbd2_journal_free_reserved") == 0 ||
-           strcmp(name, "jbd2_journal_get_create_access") == 0 ||
-           strcmp(name, "jbd2_journal_get_write_access") == 0 ||
-           strcmp(name, "jbd2_journal_init_dev") == 0 ||
-           strcmp(name, "jbd2_journal_init_inode") == 0 ||
-           strcmp(name, "jbd2_journal_init_jbd_inode") == 0 ||
-           strcmp(name, "jbd2_journal_inode_ranged_wait") == 0 ||
-           strcmp(name, "jbd2_journal_inode_ranged_write") == 0 ||
-           strcmp(name, "jbd2_journal_invalidate_folio") == 0 ||
-           strcmp(name, "jbd2_journal_load") == 0 ||
-           strcmp(name, "jbd2_journal_lock_updates") == 0 ||
-           strcmp(name, "jbd2_journal_release_jbd_inode") == 0 ||
-           strcmp(name, "jbd2_journal_revoke") == 0 ||
-           strcmp(name, "jbd2_journal_set_features") == 0 ||
-           strcmp(name, "jbd2_journal_set_triggers") == 0 ||
-           strcmp(name, "jbd2_journal_start") == 0 ||
-           strcmp(name, "jbd2_journal_start_commit") == 0 ||
-           strcmp(name, "jbd2_journal_start_reserved") == 0 ||
-           strcmp(name, "jbd2_journal_stop") == 0 ||
-           strcmp(name, "jbd2_journal_try_to_free_buffers") == 0 ||
-           strcmp(name, "jbd2_journal_unlock_updates") == 0 ||
-           strcmp(name, "jbd2_journal_update_sb_errno") == 0 ||
-           strcmp(name, "jbd2_journal_wipe") == 0;
+           strcmp(name, "kvm_mmu_set_mmio_spte_mask") == 0;
 }
 
 static int relocation_is_direct_call(const uint8_t *target)
@@ -3030,7 +3351,7 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
         }
         if (address_from_exported_module && kb_module_is_executable_address(address)) {
             unsigned long callee_gs = kb_module_kernel_gs_for_address(address);
-            if (callee_gs != 0 && callee_gs != (unsigned long)(uintptr_t)module->kernel_gs) {
+            if (callee_gs != 0) {
                 void *stub = allocate_external_call_stub(module, address, (void *)(uintptr_t)callee_gs);
                 if (stub == NULL) {
                     return KB_ERR_NOMEM;
@@ -3063,7 +3384,12 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
         symbol_address = symbol.value;
     } else {
         if (symbol_is_percpu_offset(module, &symbol)) {
-            symbol_address = symbol.value;
+            if (module->module_percpu_offset == 0 ||
+                symbol.value > module->module_percpu_size)
+            {
+                return KB_ERR_INVALID;
+            }
+            symbol_address = module->module_percpu_offset + symbol.value;
         } else {
             status = loaded_section_address(module, symbol.section_index, symbol.value, &symbol_address);
             if (status != KB_OK) {
@@ -3079,6 +3405,18 @@ static kb_status_t apply_one_relocation(kb_module_t *module, const kb_elf_reloca
     const int64_t addend = relocation->has_addend ? relocation->addend : 0;
     const uint64_t place = (uint64_t)(uintptr_t)target;
     uint64_t relocated_symbol_address = symbol_address;
+    if (trace_modules_enabled() && symbol_is_percpu_offset(module, &symbol)) {
+        fprintf(
+            stderr,
+            "kobox-loader: percpu relocation module=%s symbol=%s type=%u "
+            "address=0x%llx place=0x%llx addend=%lld\n",
+            module->module_name == NULL ? "(unnamed)" : module->module_name,
+            symbol.name == NULL ? "(section)" : symbol.name,
+            (unsigned)relocation->type,
+            (unsigned long long)symbol_address,
+            (unsigned long long)place,
+            (long long)addend);
+    }
     if (symbol.section_index != KB_ELF_SHN_UNDEF &&
         (relocation->type == KB_ELF_R_X86_64_PC32 || relocation->type == KB_ELF_R_X86_64_PLT32) &&
         relocation->offset > 0 &&
@@ -3397,40 +3735,6 @@ static kb_status_t patch_module_xhci_command_doorbell(kb_module_t *module)
     return KB_OK;
 }
 
-static kb_status_t patch_module_ext4_journal_boundary(kb_module_t *module)
-{
-    if (module == NULL || module->module_name == NULL || strstr(module->module_name, "ext4.ko") == NULL) {
-        return KB_OK;
-    }
-
-    uint64_t address = 0;
-    kb_status_t status = find_symbol_address(module, "ext4_load_and_init_journal", &address);
-    if (status == KB_ERR_NOT_FOUND) {
-        return KB_OK;
-    }
-    if (status != KB_OK) {
-        return status;
-    }
-    uint8_t *code = (uint8_t *)(uintptr_t)address;
-    if (!module_contains_executable_address(module, (uintptr_t)code)) {
-        return KB_ERR_UNSUPPORTED;
-    }
-
-    code[0] = 0x31;
-    code[1] = 0xc0;
-    code[2] = 0xc3;
-    code[3] = 0x90;
-    code[4] = 0x90;
-    if (trace_modules_enabled()) {
-        fprintf(
-            stderr,
-            "kobox-loader: patched ext4 journal boundary module=%s symbol=ext4_load_and_init_journal addr=%p\n",
-            module->module_name,
-            (void *)code);
-    }
-    return KB_OK;
-}
-
 static void free_loaded_sections(kb_module_t *module)
 {
     if (module == 0) {
@@ -3559,14 +3863,6 @@ static kb_status_t prepare_module(kb_module_t *module)
         return status;
     }
     if (trace_modules_enabled()) {
-        fprintf(stderr, "kobox-loader: prepare stage=patch_ext4 module=%s\n", module->module_name);
-        fflush(stderr);
-    }
-    status = patch_module_ext4_journal_boundary(module);
-    if (status != KB_OK) {
-        return status;
-    }
-    if (trace_modules_enabled()) {
         fprintf(stderr, "kobox-loader: prepare stage=register_exports module=%s\n", module->module_name);
         fflush(stderr);
     }
@@ -3596,6 +3892,10 @@ static kb_status_t prepare_module(kb_module_t *module)
     } else if (status != KB_ERR_NOT_FOUND) {
         return status;
     }
+    status = finalize_section_protections(module);
+    if (status != KB_OK) {
+        return status;
+    }
     if (trace_modules_enabled()) {
         fprintf(stderr, "kobox-loader: prepare done module=%s init=%p cleanup=%p\n", module->module_name, (void *)module->init_module, (void *)module->cleanup_module);
         fflush(stderr);
@@ -3622,6 +3922,9 @@ kb_status_t kb_module_open_image(
     if (module == 0) {
         return KB_ERR_NOMEM;
     }
+#if !defined(_WIN32) && defined(__x86_64__)
+    module->kernel_gs = kb_shared_kernel_gs;
+#endif
     module->backend = backend;
     module->module_name = kb_copy_string(image->name);
     if (module->module_name == NULL) {

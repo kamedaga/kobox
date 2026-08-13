@@ -16,10 +16,6 @@ typedef struct kb_subsystem_dma_window_profile {
     uint64_t direct_mapping_calls;
     uint64_t direct_mapping_cycles;
     uint64_t direct_mapped_bytes;
-    uint64_t direct_cache_hits;
-    uint64_t direct_cache_hit_cycles;
-    uint64_t direct_cache_misses;
-    uint64_t direct_cache_evictions;
     uint64_t staged_read_calls;
     uint64_t staged_bytes;
     uint64_t staging_copy_cycles;
@@ -44,12 +40,24 @@ uint64_t kb_subsystem_dma_map(
     size_t size,
     kb_dma_dir_t direction,
     kb_status_t *out_status);
+uint64_t kb_subsystem_dma_map_persistent_bidirectional(
+    kb_device_backend_t *backend,
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
+    kb_status_t *out_status);
 kb_status_t kb_subsystem_dma_map_pages(
     kb_device_backend_t *backend,
     kb_device_t *device,
     void *cpu_addr,
     size_t size,
     kb_dma_dir_t direction,
+    uint64_t *out_page_dma,
+    size_t out_capacity);
+kb_status_t kb_subsystem_dma_preallocated_pages(
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
     uint64_t *out_page_dma,
     size_t out_capacity);
 kb_status_t kb_subsystem_dma_window_begin(
@@ -67,7 +75,6 @@ kb_status_t kb_subsystem_dma_cached_window_begin(
 void kb_subsystem_dma_window_end(void);
 void kb_subsystem_dma_cached_window_end(void);
 void kb_subsystem_dma_cached_window_discard(void);
-void kb_subsystem_dma_retained_release_idle(void);
 void kb_subsystem_dma_window_profile_snapshot(
     kb_subsystem_dma_window_profile_t *out_profile);
 void kb_subsystem_dma_window_profile_record_staging(

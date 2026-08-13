@@ -1,6 +1,7 @@
 #include "linux_subsystem/kvm/kvm_symbols.h"
 
 #include "kobox/shim.h"
+#include "loader/module_context.h"
 #include "linux_subsystem/dma/dma.h"
 #include "linux_subsystem/kvm/kvm.h"
 
@@ -400,13 +401,18 @@ static void kb_kvm_sync_page_model(void)
         return;
     }
     kb_kvm_page_payload_base = (uint64_t)(uintptr_t)kb_kvm_page_payloads;
-    kb_kvm_page_offset_base =
-        kb_kvm_phys_base <= kb_kvm_page_payload_base ? kb_kvm_page_payload_base - kb_kvm_phys_base : kb_kvm_page_payload_base;
+    /* Linux's direct-map helpers intentionally do unsigned address arithmetic:
+     *
+     *   page_address(page) = page_offset_base + page_to_pfn(page) * PAGE_SIZE
+     *
+     * A device IOVA is allowed to be numerically above the userspace virtual
+     * arena.  Preserve the modular subtraction instead of clamping it; the
+     * later addition then wraps back to the payload virtual address. */
+    kb_kvm_page_offset_base = kb_kvm_page_payload_base - kb_kvm_phys_base;
     kb_kvm_vmemmap_record_base = (uint64_t)(uintptr_t)kb_kvm_page_records;
     uint64_t phys_pfn = kb_kvm_phys_base >> KB_KVM_PAGE_SHIFT;
     uint64_t adjust = phys_pfn * KB_KVM_STRUCT_PAGE_SIZE;
-    kb_kvm_vmemmap_base =
-        adjust <= kb_kvm_vmemmap_record_base ? kb_kvm_vmemmap_record_base - adjust : kb_kvm_vmemmap_record_base;
+    kb_kvm_vmemmap_base = kb_kvm_vmemmap_record_base - adjust;
 }
 
 uintptr_t kb_linux_kvm_page_offset_base(void)
@@ -476,14 +482,9 @@ int kb_linux_kvm_dma_addr_in_payload_arena(uint64_t dma_addr, size_t size)
     return offset < arena_size && size <= arena_size - offset;
 }
 
-int kb_linux_kvm_page_payload_dma_addr(
-    void *page,
-    unsigned long offset,
-    size_t size,
-    void **out_cpu_addr,
-    uint64_t *out_dma_addr)
+void *kb_linux_kvm_page_payload(void *page, unsigned long offset, size_t size)
 {
-    if (page == NULL || size == 0 || out_cpu_addr == NULL || out_dma_addr == NULL) {
+    if (page == NULL || size == 0) {
         return 0;
     }
     if (offset >= KB_KVM_PAGE_SIZE) {
@@ -517,12 +518,28 @@ int kb_linux_kvm_page_payload_dma_addr(
             return 0;
         }
     }
-    uintptr_t cpu_addr = (uintptr_t)kb_kvm_page_payloads + (page_index * KB_KVM_PAGE_SIZE) + offset;
-    uint64_t dma_addr = 0;
-    if (!kb_linux_kvm_payload_dma_addr((const void *)cpu_addr, size, &dma_addr)) {
+    return kb_kvm_page_payloads + (page_index * KB_KVM_PAGE_SIZE) + offset;
+}
+
+int kb_linux_kvm_page_payload_dma_addr(
+    void *page,
+    unsigned long offset,
+    size_t size,
+    void **out_cpu_addr,
+    uint64_t *out_dma_addr)
+{
+    if (out_cpu_addr == NULL || out_dma_addr == NULL) {
         return 0;
     }
-    *out_cpu_addr = (void *)cpu_addr;
+    void *cpu_addr = kb_linux_kvm_page_payload(page, offset, size);
+    if (cpu_addr == NULL) {
+        return 0;
+    }
+    uint64_t dma_addr = 0;
+    if (!kb_linux_kvm_payload_dma_addr(cpu_addr, size, &dma_addr)) {
+        return 0;
+    }
+    *out_cpu_addr = cpu_addr;
     *out_dma_addr = dma_addr;
     return 1;
 }
@@ -1139,20 +1156,22 @@ static kb_status_t kb_kvm_ensure_dma_arena_mapped(kb_device_backend_t *backend)
         return KB_ERR_NOMEM;
     }
     if (backend == NULL) {
-        kb_kvm_phys_base_valid = 0;
         return KB_ERR_INVALID;
     }
-    if (kb_kvm_dma_arena_mapped && kb_kvm_dma_arena_backend == backend && kb_kvm_phys_base_valid) {
-        return KB_OK;
+    if (kb_kvm_dma_arena_mapped) {
+        /* The page arena and its direct-map model have process lifetime.
+         * Rebinding it would orphan the old mapping and invalidate every
+         * struct-page-derived DMA address already handed to Linux modules. */
+        return kb_kvm_dma_arena_backend == backend && kb_kvm_phys_base_valid ?
+            KB_OK : KB_ERR_INVALID;
     }
 
     kb_status_t status = KB_ERR_INVALID;
-    uint64_t dma_addr = kb_subsystem_dma_map(
+    uint64_t dma_addr = kb_subsystem_dma_map_persistent_bidirectional(
         backend,
         NULL,
         kb_kvm_page_payloads,
         KB_KVM_PAGE_PAYLOAD_BYTES,
-        KB_DMA_BIDIRECTIONAL,
         &status);
     if (status != KB_OK || dma_addr == 0) {
         kb_kvm_phys_base_valid = 0;
@@ -1165,6 +1184,7 @@ static kb_status_t kb_kvm_ensure_dma_arena_mapped(kb_device_backend_t *backend)
     kb_kvm_phys_base_valid = 1;
     kb_kvm_dma_arena_backend = backend;
     kb_kvm_dma_arena_mapped = 1;
+    kb_loader_refresh_page_model_for_all_modules();
     return KB_OK;
 }
 
@@ -1185,8 +1205,13 @@ void *kb_kvm_alloc_pages_stub(unsigned int flags, unsigned int order)
         return NULL;
     }
     kb_device_backend_t *backend = kb_shim_current_device_backend();
-    kb_status_t dma_status = kb_kvm_ensure_dma_arena_mapped(backend);
-    if (dma_status != KB_OK) {
+    if (kb_kvm_ensure_page_arena() != 0) {
+        return NULL;
+    }
+    /* CPU-only page-cache and buffer-cache users do not need a DMA mapping.
+     * Establish it eagerly when a device context exists; BIO mapping will
+     * still fail closed until one has been established. */
+    if (backend != NULL && kb_kvm_ensure_dma_arena_mapped(backend) != KB_OK) {
         return NULL;
     }
 
@@ -1666,7 +1691,7 @@ static const kb_linux_symbol_t symbols[] = {
     {"add_wait_queue_priority_exclusive", (void *)(uintptr_t)&kb_noop_stub},
     {"alloc_cpumask_var_node", (void *)(uintptr_t)&kb_return_one},
     {"alloc_pages_noprof", (void *)(uintptr_t)&kb_kvm_alloc_pages_stub},
-    {"alloc_workqueue_noprof", (void *)(uintptr_t)&kb_alloc_stub},
+    {"alloc_workqueue_noprof", (void *)(uintptr_t)&kb_alloc_workqueue},
     {"anon_inode_create_getfile", (void *)(uintptr_t)&kb_alloc_stub},
     {"anon_inode_getfd", (void *)(uintptr_t)&kb_linux_kvm_anon_inode_getfd},
     {"anon_inode_getfile", (void *)(uintptr_t)&kb_linux_kvm_anon_inode_getfile},

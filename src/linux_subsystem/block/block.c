@@ -40,7 +40,11 @@ typedef struct kb_block_disk_state {
     uint32_t zone_revalidate_count;
     void *io_ctx;
     kb_block_disk_read_fn read_fn;
+    kb_block_disk_read_batch_fn read_batch_fn;
     kb_block_disk_write_fn write_fn;
+    kb_block_disk_write_batch_fn write_batch_fn;
+    kb_block_disk_write_flags_fn write_flags_fn;
+    kb_block_disk_flush_fn flush_fn;
     uint64_t read_count;
     uint64_t write_count;
     uint64_t bytes_read;
@@ -595,6 +599,46 @@ void kb_block_subsystem_disk_set_io(
     state->write_fn = write_fn;
 }
 
+void kb_block_subsystem_disk_set_read_batch(
+    void *disk,
+    kb_block_disk_read_batch_fn read_batch_fn)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state != NULL) {
+        state->read_batch_fn = read_batch_fn;
+    }
+}
+
+void kb_block_subsystem_disk_set_write_batch(
+    void *disk,
+    kb_block_disk_write_batch_fn write_batch_fn)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state != NULL) {
+        state->write_batch_fn = write_batch_fn;
+    }
+}
+
+void kb_block_subsystem_disk_set_write_flags(
+    void *disk,
+    kb_block_disk_write_flags_fn write_flags_fn)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state != NULL) {
+        state->write_flags_fn = write_flags_fn;
+    }
+}
+
+void kb_block_subsystem_disk_set_flush(
+    void *disk,
+    kb_block_disk_flush_fn flush_fn)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state != NULL) {
+        state->flush_fn = flush_fn;
+    }
+}
+
 int kb_block_subsystem_disk_read(void *disk, uint64_t sector, void *buffer, size_t byte_count)
 {
     kb_block_disk_state_t *state = disk_state_for(disk);
@@ -620,7 +664,55 @@ int kb_block_subsystem_disk_read(void *disk, uint64_t sector, void *buffer, size
     return result;
 }
 
-int kb_block_subsystem_disk_write(void *disk, uint64_t sector, const void *buffer, size_t byte_count)
+int kb_block_subsystem_disk_read_batch(
+    void *disk,
+    const kb_block_disk_read_request_t *requests,
+    size_t request_count)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state == NULL || requests == NULL || request_count == 0) {
+        return -22;
+    }
+    if (state->dead || !state->registered) {
+        return -19;
+    }
+    for (size_t i = 0; i < request_count; ++i) {
+        if (requests[i].buffer == NULL ||
+            disk_io_range_valid(state, requests[i].sector, requests[i].byte_count) != 0)
+        {
+            return -22;
+        }
+    }
+    int result = 0;
+    if (state->read_batch_fn != NULL) {
+        result = state->read_batch_fn(state->io_ctx, requests, request_count);
+    } else {
+        for (size_t i = 0; i < request_count; ++i) {
+            result = state->read_fn == NULL ? -95 : state->read_fn(
+                state->io_ctx,
+                requests[i].sector,
+                requests[i].buffer,
+                requests[i].byte_count);
+            if (result != 0) {
+                break;
+            }
+        }
+    }
+    if (result == 0) {
+        state->read_count += request_count;
+        for (size_t i = 0; i < request_count; ++i) {
+            state->bytes_read += requests[i].byte_count;
+        }
+    }
+    return result;
+}
+
+int kb_block_subsystem_disk_write_flags(
+    void *disk,
+    uint64_t sector,
+    const void *buffer,
+    size_t byte_count,
+    uint32_t flags)
 {
     kb_block_disk_state_t *state = disk_state_for(disk);
     if (state == NULL || buffer == NULL) {
@@ -636,16 +728,95 @@ int kb_block_subsystem_disk_write(void *disk, uint64_t sector, const void *buffe
     if (valid != 0) {
         return valid;
     }
-    if (state->write_fn == NULL) {
+    if ((flags & ~KB_BLOCK_DISK_WRITE_FUA) != 0 ||
+        (state->write_fn == NULL && state->write_flags_fn == NULL))
+    {
         return -95;
     }
 
-    int result = state->write_fn(state->io_ctx, sector, buffer, byte_count);
+    int result = state->write_flags_fn != NULL ?
+        state->write_flags_fn(
+            state->io_ctx, sector, buffer, byte_count, flags) :
+        state->write_fn(state->io_ctx, sector, buffer, byte_count);
+    if (result == 0 &&
+        state->write_flags_fn == NULL &&
+        (flags & KB_BLOCK_DISK_WRITE_FUA) != 0)
+    {
+        result = state->flush_fn == NULL ? -95 : state->flush_fn(state->io_ctx);
+    }
     if (result == 0) {
         state->write_count++;
         state->bytes_written += byte_count;
     }
     return result;
+}
+
+int kb_block_subsystem_disk_write(
+    void *disk,
+    uint64_t sector,
+    const void *buffer,
+    size_t byte_count)
+{
+    return kb_block_subsystem_disk_write_flags(
+        disk, sector, buffer, byte_count, 0);
+}
+
+int kb_block_subsystem_disk_write_batch(
+    void *disk,
+    const kb_block_disk_write_request_t *requests,
+    size_t request_count)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state == NULL || requests == NULL || request_count == 0) {
+        return -22;
+    }
+    if (state->dead || !state->registered) {
+        return -19;
+    }
+    if (state->read_only) {
+        return -30;
+    }
+    for (size_t i = 0; i < request_count; ++i) {
+        if (requests[i].buffer == NULL ||
+            disk_io_range_valid(state, requests[i].sector, requests[i].byte_count) != 0)
+        {
+            return -22;
+        }
+    }
+    int result = 0;
+    if (state->write_batch_fn != NULL) {
+        result = state->write_batch_fn(state->io_ctx, requests, request_count);
+    } else {
+        for (size_t i = 0; i < request_count; ++i) {
+            result = state->write_fn == NULL ? -95 : state->write_fn(
+                state->io_ctx,
+                requests[i].sector,
+                requests[i].buffer,
+                requests[i].byte_count);
+            if (result != 0) {
+                break;
+            }
+        }
+    }
+    if (result == 0) {
+        state->write_count += request_count;
+        for (size_t i = 0; i < request_count; ++i) {
+            state->bytes_written += requests[i].byte_count;
+        }
+    }
+    return result;
+}
+
+int kb_block_subsystem_disk_flush(void *disk)
+{
+    kb_block_disk_state_t *state = disk_state_for(disk);
+    if (state == NULL) {
+        return -22;
+    }
+    if (state->dead || !state->registered) {
+        return -19;
+    }
+    return state->flush_fn == NULL ? 0 : state->flush_fn(state->io_ctx);
 }
 
 void *kb_block_subsystem_block_device_alloc(void)
@@ -758,14 +929,20 @@ uint32_t kb_block_subsystem_tagset_alloc_tag(void *tag_set, size_t queue_index)
     }
 
     uint32_t tag = state->next_tag[queue_index];
-    if (tag == 0 || tag >= limit) {
-        tag = 1;
+    for (uint32_t scanned = 0; scanned < limit - 1u; ++scanned) {
+        if (tag == 0 || tag >= limit) {
+            tag = 1;
+        }
+        if (state->rqs[queue_index][tag] == NULL) {
+            state->next_tag[queue_index] = tag + 1u;
+            if (state->next_tag[queue_index] >= limit) {
+                state->next_tag[queue_index] = 1;
+            }
+            return tag;
+        }
+        tag++;
     }
-    state->next_tag[queue_index] = tag + 1;
-    if (state->next_tag[queue_index] >= limit) {
-        state->next_tag[queue_index] = 1;
-    }
-    return tag;
+    return UINT32_MAX;
 }
 
 int kb_block_subsystem_tagset_bind_request(void *tag_set, size_t queue_index, uint32_t tag, void *request)

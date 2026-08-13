@@ -4,7 +4,7 @@ set -eu
 runner="${KOBOX_RUNNER:-${1:-.artifacts/build/kobox-run}}"
 ext4_ko="${KOBOX_EXT4_KO:-}"
 deps="${KOBOX_EXT4_DEPS:-}"
-work_dir=".artifacts/ext4-probe"
+work_dir="${KOBOX_EXT4_PROBE_WORK_DIR:-.artifacts/ext4-probe}"
 
 if [ ! -x "$runner" ]; then
     echo "skip: kobox-run not found; set KOBOX_RUNNER=/path/to/kobox-run"
@@ -94,18 +94,37 @@ if ! command -v debugfs >/dev/null 2>&1; then
     echo "skip: debugfs not found"
     exit 77
 fi
+if ! command -v setfacl >/dev/null 2>&1; then
+    echo "skip: setfacl not found"
+    exit 77
+fi
 
 image="$work_dir/ext4-smoke.img"
 seed_dir="$work_dir/seed"
+block_size=${KOBOX_EXT4_BLOCK_SIZE:-4096}
+case "$block_size" in
+    1024|2048|4096) ;;
+    *)
+        echo "failed: KOBOX_EXT4_BLOCK_SIZE must be 1024, 2048, or 4096" >&2
+        exit 2
+        ;;
+esac
 rm -rf "$seed_dir"
 mkdir -p "$seed_dir"
+mkdir -p "$seed_dir/acl-parent"
+setfacl -m d:u::rwx,d:u:123:r--,d:g::r-x,d:m::r-x,d:o::--- \
+    "$seed_dir/acl-parent"
 printf 'kobox host ext4 smoke original data\n' > "$seed_dir/kobox-smoke.txt"
 awk 'BEGIN { for (i = 0; i < 600; i++) printf "0123456789abcdef" }' > "$seed_dir/kobox-large.txt"
 awk 'BEGIN { for (i = 0; i < 65536; i++) printf "%08x%08x\n", i, 65535 - i }' > "$seed_dir/kobox-ldlike.txt"
 printf 'kobox zero truncate payload\n' > "$seed_dir/kobox-zero.txt"
 rm -f "$image"
-truncate -s 64M "$image"
-mkfs.ext4 -q -F -b 4096 -d "$seed_dir" "$image"
+truncate -s "${KOBOX_EXT4_IMAGE_SIZE:-64M}" "$image"
+if [ -n "${KOBOX_EXT4_MKFS_FEATURES:-}" ]; then
+    mkfs.ext4 -q -F -b "$block_size" -O "$KOBOX_EXT4_MKFS_FEATURES" -d "$seed_dir" "$image"
+else
+    mkfs.ext4 -q -F -b "$block_size" -d "$seed_dir" "$image"
+fi
 
 resolve_inode() {
     debugfs -R "stat $1" "$image" 2>/dev/null |
@@ -116,7 +135,9 @@ inode=$(resolve_inode /kobox-smoke.txt)
 large_inode=$(resolve_inode /kobox-large.txt)
 ldlike_inode=$(resolve_inode /kobox-ldlike.txt)
 zero_inode=$(resolve_inode /kobox-zero.txt)
-if [ -z "$inode" ] || [ -z "$large_inode" ] || [ -z "$ldlike_inode" ] || [ -z "$zero_inode" ]; then
+acl_parent_inode=$(resolve_inode /acl-parent)
+if [ -z "$inode" ] || [ -z "$large_inode" ] || [ -z "$ldlike_inode" ] || \
+   [ -z "$zero_inode" ] || [ -z "$acl_parent_inode" ]; then
     echo "failed: could not resolve smoke inodes"
     exit 1
 fi
@@ -153,10 +174,15 @@ done
 echo "runner: $runner"
 echo "ext4: $ext4_ko"
 echo "image: $image"
+echo "block size: $block_size"
 echo "inode: $inode"
 echo "large inode: $large_inode"
 echo "ldlike inode: $ldlike_inode"
 echo "zero inode: $zero_inode"
+echo "ACL parent inode: $acl_parent_inode"
+if [ -n "${KOBOX_EXT4_MKFS_FEATURES:-}" ]; then
+    echo "features: $KOBOX_EXT4_MKFS_FEATURES"
+fi
 echo "large blocks: $initial_large_blocks"
 echo "zero blocks: $initial_zero_blocks"
 if [ -n "$deps" ]; then
@@ -170,6 +196,8 @@ KOBOX_EXT4_IMAGE_SMOKE_INODE="$inode" \
 KOBOX_EXT4_IMAGE_SMOKE_LARGE_INODE="$large_inode" \
 KOBOX_EXT4_IMAGE_SMOKE_LDLIKE_INODE="$ldlike_inode" \
 KOBOX_EXT4_IMAGE_SMOKE_ZERO_INODE="$zero_inode" \
+KOBOX_EXT4_IMAGE_SMOKE_ACL_PARENT_INODE="$acl_parent_inode" \
+KOBOX_EXT4_IMAGE_SMOKE_CHURN_COUNT="${KOBOX_EXT4_IMAGE_SMOKE_CHURN_COUNT:-256}" \
 "$runner" $args run "$ext4_ko"
 
 if [ "${KOBOX_EXT4_IMAGE_SMOKE_READ_ONLY:-0}" != "0" ] && [ -n "${KOBOX_EXT4_IMAGE_SMOKE_READ_ONLY:-}" ]; then
@@ -177,10 +205,24 @@ if [ "${KOBOX_EXT4_IMAGE_SMOKE_READ_ONLY:-0}" != "0" ] && [ -n "${KOBOX_EXT4_IMA
     exit 0
 fi
 
+# Recreate the whole module/runtime/mount state before inspecting the image
+# from the host.  This catches dependencies on a still-live buffer/page cache.
+# shellcheck disable=SC2086
+KOBOX_TRACE_MODULES="${KOBOX_TRACE_MODULES:-0}" \
+KOBOX_EXT4_IMAGE_SMOKE="$image" \
+KOBOX_EXT4_IMAGE_SMOKE_INODE="$inode" \
+KOBOX_EXT4_IMAGE_SMOKE_LARGE_INODE="$large_inode" \
+KOBOX_EXT4_IMAGE_SMOKE_LDLIKE_INODE="$ldlike_inode" \
+KOBOX_EXT4_IMAGE_SMOKE_ZERO_INODE="$zero_inode" \
+KOBOX_EXT4_IMAGE_SMOKE_ACL_PARENT_INODE="$acl_parent_inode" \
+KOBOX_EXT4_IMAGE_SMOKE_READ_ONLY=1 \
+"$runner" $args run "$ext4_ko"
+echo "kobox-ext4-smoke: clean remount read ok"
+
 persisted=$(
     debugfs -R 'cat /kobox-smoke.txt' "$image" 2>/dev/null || true
 )
-if [ "$persisted" != "kobox-ho" ]; then
+if [ "$persisted" != "kobox-hM" ]; then
     echo "failed: persisted content mismatch"
     printf '%s\n' "$persisted"
     exit 1
@@ -273,9 +315,45 @@ if debugfs -R 'stat /kobox-created-dir' "$image" 2>/dev/null | grep -q '^Inode:'
 fi
 echo "kobox-ext4-smoke: directory consistency ok"
 
+if debugfs -R 'ls -l /' "$image" 2>/dev/null | grep -q '\.apk-churn-'; then
+    echo "failed: APK churn path remains after cleanup"
+    debugfs -R 'ls -l /' "$image" 2>/dev/null || true
+    exit 1
+fi
+echo "kobox-ext4-smoke: APK churn cleanup persistence ok"
+if debugfs -R 'stat /acl-parent/kobox-acl-child' "$image" 2>&1 | \
+    grep -q '^Inode:'
+then
+    echo "failed: ACL inheritance child survived cleanup" >&2
+    exit 1
+fi
+if ! debugfs -R 'ea_list /acl-parent' "$image" 2>/dev/null | \
+    grep -q 'system.posix_acl_default'
+then
+    echo "failed: default POSIX ACL was lost" >&2
+    exit 1
+fi
+echo "kobox-ext4-smoke: POSIX ACL persistence and cleanup ok"
+
+if debugfs -R 'stat /kobox-enospc.dat' "$image" 2>/dev/null | grep -q '^Inode:'; then
+    echo "failed: ENOSPC probe path remains after cleanup"
+    exit 1
+fi
+
 if ! command -v e2fsck >/dev/null 2>&1; then
     echo "skip: e2fsck not found"
     exit 77
 fi
-e2fsck -fn "$image"
+fsck_log="$work_dir/e2fsck.log"
+set +e
+e2fsck -fn "$image" >"$fsck_log" 2>&1
+fsck_status=$?
+set -e
+cat "$fsck_log"
+if [ "$fsck_status" -ne 0 ] ||
+    grep -Eiq 'UNEXPECTED INCONSISTENCY|filesystem still has errors|corrupt|wrong' "$fsck_log"
+then
+    echo "failed: e2fsck reported inconsistency status=$fsck_status"
+    exit 1
+fi
 echo "kobox-ext4-smoke: fsck ok"

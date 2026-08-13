@@ -3,47 +3,15 @@
 
 #include <string.h>
 
-struct kb_subsystem_dma_retained;
-
 typedef struct kb_subsystem_dma_mapping {
     void *cpu_addr;
     uint64_t dma_addr;
     uint64_t size;
     kb_device_t *device;
     uint8_t borrowed_window;
-    struct kb_subsystem_dma_retained *borrowed_retained;
+    uint8_t persistent_allocation;
     struct kb_subsystem_dma_mapping *next;
 } kb_subsystem_dma_mapping_t;
-
-/* Deriving a device mapping costs a capability round trip per request.  The
- * block layer recycles a small set of bounce buffers, so requests repeat the
- * same (address, length, direction) triple constantly.  Retain those mappings
- * instead of tearing them down, and hand the same pages back on the next
- * request.  Only small mappings are retained so the page table stays bounded;
- * larger transfers already ride the scoped window. */
-/* Each retained mapping holds a device mapping capability, and those come out
- * of the same bounded descriptor table the rest of FileD uses.  Keep the pool
- * small enough that retaining mappings never starves it. */
-enum {
-    KB_SUBSYSTEM_DMA_RETAINED_SLOTS = 16,
-    KB_SUBSYSTEM_DMA_RETAINED_MAX_PAGES = 16,
-};
-
-/* Keyed on the exact byte range the mapping was derived for.  The backend
- * derives device addresses for that range only, so a request covering the same
- * pages but a different range must derive its own mapping. */
-typedef struct kb_subsystem_dma_retained {
-    kb_device_backend_t *backend;
-    kb_device_t *device;
-    kb_dma_dir_t direction;
-    void *cpu_addr;
-    size_t size;
-    size_t page_count;
-    uint64_t page_dma[KB_SUBSYSTEM_DMA_RETAINED_MAX_PAGES];
-    size_t borrowers;
-    uint64_t clock;
-    uint8_t active;
-} kb_subsystem_dma_retained_t;
 
 typedef struct kb_subsystem_dma_window {
     kb_device_backend_t *backend;
@@ -66,8 +34,6 @@ enum {
 
 static kb_subsystem_dma_mapping_t *dma_mappings;
 static kb_subsystem_dma_window_t dma_window;
-static kb_subsystem_dma_retained_t dma_retained[KB_SUBSYSTEM_DMA_RETAINED_SLOTS];
-static uint64_t dma_retained_clock;
 #if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
 static kb_subsystem_dma_window_profile_t dma_window_profile;
 #endif
@@ -90,7 +56,7 @@ static kb_status_t remember_dma_mapping_full(
     uint64_t size,
     kb_device_t *device,
     int borrowed_window,
-    kb_subsystem_dma_retained_t *borrowed_retained)
+    int persistent_allocation)
 {
     if (cpu_addr == NULL || size == 0) {
         return KB_ERR_INVALID;
@@ -104,7 +70,7 @@ static kb_status_t remember_dma_mapping_full(
     entry->size = size;
     entry->device = device;
     entry->borrowed_window = borrowed_window != 0;
-    entry->borrowed_retained = borrowed_retained;
+    entry->persistent_allocation = persistent_allocation != 0;
     entry->next = dma_mappings;
     dma_mappings = entry;
     return KB_OK;
@@ -118,7 +84,7 @@ static kb_status_t remember_dma_mapping(
     int borrowed_window)
 {
     return remember_dma_mapping_full(
-        cpu_addr, dma_addr, size, device, borrowed_window, NULL);
+        cpu_addr, dma_addr, size, device, borrowed_window, 0);
 }
 
 static kb_subsystem_dma_mapping_t *take_dma_mapping(uint64_t dma_addr)
@@ -155,82 +121,6 @@ static void dma_window_release_mapping(void)
     dma_window.mapped_size = 0;
     dma_window.mapped_page_count = 0;
     memset(dma_window.page_dma, 0, sizeof(dma_window.page_dma));
-}
-
-static void dma_retained_release(kb_subsystem_dma_retained_t *entry)
-{
-    if (entry == NULL || !entry->active || entry->borrowers != 0) {
-        return;
-    }
-    const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(entry->backend);
-    if (ops != NULL && ops->dma_unmap != NULL) {
-        ops->dma_unmap(
-            entry->device, entry->page_dma[0], entry->size, entry->direction);
-    }
-    memset(entry, 0, sizeof(*entry));
-}
-
-void kb_subsystem_dma_retained_release_idle(void)
-{
-    for (size_t i = 0; i < KB_SUBSYSTEM_DMA_RETAINED_SLOTS; i++) {
-        dma_retained_release(&dma_retained[i]);
-    }
-}
-
-/* Serve a request from a retained mapping when the whole request falls inside
- * the pages that mapping already covers. */
-static kb_subsystem_dma_retained_t *dma_retained_lookup(
-    kb_device_backend_t *backend,
-    kb_device_t *device,
-    void *cpu_addr,
-    size_t size,
-    kb_dma_dir_t direction,
-    uint64_t *out_page_dma,
-    size_t out_capacity)
-{
-    for (size_t i = 0; i < KB_SUBSYSTEM_DMA_RETAINED_SLOTS; i++) {
-        kb_subsystem_dma_retained_t *entry = &dma_retained[i];
-        if (!entry->active || entry->backend != backend ||
-            entry->device != device || entry->direction != direction ||
-            entry->cpu_addr != cpu_addr || entry->size != size ||
-            entry->page_count > out_capacity)
-        {
-            continue;
-        }
-        memcpy(out_page_dma,
-            entry->page_dma,
-            entry->page_count * sizeof(*out_page_dma));
-        entry->clock = ++dma_retained_clock;
-        return entry;
-    }
-    return NULL;
-}
-
-/* Take a slot, evicting the least recently used idle mapping when full.  A
- * mapping that is still borrowed is never evicted; if every slot is busy the
- * caller keeps the one-shot behaviour. */
-static kb_subsystem_dma_retained_t *dma_retained_take_slot(void)
-{
-    kb_subsystem_dma_retained_t *oldest = NULL;
-    for (size_t i = 0; i < KB_SUBSYSTEM_DMA_RETAINED_SLOTS; i++) {
-        kb_subsystem_dma_retained_t *entry = &dma_retained[i];
-        if (!entry->active) {
-            return entry;
-        }
-        if (entry->borrowers == 0 &&
-            (oldest == NULL || entry->clock < oldest->clock))
-        {
-            oldest = entry;
-        }
-    }
-    if (oldest == NULL) {
-        return NULL;
-    }
-    dma_retained_release(oldest);
-#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
-    __atomic_fetch_add(&dma_window_profile.direct_cache_evictions, 1u, __ATOMIC_RELAXED);
-#endif
-    return oldest;
 }
 
 static kb_status_t dma_window_begin_common(
@@ -327,7 +217,6 @@ void kb_subsystem_dma_cached_window_end(void)
 
 void kb_subsystem_dma_cached_window_discard(void)
 {
-    kb_subsystem_dma_retained_release_idle();
     if (dma_window.active || dma_window.borrowers != 0) {
         return;
     }
@@ -355,10 +244,6 @@ void kb_subsystem_dma_window_profile_snapshot(
     KB_DMA_WINDOW_PROFILE_LOAD(direct_mapping_calls);
     KB_DMA_WINDOW_PROFILE_LOAD(direct_mapping_cycles);
     KB_DMA_WINDOW_PROFILE_LOAD(direct_mapped_bytes);
-    KB_DMA_WINDOW_PROFILE_LOAD(direct_cache_hits);
-    KB_DMA_WINDOW_PROFILE_LOAD(direct_cache_hit_cycles);
-    KB_DMA_WINDOW_PROFILE_LOAD(direct_cache_misses);
-    KB_DMA_WINDOW_PROFILE_LOAD(direct_cache_evictions);
     KB_DMA_WINDOW_PROFILE_LOAD(staged_read_calls);
     KB_DMA_WINDOW_PROFILE_LOAD(staged_bytes);
     KB_DMA_WINDOW_PROFILE_LOAD(staging_copy_cycles);
@@ -553,7 +438,14 @@ void *kb_subsystem_dma_alloc(
         return NULL;
     }
 
-    if (remember_dma_mapping(buffer.cpu_addr, buffer.dma_addr, buffer.size, device, 0) != KB_OK) {
+    if (remember_dma_mapping_full(
+            buffer.cpu_addr,
+            buffer.dma_addr,
+            buffer.size,
+            device,
+            0,
+            1) != KB_OK)
+    {
         if (ops->dma_free != NULL) {
             ops->dma_free(device, &buffer);
         }
@@ -562,6 +454,82 @@ void *kb_subsystem_dma_alloc(
 
     *dma_handle = buffer.dma_addr;
     return buffer.cpu_addr;
+}
+
+kb_status_t kb_subsystem_dma_preallocated_pages(
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
+    uint64_t *out_page_dma,
+    size_t out_capacity)
+{
+    if (device == NULL || cpu_addr == NULL || size == 0 ||
+        out_page_dma == NULL || out_capacity == 0)
+    {
+        return KB_ERR_INVALID;
+    }
+    const uintptr_t request_start = (uintptr_t)cpu_addr;
+    if (request_start > UINTPTR_MAX - size) {
+        return KB_ERR_INVALID;
+    }
+    const uintptr_t request_end = request_start + size;
+    for (kb_subsystem_dma_mapping_t *entry = dma_mappings;
+         entry != NULL;
+         entry = entry->next)
+    {
+        const uintptr_t mapping_start = (uintptr_t)entry->cpu_addr;
+        if (!entry->persistent_allocation || entry->device != device ||
+            mapping_start > UINTPTR_MAX - entry->size)
+        {
+            continue;
+        }
+        const uintptr_t mapping_end = mapping_start + (uintptr_t)entry->size;
+        if (request_start < mapping_start || request_end > mapping_end) {
+            continue;
+        }
+        const size_t page_offset =
+            request_start & (KB_SUBSYSTEM_DMA_PAGE_SIZE - 1u);
+        if (size > SIZE_MAX - page_offset) {
+            return KB_ERR_INVALID;
+        }
+        const size_t span = page_offset + size;
+        const size_t page_count =
+            span / KB_SUBSYSTEM_DMA_PAGE_SIZE +
+            (span % KB_SUBSYSTEM_DMA_PAGE_SIZE != 0);
+        if (page_count == 0 || page_count > out_capacity) {
+            return KB_ERR_UNSUPPORTED;
+        }
+        const uintptr_t mapping_offset = request_start - mapping_start;
+        if ((uint64_t)mapping_offset > UINT64_MAX - entry->dma_addr) {
+            return KB_ERR_INVALID;
+        }
+        const uint64_t dma_start =
+            entry->dma_addr + (uint64_t)mapping_offset;
+        const uint64_t page_base =
+            dma_start & ~(uint64_t)(KB_SUBSYSTEM_DMA_PAGE_SIZE - 1u);
+        if (page_count > 1) {
+            const size_t last_index = page_count - 1;
+            if (last_index >
+                UINT64_MAX / (uint64_t)KB_SUBSYSTEM_DMA_PAGE_SIZE)
+            {
+                return KB_ERR_INVALID;
+            }
+            const uint64_t last_delta =
+                (uint64_t)last_index *
+                (uint64_t)KB_SUBSYSTEM_DMA_PAGE_SIZE;
+            if (last_delta > UINT64_MAX - page_base) {
+                return KB_ERR_INVALID;
+            }
+        }
+        out_page_dma[0] = dma_start;
+        for (size_t i = 1; i < page_count; ++i) {
+            const uint64_t page_delta =
+                (uint64_t)i * (uint64_t)KB_SUBSYSTEM_DMA_PAGE_SIZE;
+            out_page_dma[i] = page_base + page_delta;
+        }
+        return KB_OK;
+    }
+    return KB_ERR_NOT_FOUND;
 }
 
 void kb_subsystem_dma_free(
@@ -612,12 +580,13 @@ void *kb_subsystem_dma_cpu_addr(uint64_t dma_addr, size_t *out_available)
     return NULL;
 }
 
-uint64_t kb_subsystem_dma_map(
+static uint64_t dma_map_with_lifetime(
     kb_device_backend_t *backend,
     kb_device_t *device,
     void *cpu_addr,
     size_t size,
     kb_dma_dir_t direction,
+    int persistent_allocation,
     kb_status_t *out_status)
 {
     if (out_status != NULL) {
@@ -634,7 +603,8 @@ uint64_t kb_subsystem_dma_map(
     }
 
     const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
-    if (ops == NULL || ops->dma_map == NULL) {
+    if (ops == NULL || ops->dma_map == NULL ||
+        (persistent_allocation && ops->dma_unmap == NULL)) {
         if (out_status != NULL) {
             *out_status = KB_ERR_UNSUPPORTED;
         }
@@ -643,8 +613,22 @@ uint64_t kb_subsystem_dma_map(
 
     uint64_t dma_addr = 0;
     kb_status_t status = ops->dma_map(device, cpu_addr, size, direction, &dma_addr);
-    if (status == KB_OK) {
-        kb_status_t remember_status = remember_dma_mapping(cpu_addr, dma_addr, size, device, 0);
+    if (status == KB_OK && dma_addr == 0) {
+        /* Zero is the public mapping-error sentinel.  A backend returning it
+         * with KB_OK has nevertheless created a mapping, so roll that mapping
+         * back before reporting the contract violation. */
+        if (ops->dma_unmap != NULL) {
+            ops->dma_unmap(device, dma_addr, size, direction);
+        }
+        status = KB_ERR_IO;
+    } else if (status == KB_OK) {
+        kb_status_t remember_status = remember_dma_mapping_full(
+            cpu_addr,
+            dma_addr,
+            size,
+            device,
+            0,
+            persistent_allocation);
         if (remember_status != KB_OK) {
             if (ops->dma_unmap != NULL) {
                 ops->dma_unmap(device, dma_addr, size, direction);
@@ -656,6 +640,44 @@ uint64_t kb_subsystem_dma_map(
         *out_status = status;
     }
     return status == KB_OK ? dma_addr : 0;
+}
+
+uint64_t kb_subsystem_dma_map(
+    kb_device_backend_t *backend,
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
+    kb_dma_dir_t direction,
+    kb_status_t *out_status)
+{
+    return dma_map_with_lifetime(
+        backend,
+        device,
+        cpu_addr,
+        size,
+        direction,
+        0,
+        out_status);
+}
+
+uint64_t kb_subsystem_dma_map_persistent_bidirectional(
+    kb_device_backend_t *backend,
+    kb_device_t *device,
+    void *cpu_addr,
+    size_t size,
+    kb_status_t *out_status)
+{
+    /* Preallocated subranges do not carry a direction into their lookup.
+     * Only a mapping valid for both device reads and writes may therefore be
+     * published as a persistent parent. */
+    return dma_map_with_lifetime(
+        backend,
+        device,
+        cpu_addr,
+        size,
+        KB_DMA_BIDIRECTIONAL,
+        1,
+        out_status);
 }
 
 kb_status_t kb_subsystem_dma_map_pages(
@@ -696,34 +718,6 @@ kb_status_t kb_subsystem_dma_map_pages(
         return status;
     }
 
-    const uint64_t profile_hit_start = dma_profile_begin();
-    kb_subsystem_dma_retained_t *retained = dma_retained_lookup(
-        backend, device, cpu_addr, size, direction, out_page_dma, out_capacity);
-    if (retained != NULL) {
-        status = remember_dma_mapping_full(
-            cpu_addr, out_page_dma[0], size, device, 0, retained);
-        if (status != KB_OK) {
-            return status;
-        }
-        retained->borrowers++;
-#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
-        const uint64_t profile_hit_end = dma_profile_begin();
-        __atomic_fetch_add(&dma_window_profile.direct_cache_hits, 1u, __ATOMIC_RELAXED);
-        if (profile_hit_start != 0 && profile_hit_end >= profile_hit_start) {
-            __atomic_fetch_add(
-                &dma_window_profile.direct_cache_hit_cycles,
-                profile_hit_end - profile_hit_start,
-                __ATOMIC_RELAXED);
-        }
-#endif
-        return KB_OK;
-    }
-#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
-    __atomic_fetch_add(&dma_window_profile.direct_cache_misses, 1u, __ATOMIC_RELAXED);
-#else
-    (void)profile_hit_start;
-#endif
-
     const uint64_t profile_direct_start = dma_profile_begin();
     status = ops->dma_map_pages(
         device,
@@ -749,36 +743,13 @@ kb_status_t kb_subsystem_dma_map_pages(
         return status;
     }
 
-    const uintptr_t page_offset =
-        (uintptr_t)cpu_addr & (uintptr_t)(KB_SUBSYSTEM_DMA_PAGE_SIZE - 1u);
-    const size_t span = (size_t)page_offset + size;
-    const size_t mapped_pages =
-        span / KB_SUBSYSTEM_DMA_PAGE_SIZE +
-        (span % KB_SUBSYSTEM_DMA_PAGE_SIZE != 0);
-    kb_subsystem_dma_retained_t *slot = NULL;
-    if (mapped_pages != 0 && mapped_pages <= KB_SUBSYSTEM_DMA_RETAINED_MAX_PAGES) {
-        slot = dma_retained_take_slot();
-    }
-
     status = remember_dma_mapping_full(
-        cpu_addr, out_page_dma[0], size, device, 0, slot);
+        cpu_addr, out_page_dma[0], size, device, 0, 0);
     if (status != KB_OK) {
         if (ops->dma_unmap != NULL) {
             ops->dma_unmap(device, out_page_dma[0], size, direction);
         }
         return status;
-    }
-    if (slot != NULL) {
-        slot->backend = backend;
-        slot->device = device;
-        slot->direction = direction;
-        slot->cpu_addr = cpu_addr;
-        slot->size = size;
-        slot->page_count = mapped_pages;
-        memcpy(slot->page_dma, out_page_dma, mapped_pages * sizeof(*out_page_dma));
-        slot->borrowers = 1;
-        slot->clock = ++dma_retained_clock;
-        slot->active = 1;
     }
     return KB_OK;
 }
@@ -841,16 +812,6 @@ void kb_subsystem_dma_unmap(
         kb_kfree(mapping);
         return;
     }
-    if (mapping != NULL && mapping->borrowed_retained != NULL) {
-        /* Keep the device mapping alive for the next request on this buffer. */
-        kb_subsystem_dma_retained_t *entry = mapping->borrowed_retained;
-        if (entry->borrowers != 0) {
-            entry->borrowers--;
-        }
-        kb_kfree(mapping);
-        return;
-    }
-
     const kb_device_backend_ops_t *ops = kb_device_backend_get_ops(backend);
     if (device != NULL && ops != NULL && ops->dma_unmap != NULL) {
         ops->dma_unmap(device, dma_addr, size, direction);

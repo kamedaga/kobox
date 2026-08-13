@@ -92,6 +92,70 @@ struct kb_pachaos_capsule_backend {
 
 static const kb_device_backend_ops_t pachaos_capsule_ops;
 static uint64_t pachaos_capsule_monotonic_ns(kb_device_backend_t *backend);
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+static kb_pachaos_capsule_dma_profile_t pachaos_dma_profile;
+static kb_pachaos_capsule_irq_profile_t pachaos_irq_profile;
+#endif
+
+static inline uint64_t pachaos_profile_begin(void)
+{
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE && defined(__x86_64__)
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | lo;
+#else
+    return 0;
+#endif
+}
+
+void kb_pachaos_capsule_dma_profile_snapshot(
+    kb_pachaos_capsule_dma_profile_t *out_profile)
+{
+    if (out_profile == NULL) {
+        return;
+    }
+    memset(out_profile, 0, sizeof(*out_profile));
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    out_profile->copy_back_calls =
+        __atomic_load_n(&pachaos_dma_profile.copy_back_calls, __ATOMIC_RELAXED);
+    out_profile->copy_back_bytes =
+        __atomic_load_n(&pachaos_dma_profile.copy_back_bytes, __ATOMIC_RELAXED);
+    out_profile->copy_back_cycles =
+        __atomic_load_n(&pachaos_dma_profile.copy_back_cycles, __ATOMIC_RELAXED);
+#endif
+}
+
+void kb_pachaos_capsule_irq_profile_snapshot(
+    kb_pachaos_capsule_irq_profile_t *out_profile)
+{
+    if (out_profile == NULL) {
+        return;
+    }
+    memset(out_profile, 0, sizeof(*out_profile));
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+#define PACHA_IRQ_PROFILE_LOAD(field) \
+    out_profile->field = \
+        __atomic_load_n(&pachaos_irq_profile.field, __ATOMIC_RELAXED)
+    PACHA_IRQ_PROFILE_LOAD(wait_calls);
+    PACHA_IRQ_PROFILE_LOAD(wait_cycles);
+    PACHA_IRQ_PROFILE_LOAD(fd_wait_calls);
+    PACHA_IRQ_PROFILE_LOAD(fd_wait_cycles);
+    PACHA_IRQ_PROFILE_LOAD(fd_wait_ready);
+    PACHA_IRQ_PROFILE_LOAD(poll_calls);
+    PACHA_IRQ_PROFILE_LOAD(poll_cycles);
+    PACHA_IRQ_PROFILE_LOAD(poll_ready);
+    PACHA_IRQ_PROFILE_LOAD(pre_poll_calls);
+    PACHA_IRQ_PROFILE_LOAD(pre_poll_cycles);
+    PACHA_IRQ_PROFILE_LOAD(pre_poll_ready);
+    PACHA_IRQ_PROFILE_LOAD(post_poll_calls);
+    PACHA_IRQ_PROFILE_LOAD(post_poll_cycles);
+    PACHA_IRQ_PROFILE_LOAD(post_poll_ready);
+    PACHA_IRQ_PROFILE_LOAD(handler_calls);
+    PACHA_IRQ_PROFILE_LOAD(handler_cycles);
+#undef PACHA_IRQ_PROFILE_LOAD
+#endif
+}
 
 static kb_status_t status_from_pacha(int status)
 {
@@ -424,7 +488,23 @@ static void release_dma_mapping(kb_pachaos_dma_mapping_t *mapping, int copy_back
         return;
     }
     if (mapping->owns_mapped_cpu_addr && copy_back && mapping->cpu_addr != NULL && mapping->mapped_cpu_addr != NULL) {
+        const uint64_t profile_copy_start = pachaos_profile_begin();
         memcpy(mapping->cpu_addr, mapping->mapped_cpu_addr, (size_t)mapping->size);
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+        const uint64_t profile_copy_end = pachaos_profile_begin();
+        if (profile_copy_start != 0 && profile_copy_end >= profile_copy_start) {
+            __atomic_fetch_add(
+                &pachaos_dma_profile.copy_back_calls, 1u, __ATOMIC_RELAXED);
+            __atomic_fetch_add(
+                &pachaos_dma_profile.copy_back_bytes, mapping->size, __ATOMIC_RELAXED);
+            __atomic_fetch_add(
+                &pachaos_dma_profile.copy_back_cycles,
+                profile_copy_end - profile_copy_start,
+                __ATOMIC_RELAXED);
+        }
+#else
+        (void)profile_copy_start;
+#endif
     }
     if (pacha_capsule_is_fd(mapping->dma.fd)) {
         (void)pacha_capsule_close(mapping->dma.fd);
@@ -1144,7 +1224,37 @@ static kb_status_t pachaos_capsule_irq_wait(kb_device_t *device, kb_device_irq_t
     if (irq == NULL || !pacha_capsule_is_fd(irq->irq.fd)) {
         return KB_ERR_INVALID;
     }
+    const uint64_t profile_wait_start = pachaos_profile_begin();
 #if defined(__pachaos__)
+    uint64_t next_count = 0;
+    const uint64_t profile_pre_poll_start = pachaos_profile_begin();
+    int status = pacha_capsule_irq_poll(
+        irq->irq.fd, irq->irq.count, &next_count);
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    const uint64_t profile_pre_poll_end = pachaos_profile_begin();
+    __atomic_fetch_add(&pachaos_irq_profile.poll_calls, 1u, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pachaos_irq_profile.pre_poll_calls, 1u, __ATOMIC_RELAXED);
+    if (profile_pre_poll_start != 0 && profile_pre_poll_end >= profile_pre_poll_start) {
+        const uint64_t cycles = profile_pre_poll_end - profile_pre_poll_start;
+        __atomic_fetch_add(&pachaos_irq_profile.poll_cycles, cycles, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pachaos_irq_profile.pre_poll_cycles, cycles, __ATOMIC_RELAXED);
+    }
+    if (status == 0) {
+        __atomic_fetch_add(&pachaos_irq_profile.poll_ready, 1u, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pachaos_irq_profile.pre_poll_ready, 1u, __ATOMIC_RELAXED);
+    }
+#else
+    (void)profile_pre_poll_start;
+#endif
+    if (status == 0) {
+        goto dispatch_irq;
+    }
+    if (status != PACHA_ERR_NOT_READY && status != PACHA_SYSCALL_ERR_NOT_READY) {
+        goto finish_wait;
+    }
+    if (timeout_ns == 0) {
+        goto finish_wait;
+    }
     if (timeout_ns != 0) {
         const uint64_t timeout_ticks =
             timeout_ns > UINT64_MAX - 999999ull ? UINT64_MAX :
@@ -1153,19 +1263,103 @@ static kb_status_t pachaos_capsule_irq_wait(kb_device_t *device, kb_device_irq_t
             .fd = irq->irq.fd,
             .events = PACHA_FD_EVENT_READABLE,
         };
+        const uint64_t profile_fd_wait_start = pachaos_profile_begin();
         const long ready = pacha_fd_wait_many(&pollfd, 1, timeout_ticks);
-        if (ready <= 0) {
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+        const uint64_t profile_fd_wait_end = pachaos_profile_begin();
+        __atomic_fetch_add(&pachaos_irq_profile.fd_wait_calls, 1u, __ATOMIC_RELAXED);
+        if (profile_fd_wait_start != 0 && profile_fd_wait_end >= profile_fd_wait_start) {
+            __atomic_fetch_add(
+                &pachaos_irq_profile.fd_wait_cycles,
+                profile_fd_wait_end - profile_fd_wait_start,
+                __ATOMIC_RELAXED);
+        }
+        if (ready > 0) {
+            __atomic_fetch_add(&pachaos_irq_profile.fd_wait_ready, 1u, __ATOMIC_RELAXED);
+        }
+#else
+        (void)profile_fd_wait_start;
+#endif
+        if (ready <= 0 &&
+            ready != PACHA_ERR_NOT_READY &&
+            ready != PACHA_SYSCALL_ERR_NOT_READY)
+        {
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+            const uint64_t profile_wait_end = pachaos_profile_begin();
+            __atomic_fetch_add(&pachaos_irq_profile.wait_calls, 1u, __ATOMIC_RELAXED);
+            if (profile_wait_start != 0 && profile_wait_end >= profile_wait_start) {
+                __atomic_fetch_add(
+                    &pachaos_irq_profile.wait_cycles,
+                    profile_wait_end - profile_wait_start,
+                    __ATOMIC_RELAXED);
+            }
+#endif
             return status_from_pacha((int)ready);
         }
     }
-    uint64_t next_count = 0;
-    const int status = pacha_capsule_irq_poll(
+    const uint64_t profile_poll_start = pachaos_profile_begin();
+    status = pacha_capsule_irq_poll(
         irq->irq.fd, irq->irq.count, &next_count);
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    const uint64_t profile_poll_end = pachaos_profile_begin();
+    __atomic_fetch_add(&pachaos_irq_profile.poll_calls, 1u, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pachaos_irq_profile.post_poll_calls, 1u, __ATOMIC_RELAXED);
+    if (profile_poll_start != 0 && profile_poll_end >= profile_poll_start) {
+        const uint64_t cycles = profile_poll_end - profile_poll_start;
+        __atomic_fetch_add(
+            &pachaos_irq_profile.poll_cycles,
+            cycles,
+            __ATOMIC_RELAXED);
+        __atomic_fetch_add(
+            &pachaos_irq_profile.post_poll_cycles,
+            cycles,
+            __ATOMIC_RELAXED);
+    }
+    if (status == 0) {
+        __atomic_fetch_add(&pachaos_irq_profile.poll_ready, 1u, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pachaos_irq_profile.post_poll_ready, 1u, __ATOMIC_RELAXED);
+    }
+#else
+    (void)profile_poll_start;
+#endif
+finish_wait:
     if (status != 0) {
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+        const uint64_t profile_wait_end = pachaos_profile_begin();
+        __atomic_fetch_add(&pachaos_irq_profile.wait_calls, 1u, __ATOMIC_RELAXED);
+        if (profile_wait_start != 0 && profile_wait_end >= profile_wait_start) {
+            __atomic_fetch_add(
+                &pachaos_irq_profile.wait_cycles,
+                profile_wait_end - profile_wait_start,
+                __ATOMIC_RELAXED);
+        }
+#endif
         return status_from_pacha(status);
     }
+dispatch_irq:
     irq->irq.count = next_count;
+    const uint64_t profile_handler_start = pachaos_profile_begin();
     irq->handler(irq->ctx);
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    const uint64_t profile_handler_end = pachaos_profile_begin();
+    __atomic_fetch_add(&pachaos_irq_profile.handler_calls, 1u, __ATOMIC_RELAXED);
+    if (profile_handler_start != 0 && profile_handler_end >= profile_handler_start) {
+        __atomic_fetch_add(
+            &pachaos_irq_profile.handler_cycles,
+            profile_handler_end - profile_handler_start,
+            __ATOMIC_RELAXED);
+    }
+    const uint64_t profile_wait_end = pachaos_profile_begin();
+    __atomic_fetch_add(&pachaos_irq_profile.wait_calls, 1u, __ATOMIC_RELAXED);
+    if (profile_wait_start != 0 && profile_wait_end >= profile_wait_start) {
+        __atomic_fetch_add(
+            &pachaos_irq_profile.wait_cycles,
+            profile_wait_end - profile_wait_start,
+            __ATOMIC_RELAXED);
+    }
+#else
+    (void)profile_handler_start;
+#endif
     return KB_OK;
 #else
     uint64_t attempts = timeout_ns == 0 ? 1 : (timeout_ns + 999999ull) / 1000000ull;
@@ -1191,6 +1385,7 @@ static kb_status_t pachaos_capsule_irq_wait(kb_device_t *device, kb_device_irq_t
         }
         __asm__ volatile("pause");
     }
+    (void)profile_wait_start;
     return KB_ERR_NOT_FOUND;
 #endif
 }

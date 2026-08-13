@@ -14,6 +14,7 @@ uintptr_t kb_linux_kvm_exported_vmemmap_base(void);
 uintptr_t kb_linux_kvm_phys_base(void);
 int kb_linux_kvm_payload_dma_addr(const void *cpu_addr, size_t size, uint64_t *out_dma_addr);
 int kb_linux_kvm_dma_addr_in_payload_arena(uint64_t dma_addr, size_t size);
+void *kb_linux_kvm_page_payload(void *page, unsigned long offset, size_t size);
 int kb_linux_kvm_page_payload_dma_addr(
     void *page,
     unsigned long offset,
