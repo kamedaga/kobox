@@ -95,6 +95,13 @@ struct kb_pachaos_capsule_backend {
 
 static const kb_device_backend_ops_t pachaos_capsule_ops;
 static uint64_t pachaos_capsule_monotonic_ns(kb_device_backend_t *backend);
+static kb_status_t pachaos_capsule_dma_map_pages(
+    kb_device_t *device,
+    void *cpu_addr,
+    uint64_t size,
+    kb_dma_dir_t direction,
+    uint64_t *out_page_dma,
+    size_t out_capacity);
 #if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
 static kb_pachaos_capsule_dma_profile_t pachaos_dma_profile;
 static kb_pachaos_capsule_irq_profile_t pachaos_irq_profile;
@@ -524,7 +531,7 @@ static void release_dma_mapping(kb_pachaos_dma_mapping_t *mapping, int copy_back
         free_aligned_zeroed(mapping->alloc_addr, mapping->alloc_size);
     } else if (mapping->owns_cpu_addr) {
         free(mapping->cpu_addr);
-    } else if (mapping->owns_mapped_cpu_addr) {
+    } else if (mapping->owns_mapped_cpu_addr && mapping->vmo_mapping == NULL) {
         free(mapping->mapped_cpu_addr);
     }
     free(mapping);
@@ -904,13 +911,147 @@ static kb_status_t pachaos_capsule_dma_map(
         return KB_ERR_INVALID;
     }
     void *mapped = (void *)((uintptr_t)cpu_addr - (uintptr_t)page_offset);
+    uint64_t mapped_size = map_size;
+    uint64_t dma_offset = page_offset;
+    void *mapped_cpu_addr = cpu_addr;
+    int owns_mapped = 0;
+#if defined(__pachaos__)
+    void *vmo_mapping = NULL;
+    uint64_t vmo_mapping_size = 0;
+    int vmo_fd = 0;
+    int needs_bounce = 0;
+
+    /* The direct derive syscall still packs noncontiguous live pages. Probe
+     * physical continuity through the scatter API first so only an already
+     * contiguous range can reach that path. Large ranges are probed in chunks
+     * to keep transient FD use bounded to one mapping at a time. */
+    const uint64_t page_count = map_size / page_size;
+    if (page_count > 1 && page_count <= KB_DEVICE_DMA_MAPPING_MAX_PAGES) {
+        uint64_t page_dma[KB_DEVICE_DMA_MAPPING_MAX_PAGES];
+        const kb_status_t pages_status = pachaos_capsule_dma_map_pages(
+            device,
+            cpu_addr,
+            size,
+            direction,
+            page_dma,
+            KB_DEVICE_DMA_MAPPING_MAX_PAGES);
+        if (pages_status != KB_OK) {
+            return pages_status;
+        }
+
+        int contiguous = 1;
+        const uint64_t first_page_dma = page_dma[0] - page_offset;
+        for (uint64_t i = 1; i < page_count; i++) {
+            const uint64_t page_delta = i * page_size;
+            if (first_page_dma > UINT64_MAX - page_delta ||
+                page_dma[i] != first_page_dma + page_delta)
+            {
+                contiguous = 0;
+                break;
+            }
+        }
+        if (contiguous) {
+            *out_dma_addr = page_dma[0];
+            return KB_OK;
+        }
+
+        kb_pachaos_dma_mapping_t *probe = take_dma_mapping(device->backend, page_dma[0]);
+        if (probe == NULL) {
+            return KB_ERR_IO;
+        }
+        release_dma_mapping(probe, 0);
+        needs_bounce = 1;
+    } else if (page_count > KB_DEVICE_DMA_MAPPING_MAX_PAGES) {
+        uintptr_t probe_addr = (uintptr_t)cpu_addr;
+        uint64_t remaining = size;
+        uint64_t expected_page_dma = 0;
+        int have_expected_page_dma = 0;
+        while (remaining != 0) {
+            const uint64_t probe_offset = (uint64_t)(probe_addr & (uintptr_t)(page_size - 1u));
+            const uint64_t probe_capacity =
+                (uint64_t)KB_DEVICE_DMA_MAPPING_MAX_PAGES * page_size - probe_offset;
+            const uint64_t probe_size = remaining < probe_capacity ? remaining : probe_capacity;
+            uint64_t page_dma[KB_DEVICE_DMA_MAPPING_MAX_PAGES];
+            const kb_status_t pages_status = pachaos_capsule_dma_map_pages(
+                device,
+                (void *)probe_addr,
+                probe_size,
+                direction,
+                page_dma,
+                KB_DEVICE_DMA_MAPPING_MAX_PAGES);
+            if (pages_status != KB_OK) {
+                return pages_status;
+            }
+
+            const uint64_t probe_span = probe_offset + probe_size;
+            const uint64_t probe_page_count =
+                probe_span / page_size + (probe_span % page_size != 0);
+            for (uint64_t i = 0; i < probe_page_count; i++) {
+                const uint64_t current_page_dma =
+                    i == 0 ? page_dma[0] - probe_offset : page_dma[i];
+                if ((have_expected_page_dma && current_page_dma != expected_page_dma) ||
+                    current_page_dma > UINT64_MAX - page_size)
+                {
+                    needs_bounce = 1;
+                    break;
+                }
+                expected_page_dma = current_page_dma + page_size;
+                have_expected_page_dma = 1;
+            }
+
+            kb_pachaos_dma_mapping_t *probe = take_dma_mapping(device->backend, page_dma[0]);
+            if (probe == NULL) {
+                return KB_ERR_IO;
+            }
+            release_dma_mapping(probe, 0);
+            if (needs_bounce) {
+                break;
+            }
+            if (probe_addr > UINTPTR_MAX - probe_size) {
+                return KB_ERR_INVALID;
+            }
+            probe_addr += (uintptr_t)probe_size;
+            remaining -= probe_size;
+        }
+    }
+
+    if (needs_bounce) {
+        const uint64_t bounce_size = align_up_u64(size, page_size);
+        if (bounce_size == 0 || bounce_size > (uint64_t)SIZE_MAX) {
+            return KB_ERR_INVALID;
+        }
+        vmo_fd = pacha_vmo_create_contiguous(bounce_size, 0, 0);
+        if (vmo_fd < 16) {
+            return KB_ERR_NOMEM;
+        }
+        vmo_mapping = pacha_mmap(
+            vmo_fd,
+            bounce_size,
+            PACHA_PROT_READ | PACHA_PROT_WRITE,
+            PACHA_MMAP_SHARED,
+            0);
+        if (vmo_mapping == NULL) {
+            (void)pacha_fd_close(vmo_fd);
+            return KB_ERR_NOMEM;
+        }
+        mapped = vmo_mapping;
+        mapped_size = bounce_size;
+        dma_offset = 0;
+        mapped_cpu_addr = vmo_mapping;
+        owns_mapped = 1;
+        vmo_mapping_size = bounce_size;
+        if (direction == KB_DMA_TO_DEVICE || direction == KB_DMA_BIDIRECTIONAL) {
+            memcpy(mapped_cpu_addr, cpu_addr, (size_t)size);
+        }
+    }
+#endif
 
     struct pacha_capsule_dma dma = {0};
     const int status = pacha_capsule_derive_dma_mapping(
         device->device_fd,
         mapped,
         PACHA_CAPSULE_DMA_IOVA_KERNEL_CHOOSE,
-        (size_t)map_size,
+        (size_t)mapped_size,
         (unsigned)dma_dir_to_pacha(direction),
         0);
     if (!pacha_capsule_is_fd(status)) {
@@ -920,15 +1061,31 @@ static kb_status_t pachaos_capsule_dma_map(
                 cpu_addr,
                 mapped,
                 (unsigned long long)size,
-                (unsigned long long)map_size,
-                0,
+                (unsigned long long)mapped_size,
+                owns_mapped,
                 status);
         }
+#if defined(__pachaos__)
+        if (vmo_mapping != NULL) {
+            (void)pacha_munmap(vmo_mapping, vmo_mapping_size);
+        }
+        if (vmo_fd >= 16) {
+            (void)pacha_fd_close(vmo_fd);
+        }
+#endif
         return status_from_pacha(status);
     }
     const int read_status = pacha_capsule_dma_from_fd(status, &dma);
     if (read_status != 0) {
         (void)pacha_capsule_close(status);
+#if defined(__pachaos__)
+        if (vmo_mapping != NULL) {
+            (void)pacha_munmap(vmo_mapping, vmo_mapping_size);
+        }
+        if (vmo_fd >= 16) {
+            (void)pacha_fd_close(vmo_fd);
+        }
+#endif
         return status_from_pacha(read_status);
     }
     if (trace_pachaos_dma_enabled()) {
@@ -937,8 +1094,8 @@ static kb_status_t pachaos_capsule_dma_map(
             cpu_addr,
             mapped,
             (unsigned long long)size,
-            (unsigned long long)map_size,
-            0,
+            (unsigned long long)mapped_size,
+            owns_mapped,
             dma.fd,
             (unsigned long long)dma.iova,
             dma.len,
@@ -948,13 +1105,18 @@ static kb_status_t pachaos_capsule_dma_map(
     kb_pachaos_dma_mapping_t mapping = {
         .dma = dma,
         .cpu_addr = cpu_addr,
-        .mapped_cpu_addr = mapped,
+        .mapped_cpu_addr = mapped_cpu_addr,
+#if defined(__pachaos__)
+        .vmo_mapping = vmo_mapping,
+        .vmo_mapping_size = vmo_mapping_size,
+        .vmo_fd = vmo_fd,
+#endif
         .alloc_addr = NULL,
         .alloc_size = 0,
         .size = size,
         .direction = direction,
         .owns_cpu_addr = 0,
-        .owns_mapped_cpu_addr = 0,
+        .owns_mapped_cpu_addr = owns_mapped,
     };
     kb_status_t remember_status = remember_dma_mapping(device->backend, &mapping);
     if (remember_status != KB_OK) {
@@ -966,9 +1128,17 @@ static kb_status_t pachaos_capsule_dma_map(
                 remember_status);
         }
         (void)pacha_capsule_close(dma.fd);
+#if defined(__pachaos__)
+        if (vmo_mapping != NULL) {
+            (void)pacha_munmap(vmo_mapping, vmo_mapping_size);
+        }
+        if (vmo_fd >= 16) {
+            (void)pacha_fd_close(vmo_fd);
+        }
+#endif
         return remember_status;
     }
-    *out_dma_addr = dma.iova + page_offset;
+    *out_dma_addr = dma.iova + dma_offset;
     return KB_OK;
 }
 
