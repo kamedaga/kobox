@@ -242,6 +242,12 @@ static void *kb_kvm_alloc_aligned_zeroed(size_t size, size_t alignment, void **a
     return (void *)aligned;
 }
 
+__attribute__((weak)) void *kb_kvm_host_alloc_dma_arena(size_t bytes)
+{
+    (void)bytes;
+    return NULL;
+}
+
 static int kb_kvm_ensure_page_arena(void)
 {
     if (kb_kvm_page_payloads != NULL && kb_kvm_page_records != NULL) {
@@ -250,15 +256,18 @@ static int kb_kvm_ensure_page_arena(void)
 
     void *payloads_alloc = NULL;
     void *records_alloc = NULL;
-    void *payloads =
-        kb_kvm_alloc_aligned_zeroed(KB_KVM_PAGE_PAYLOAD_BYTES, KB_KVM_PAGE_SIZE, &payloads_alloc);
-    if (payloads == NULL) {
-        return -ENOMEM;
-    }
     void *records = kb_kvm_alloc_aligned_zeroed(
         KB_KVM_PAGE_RECORD_BYTES, KB_KVM_STRUCT_PAGE_SIZE, &records_alloc);
     if (records == NULL) {
-        free(payloads_alloc);
+        return -ENOMEM;
+    }
+    void *payloads = kb_kvm_host_alloc_dma_arena(KB_KVM_PAGE_PAYLOAD_BYTES);
+    if (payloads == NULL) {
+        payloads = kb_kvm_alloc_aligned_zeroed(
+            KB_KVM_PAGE_PAYLOAD_BYTES, KB_KVM_PAGE_SIZE, &payloads_alloc);
+    }
+    if (payloads == NULL) {
+        free(records_alloc);
         return -ENOMEM;
     }
     memset(kb_kvm_page_alloc_state, 0, sizeof(kb_kvm_page_alloc_state));

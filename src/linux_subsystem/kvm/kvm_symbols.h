@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 const kb_linux_symbol_t *kb_linux_kvm_symbols(size_t *out_count);
+void *kb_kvm_host_alloc_dma_arena(size_t bytes);
 uintptr_t kb_linux_kvm_page_offset_base(void);
 uintptr_t kb_linux_kvm_exported_page_offset_base(void);
 uintptr_t kb_linux_kvm_vmemmap_base(void);

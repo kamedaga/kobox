@@ -23,6 +23,7 @@ add_library(kobox_runtime STATIC
     src/device/linux_mock/device_linux_mock.c
     src/device/pachaos_capsule/device_pachaos_capsule.c
     src/device/pachaos_capsule/device_pachaos_capsule_env.c
+    src/device/pachaos_capsule/pachaos_dma_arena.c
     src/device/linux_sysfs/device_linux_sysfs.c
     src/device/linux_vfio/device_linux_vfio.c
     src/device/linux_vfio/nvme.c
