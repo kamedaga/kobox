@@ -75,6 +75,8 @@ enum {
     KB_LOCAL_CURRENT_CRED_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 7680,
     KB_LOCAL_CURRENT_MM_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 4608,
     KB_LOCAL_CURRENT_TASK_OFFSET = KB_LOCAL_SHIM_DATA_OFFSET + 8192,
+    /* task_struct::__state in the Linux 6.8 TTY and Linux 6.12 ext4 modules. */
+    KB_LOCAL_LINUX_TASK_STATE_OFFSET = 0x18,
     KB_LOCAL_CURRENT_TASK_NSPROXY_OFFSET = 0x750,
     KB_LOCAL_ARCH_6_8_CURRENT_TASK_NSPROXY_OFFSET = 0x840,
     KB_LOCAL_CURRENT_TASK_REAL_CRED_OFFSET = 0x6f0,
@@ -1876,6 +1878,18 @@ void *kb_loader_task_journal_info(const void *task)
             sizeof(journal_info));
     }
     return journal_info;
+}
+
+unsigned int kb_loader_task_state(const void *task)
+{
+    unsigned int state = 0;
+    if (task != NULL) {
+        memcpy(
+            &state,
+            (const uint8_t *)task + KB_LOCAL_LINUX_TASK_STATE_OFFSET,
+            sizeof(state));
+    }
+    return state;
 }
 
 void kb_loader_set_current_task_for_all_modules(void *task)

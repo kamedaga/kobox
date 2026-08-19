@@ -42,6 +42,7 @@ enum {
     KB_LINUX_TIMER_EXPIRES_OFFSET = 16,
     KB_LINUX_TIMER_FUNCTION_OFFSET = 24,
     KB_DEFERRED_DRAIN_LIMIT = 1024,
+    KB_DEFERRED_MAX_DRAIN_DEPTH = 8,
     KB_DEFERRED_LIST_WALK_LIMIT = 65536,
     KB_WORK_CONTEXT_MAX_DEPTH = 16,
     KB_JIFFIES_STORAGE_MAX = 64,
@@ -587,9 +588,8 @@ static void refresh_deferred_tail(void)
     }
 }
 
-static kb_deferred_item_t *pop_due_deferred(int include_work)
+static kb_deferred_item_t *pop_due_deferred_at(int include_work, uint64_t now_ns)
 {
-    const uint64_t now_ns = elapsed_ns();
     kb_deferred_item_t **cursor = &deferred_head;
     while (*cursor != NULL) {
         kb_deferred_item_t *item = *cursor;
@@ -607,6 +607,11 @@ static kb_deferred_item_t *pop_due_deferred(int include_work)
         cursor = &item->next;
     }
     return NULL;
+}
+
+static kb_deferred_item_t *pop_due_deferred(int include_work)
+{
+    return pop_due_deferred_at(include_work, elapsed_ns());
 }
 
 static kb_deferred_item_t *pop_workqueue_deferred(void *workqueue, uint64_t through_sequence)
@@ -1100,15 +1105,13 @@ static int run_tasklet(void *tasklet, unsigned long fallback_gs)
     return 1;
 }
 
-static void run_deferred_items(int include_work)
+static void run_deferred_items_body(int include_work, int has_initial_now, uint64_t initial_now)
 {
-    if (draining_deferred_depth >= 8) {
-        return;
-    }
-
-    draining_deferred_depth++;
     for (unsigned i = 0; i < KB_DEFERRED_DRAIN_LIMIT; i++) {
-        kb_deferred_item_t *item = pop_due_deferred(include_work);
+        kb_deferred_item_t *item = has_initial_now ?
+            pop_due_deferred_at(include_work, initial_now) :
+            pop_due_deferred(include_work);
+        has_initial_now = 0;
         if (item == NULL) {
             break;
         }
@@ -1136,12 +1139,46 @@ static void run_deferred_items(int include_work)
         }
         release_deferred_item(item);
     }
+}
+
+static void run_deferred_items(int include_work)
+{
+    if (draining_deferred_depth >= KB_DEFERRED_MAX_DRAIN_DEPTH) {
+        return;
+    }
+
+    draining_deferred_depth++;
+    run_deferred_items_body(include_work, 0, 0);
     draining_deferred_depth--;
 }
 
 void kb_run_deferred_work(void)
 {
     if (kb_kthread_yield_current()) {
+        return;
+    }
+    const int no_deferred = deferred_head == NULL;
+    const int has_runnable = no_deferred ? kb_kthread_has_runnable() : 0;
+    if (no_deferred && !has_runnable) {
+        /*
+         * Preserve the empty full-path ordering around elapsed_ns(): the
+         * depth is observable to a reentrant clock backend, and that backend
+         * can make deferred work or a kthread runnable.  Reuse this first
+         * timestamp if either state changed instead of taking it twice.
+         */
+        if (draining_deferred_depth < KB_DEFERRED_MAX_DRAIN_DEPTH) {
+            draining_deferred_depth++;
+            const uint64_t now_ns = elapsed_ns();
+            const int recheck_deferred = deferred_head != NULL;
+            const int recheck_runnable = recheck_deferred ? 0 : kb_kthread_has_runnable();
+            if (recheck_deferred || recheck_runnable) {
+                run_deferred_items_body(1, 1, now_ns);
+                draining_deferred_depth--;
+                kb_kthread_run_ready();
+                return;
+            }
+            draining_deferred_depth--;
+        }
         return;
     }
     kb_kthread_run_ready();

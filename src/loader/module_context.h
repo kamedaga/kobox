@@ -10,6 +10,7 @@ void *kb_loader_default_current_task(void);
 void *kb_loader_current_task(void);
 void *kb_loader_clone_execution_task(void);
 void *kb_loader_task_journal_info(const void *task);
+unsigned int kb_loader_task_state(const void *task);
 void kb_loader_set_current_task_for_all_modules(void *task);
 void kb_loader_refresh_page_model_for_all_modules(void);
 kb_status_t kb_loader_enter_module_context(kb_module_t *module, unsigned long *out_old_gs);

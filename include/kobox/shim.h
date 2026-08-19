@@ -550,6 +550,7 @@ int kb_kthread_should_stop(void);
 int kb_kthread_stop(void *task);
 int kb_kthread_yield_current(void);
 void kb_kthread_run_ready(void);
+int kb_kthread_has_runnable(void);
 void *kb_kthread_current_task(void);
 void kb_kthread_prepare_wait(void *task);
 void kb_kthread_finish_wait(void *task);

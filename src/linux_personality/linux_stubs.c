@@ -1659,17 +1659,11 @@ void kb_schedule(void)
         return;
     }
 
-    /*
-     * schedule() only blocks a task after a wait primitive changed its
-     * state away from TASK_RUNNING.  Kobox does not expose Linux task state
-     * to the host scheduler, so prepare_to_wait*() records that transition
-     * explicitly.  A plain schedule() remains a cooperative yield.
-     *
-     * A wake between prepare_to_wait*() and schedule() must not be lost.
-     * In that case Linux would observe TASK_RUNNING and schedule() may return
-     * immediately, which is exactly what the wake_pending branch models.
-     */
-    if (active_kthread->wait_prepared) {
+    /* prepare_to_wait*() records the transition explicitly, while callers
+     * such as khvcd write task_struct::__state directly before schedule(). */
+    const int state_blocks = kb_loader_task_state(active_kthread->task) != 0;
+    if (active_kthread->wait_prepared || state_blocks) {
+        /* Do not lose a wake delivered between preparing to sleep and here. */
         if (active_kthread->wake_pending) {
             active_kthread->wait_prepared = 0;
             active_kthread->wake_pending = 0;
@@ -1791,6 +1785,16 @@ void kb_kthread_run_ready(void)
     for (kb_kthread_record_t *record = kthread_records; record != NULL; record = record->next) {
         kb_kthread_run_one(record);
     }
+}
+
+int kb_kthread_has_runnable(void)
+{
+    for (kb_kthread_record_t *record = kthread_records; record != NULL; record = record->next) {
+        if (record->activated && !record->finished) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int kb_kthread_should_stop(void)
