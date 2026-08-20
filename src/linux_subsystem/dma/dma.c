@@ -87,12 +87,12 @@ static kb_status_t remember_dma_mapping(
         cpu_addr, dma_addr, size, device, borrowed_window, 0);
 }
 
-static kb_subsystem_dma_mapping_t *take_dma_mapping(uint64_t dma_addr)
+static kb_subsystem_dma_mapping_t *take_dma_mapping(kb_device_t *device, uint64_t dma_addr)
 {
     kb_subsystem_dma_mapping_t **cursor = &dma_mappings;
     while (*cursor != NULL) {
         kb_subsystem_dma_mapping_t *entry = *cursor;
-        if (entry->dma_addr == dma_addr) {
+        if (entry->device == device && entry->dma_addr == dma_addr) {
             *cursor = entry->next;
             entry->next = NULL;
             return entry;
@@ -100,6 +100,19 @@ static kb_subsystem_dma_mapping_t *take_dma_mapping(uint64_t dma_addr)
         cursor = &entry->next;
     }
     return NULL;
+}
+
+int kb_subsystem_dma_has_transient_mapping(kb_device_t *device, uint64_t dma_addr)
+{
+    for (kb_subsystem_dma_mapping_t *entry = dma_mappings; entry != NULL; entry = entry->next) {
+        if (entry->device == device &&
+            entry->dma_addr == dma_addr &&
+            !entry->persistent_allocation)
+        {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void dma_window_release_mapping(void)
@@ -804,7 +817,7 @@ void kb_subsystem_dma_unmap(
         device = kb_subsystem_dma_default_device(backend);
     }
 
-    kb_subsystem_dma_mapping_t *mapping = take_dma_mapping(dma_addr);
+    kb_subsystem_dma_mapping_t *mapping = take_dma_mapping(device, dma_addr);
     if (mapping != NULL && mapping->borrowed_window) {
         if (dma_window.borrowers != 0) {
             dma_window.borrowers--;

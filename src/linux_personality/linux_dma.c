@@ -339,10 +339,18 @@ void kb_dma_unmap_page_attrs(void *dev, uint64_t dma_addr, size_t size, int dir,
     }
 
     trace_dma_from_device_head("unmap_page", dma_addr, size, dir);
-    if (kb_linux_kvm_dma_addr_in_payload_arena(dma_addr, size)) {
+    kb_device_t *device = dma_device(dev);
+    if (kb_linux_kvm_dma_addr_in_payload_arena(dma_addr, size) &&
+        !kb_subsystem_dma_has_transient_mapping(device, dma_addr))
+    {
         return;
     }
-    kb_subsystem_dma_unmap(kb_shim_current_device_backend(), dma_device(dev), dma_addr, size, linux_dma_dir(dir));
+    kb_subsystem_dma_unmap(
+        kb_shim_current_device_backend(),
+        device,
+        dma_addr,
+        size,
+        linux_dma_dir(dir));
 }
 
 void kb_dma_unmap_single_attrs(void *dev, uint64_t dma_addr, size_t size, int dir, unsigned long attrs)

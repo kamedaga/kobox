@@ -93,4 +93,7 @@ void kb_subsystem_dma_unmap(
     uint64_t dma_addr,
     size_t size,
     kb_dma_dir_t direction);
+int kb_subsystem_dma_has_transient_mapping(
+    kb_device_t *device,
+    uint64_t dma_addr);
 int kb_subsystem_dma_mapping_error(uint64_t dma_addr);
