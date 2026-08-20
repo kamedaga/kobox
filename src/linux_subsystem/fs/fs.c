@@ -607,6 +607,110 @@ static uint64_t fs_hotpath_tsc(void)
 #define FS_HOTPATH_END(field, name) ((void)0)
 #endif
 
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE && defined(__x86_64__)
+#define FS_READ_PROFILE_BEGIN(name) const uint64_t name = fs_hotpath_tsc()
+#define FS_READ_PROFILE_END(field, name) \
+    do { \
+        const uint64_t profile_end = fs_hotpath_tsc(); \
+        if (profile_end >= (name)) { \
+            __atomic_fetch_add( \
+                &fs_read_profile.field##_cycles, \
+                profile_end - (name), \
+                __ATOMIC_RELAXED); \
+            __atomic_fetch_add( \
+                &fs_read_profile.field##_calls, \
+                1u, \
+                __ATOMIC_RELAXED); \
+        } \
+    } while (0)
+#define FS_READ_PROFILE_EXTENT_BEGIN(name) \
+    const uint64_t name = fs_hotpath_tsc(); \
+    const uint64_t name##_device = __atomic_load_n( \
+        &fs_read_profile.device_read_cycles, __ATOMIC_RELAXED); \
+    const uint64_t name##_overlay = __atomic_load_n( \
+        &fs_read_profile.overlay_cycles, __ATOMIC_RELAXED)
+#define FS_READ_PROFILE_EXTENT_END(name) \
+    do { \
+        const uint64_t profile_end = fs_hotpath_tsc(); \
+        const uint64_t profile_device_end = __atomic_load_n( \
+            &fs_read_profile.device_read_cycles, __ATOMIC_RELAXED); \
+        const uint64_t profile_overlay_end = __atomic_load_n( \
+            &fs_read_profile.overlay_cycles, __ATOMIC_RELAXED); \
+        if (profile_end >= (name)) { \
+            uint64_t profile_cycles = profile_end - (name); \
+            const uint64_t profile_device_cycles = \
+                profile_device_end >= name##_device ? \
+                    profile_device_end - name##_device : 0; \
+            const uint64_t profile_overlay_cycles = \
+                profile_overlay_end >= name##_overlay ? \
+                    profile_overlay_end - name##_overlay : 0; \
+            const uint64_t profile_nested_cycles = \
+                profile_device_cycles <= UINT64_MAX - profile_overlay_cycles ? \
+                    profile_device_cycles + profile_overlay_cycles : UINT64_MAX; \
+            profile_cycles = profile_cycles > profile_nested_cycles ? \
+                profile_cycles - profile_nested_cycles : 0; \
+            __atomic_fetch_add( \
+                &fs_read_profile.extent_lookup_cycles, \
+                profile_cycles, \
+                __ATOMIC_RELAXED); \
+            __atomic_fetch_add( \
+                &fs_read_profile.extent_lookup_calls, \
+                1u, \
+                __ATOMIC_RELAXED); \
+        } \
+    } while (0)
+static long fs_read_profile_finish(uint64_t start, long result)
+{
+    const uint64_t end = fs_hotpath_tsc();
+    if (start != 0 && end >= start) {
+        __atomic_fetch_add(&fs_read_profile.calls, 1u, __ATOMIC_RELAXED);
+        if (result > 0) {
+            __atomic_fetch_add(
+                &fs_read_profile.bytes,
+                (uint64_t)result,
+                __ATOMIC_RELAXED);
+        }
+        __atomic_fetch_add(
+            &fs_read_profile.total_cycles,
+            end - start,
+            __ATOMIC_RELAXED);
+    }
+    return result;
+}
+static kb_status_t fs_read_profile_finish_status(
+    uint64_t start,
+    kb_status_t status,
+    uint64_t bytes)
+{
+    const uint64_t end = fs_hotpath_tsc();
+    if (start != 0 && end >= start) {
+        __atomic_fetch_add(&fs_read_profile.calls, 1u, __ATOMIC_RELAXED);
+        if (status == KB_OK && bytes != 0) {
+            __atomic_fetch_add(
+                &fs_read_profile.bytes,
+                bytes,
+                __ATOMIC_RELAXED);
+        }
+        __atomic_fetch_add(
+            &fs_read_profile.total_cycles,
+            end - start,
+            __ATOMIC_RELAXED);
+    }
+    return status;
+}
+#define FS_READ_PROFILE_RETURN(start, result) \
+    return fs_read_profile_finish((start), (result))
+#define FS_READ_PROFILE_STATUS_RETURN(start, status, bytes) \
+    return fs_read_profile_finish_status((start), (status), (bytes))
+#else
+#define FS_READ_PROFILE_BEGIN(name) ((void)0)
+#define FS_READ_PROFILE_END(field, name) ((void)0)
+#define FS_READ_PROFILE_EXTENT_BEGIN(name) ((void)0)
+#define FS_READ_PROFILE_EXTENT_END(name) ((void)0)
+#define FS_READ_PROFILE_RETURN(start, result) return (result)
+#define FS_READ_PROFILE_STATUS_RETURN(start, status, bytes) return (status)
+#endif
+
 void kb_fs_hotpath_profile_reset(void)
 {
     memset(&fs_hotpath_profile, 0, sizeof(fs_hotpath_profile));
@@ -985,11 +1089,14 @@ static void buffer_cache_release_storage(kb_fs_buffer_cache_record_t *record)
 
 static void overlay_dirty_buffer_cache_on_read(uint64_t offset, void *buffer, size_t size)
 {
+    FS_READ_PROFILE_BEGIN(profile_start);
     if (buffer == NULL || size == 0 || buffer_cache_dirty_count == 0) {
+        FS_READ_PROFILE_END(overlay, profile_start);
         return;
     }
     uint64_t read_end = 0;
     if (__builtin_add_overflow(offset, (uint64_t)size, &read_end)) {
+        FS_READ_PROFILE_END(overlay, profile_start);
         return;
     }
     for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
@@ -1017,6 +1124,7 @@ static void overlay_dirty_buffer_cache_on_read(uint64_t offset, void *buffer, si
             (const uint8_t *)buffer_cache[i].data + (copy_start - block_start),
             (size_t)(copy_end - copy_start));
     }
+    FS_READ_PROFILE_END(overlay, profile_start);
 }
 
 int kb_fs_subsystem_flush_dirty_buffers(void)
@@ -2461,6 +2569,7 @@ kb_status_t kb_fs_subsystem_read(kb_interface_t *interface, const kb_fs_read_des
     if (desc == NULL || desc->buffer == NULL || desc->byte_count == 0) {
         return KB_ERR_INVALID;
     }
+    FS_READ_PROFILE_BEGIN(profile_start);
     kb_fs_ipc_request_t request = {
         .operation = KB_FS_OPERATION_READ,
         .handle = desc->handle,
@@ -2471,15 +2580,23 @@ kb_status_t kb_fs_subsystem_read(kb_interface_t *interface, const kb_fs_read_des
     };
     kb_status_t status = kb_fs_subsystem_dispatch(interface, &request);
     if (status != KB_OK) {
-        return status;
+        FS_READ_PROFILE_STATUS_RETURN(profile_start, status, 0);
     }
     if (desc->out_bytes != NULL) {
         *desc->out_bytes = request.output_size;
     }
     if (!request.handled) {
-        return fs_local_read(desc);
+        status = fs_local_read(desc);
+        FS_READ_PROFILE_STATUS_RETURN(
+            profile_start,
+            status,
+            status == KB_OK && desc->out_bytes != NULL ? *desc->out_bytes : 0);
     }
-    return request.result_code == 0 ? KB_OK : KB_ERR_IO;
+    status = request.result_code == 0 ? KB_OK : KB_ERR_IO;
+    FS_READ_PROFILE_STATUS_RETURN(
+        profile_start,
+        status,
+        status == KB_OK ? request.output_size : 0);
 }
 
 kb_status_t kb_fs_subsystem_write(kb_interface_t *interface, const kb_fs_write_desc_t *desc)
@@ -2800,7 +2917,9 @@ int kb_fs_block_device_read(kb_fs_block_device_t *device, uint64_t offset, void 
     }
     KB_FS_TRACE_INCREMENT(block_read_calls);
     KB_FS_TRACE_ADD(block_read_bytes, size);
+    FS_READ_PROFILE_BEGIN(profile_start);
     status = device->read(device->ctx, offset, buffer, size);
+    FS_READ_PROFILE_END(device_read, profile_start);
     if (status == 0 && device == active_bdev_binding.device) {
         overlay_dirty_buffer_cache_on_read(offset, buffer, size);
     }
@@ -2831,6 +2950,7 @@ int kb_fs_block_device_read_batch(
         }
     }
     int status = 0;
+    FS_READ_PROFILE_BEGIN(profile_start);
     if (device->read_batch != NULL) {
         status = device->read_batch(device->ctx, requests, request_count);
     } else {
@@ -2845,6 +2965,7 @@ int kb_fs_block_device_read_batch(
             }
         }
     }
+    FS_READ_PROFILE_END(device_read, profile_start);
     if (status == 0) {
         for (size_t i = 0; i < request_count; ++i) {
             KB_FS_TRACE_INCREMENT(block_read_calls);
@@ -4357,7 +4478,12 @@ static kb_fs_filemap_folio_record_t *filemap_folio_record(void *folio)
     return NULL;
 }
 
-void *kb_fs_subsystem_filemap_get_folio(void *mapping, unsigned long index, unsigned int fgp_flags, unsigned int gfp)
+static void *filemap_get_folio_internal(
+    void *mapping,
+    unsigned long index,
+    unsigned int fgp_flags,
+    unsigned int gfp,
+    int preserve_unconsumed_readahead)
 {
     if (mapping == NULL) {
         return (void *)(uintptr_t)-22;
@@ -4426,6 +4552,14 @@ void *kb_fs_subsystem_filemap_get_folio(void *mapping, unsigned long index, unsi
             {
                 continue;
             }
+            /* Keep this stream's unconsumed readahead resident; evicting it
+             * here turns the next sequential access into the same RA again. */
+            if (preserve_unconsumed_readahead &&
+                filemap_folio_cache[i].mapping == mapping &&
+                filemap_folio_cache[i].index >= index)
+            {
+                continue;
+            }
             filemap_folio_discard(cached);
             cache_slot = i;
             break;
@@ -4448,6 +4582,11 @@ void *kb_fs_subsystem_filemap_get_folio(void *mapping, unsigned long index, unsi
                 sizeof(refcount));
             memcpy(&flags, record->folio, sizeof(flags));
             if (refcount > 1u || (flags & KB_FS_FOLIO_FLAG_WRITEBACK) != 0) {
+                continue;
+            }
+            if (preserve_unconsumed_readahead &&
+                record->mapping == mapping && record->index >= index)
+            {
                 continue;
             }
             if ((flags & KB_FS_FOLIO_FLAG_DIRTY) != 0 &&
@@ -4525,6 +4664,15 @@ void *kb_fs_subsystem_filemap_get_folio(void *mapping, unsigned long index, unsi
     return folio;
 }
 
+void *kb_fs_subsystem_filemap_get_folio(
+    void *mapping,
+    unsigned long index,
+    unsigned int fgp_flags,
+    unsigned int gfp)
+{
+    return filemap_get_folio_internal(mapping, index, fgp_flags, gfp, 0);
+}
+
 void kb_fs_subsystem_folio_end_read(void *folio, int success)
 {
     if (folio == NULL) {
@@ -4594,7 +4742,9 @@ void *kb_fs_subsystem_read_cache_folio(
     write_u64_field(folio, 0, flags);
     unsigned long old_gs = 0;
     int has_gs = kb_fs_enter_ext4_call((void *)filler, &old_gs);
+    FS_READ_PROFILE_EXTENT_BEGIN(profile_start);
     int status = filler(file, folio);
+    FS_READ_PROFILE_EXTENT_END(profile_start);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
@@ -4721,7 +4871,9 @@ static void page_cache_read_pages(void *readahead_control)
         unsigned long old_gs = 0;
         const int has_gs =
             kb_fs_enter_ext4_call(readahead_operation, &old_gs);
+        FS_READ_PROFILE_EXTENT_BEGIN(profile_start);
         readahead_fn(readahead_control);
+        FS_READ_PROFILE_EXTENT_END(profile_start);
         if (has_gs) {
             kb_shim_leave_kernel_gs(old_gs);
         }
@@ -4734,11 +4886,13 @@ static void page_cache_read_pages(void *readahead_control)
             unsigned long old_gs = 0;
             const int has_gs =
                 kb_fs_enter_ext4_call(read_folio_operation, &old_gs);
+            FS_READ_PROFILE_EXTENT_BEGIN(profile_start);
             const int status = read_folio_fn(
                 read_pointer_field(
                     readahead_control,
                     KB_FS_READAHEAD_FILE_OFFSET),
                 folio);
+            FS_READ_PROFILE_EXTENT_END(profile_start);
             if (has_gs) {
                 kb_shim_leave_kernel_gs(old_gs);
             }
@@ -4809,11 +4963,12 @@ void kb_fs_subsystem_page_cache_ra_unbounded(
             continue;
         }
 
-        void *folio = kb_fs_subsystem_filemap_get_folio(
+        void *folio = filemap_get_folio_internal(
             mapping,
             index,
             KB_FS_FGP_CREAT | KB_FS_FGP_LOCK,
-            0);
+            0,
+            1);
         if (low_or_err_pointer(folio)) {
             break;
         }
@@ -11541,6 +11696,7 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
     if (pos >= file_size || count == 0) {
         return 0;
     }
+    FS_READ_PROFILE_BEGIN(profile_start);
     uint64_t remaining = file_size - pos;
     if (remaining > count) {
         remaining = count;
@@ -11561,14 +11717,32 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
             file);
         if (low_or_err_pointer(folio)) {
             const int error = (int)(intptr_t)folio;
-            return copied != 0 ? (long)copied : error;
+            FS_READ_PROFILE_RETURN(
+                profile_start,
+                copied != 0 ? (long)copied : error);
         }
         void *payload = folio_page_payload(folio);
-        if (payload == NULL ||
-            kb_fs_subsystem_copy_to_iter((const uint8_t *)payload + page_offset, chunk, iter) != chunk)
-        {
+        size_t copied_to_iter = 0;
+        if (payload != NULL) {
+            if (page_offset != 0 || chunk != KB_FS_PAGE_SIZE) {
+                FS_READ_PROFILE_BEGIN(copy_start);
+                copied_to_iter = kb_fs_subsystem_copy_to_iter(
+                    (const uint8_t *)payload + page_offset,
+                    chunk,
+                    iter);
+                FS_READ_PROFILE_END(partial_copy, copy_start);
+            } else {
+                copied_to_iter = kb_fs_subsystem_copy_to_iter(
+                    payload,
+                    chunk,
+                    iter);
+            }
+        }
+        if (payload == NULL || copied_to_iter != chunk) {
             kb_fs_subsystem_folio_put(folio);
-            return copied != 0 ? (long)copied : -14;
+            FS_READ_PROFILE_RETURN(
+                profile_start,
+                copied != 0 ? (long)copied : -14);
         }
         kb_fs_subsystem_folio_put(folio);
         pos += chunk;
@@ -11584,7 +11758,7 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
         kb_fs_subsystem_touch_atime(
             (uint8_t *)file + KB_FS_NATIVE_FILE_PATH_MNT_OFFSET);
     }
-    return (long)copied;
+    FS_READ_PROFILE_RETURN(profile_start, (long)copied);
 }
 
 long kb_fs_subsystem_generic_write_checks(void *kiocb, void *iter)
