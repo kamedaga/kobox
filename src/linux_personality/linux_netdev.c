@@ -33,6 +33,244 @@ static const unsigned long kb_rwsem_reader_bias = 1ul << 8;
 static const unsigned long kb_rwsem_readfail =
     1ul << (sizeof(unsigned long) * 8u - 1u);
 
+enum {
+    /* One attempt includes a cooperative yield or a full ready-list scan. */
+    KB_RWSEM_ORPHAN_GATE_ATTEMPTS = 256,
+    KB_RWSEM_LONG_WAIT_REPORT_INTERVAL = 4096,
+};
+
+/* Which task holds a write lock, and where it took it.
+ *
+ * A stalled reader that cannot name the holder forces a rebuild to find out,
+ * and it cannot tell a real holder apart from the waiter itself.  The
+ * semaphore is Linux's own struct inside the module, so the owner lives in a
+ * side table keyed by its address rather than in the lock word. */
+enum { KB_RWSEM_OWNER_SLOTS = 256 };
+
+typedef struct kb_rwsem_owner {
+    void *sem;
+    void *task;
+    void *caller;
+    const char *site;
+} kb_rwsem_owner_t;
+
+/* Module calls reach the shim through one shared trampoline, so the return
+ * address is the same for every lock operation and cannot name a call site.
+ * A holder that wants to be identifiable leaves its own label instead. */
+static const char *kb_rwsem_pending_site;
+
+void kb_rwsem_note_site(const char *site)
+{
+    kb_rwsem_pending_site = site;
+}
+
+static const char *kb_rwsem_take_pending_site(void)
+{
+    const char *site = kb_rwsem_pending_site;
+    kb_rwsem_pending_site = NULL;
+    return site;
+}
+
+static kb_rwsem_owner_t kb_rwsem_owners[KB_RWSEM_OWNER_SLOTS];
+
+static size_t kb_rwsem_owner_hash(void *sem)
+{
+    uintptr_t value = (uintptr_t)sem >> 4;
+    value *= 0x9e3779b97f4a7c15ull;
+    return (size_t)(value >> 56) % KB_RWSEM_OWNER_SLOTS;
+}
+
+/* Clearing a slot must not cut a probe chain: a later entry for another
+ * semaphore that hashed here would become unreachable, and the table would
+ * then answer with a stale owner.  A freed slot is marked, not emptied. */
+static void *const kb_rwsem_owner_free = (void *)(uintptr_t)1;
+
+static void kb_rwsem_owner_set(void *sem, void *caller, const char *site)
+{
+    const size_t start = kb_rwsem_owner_hash(sem);
+    void *task = kb_kthread_current_task();
+    size_t reusable = KB_RWSEM_OWNER_SLOTS;
+    for (size_t probe = 0; probe < KB_RWSEM_OWNER_SLOTS; probe++) {
+        const size_t index = (start + probe) % KB_RWSEM_OWNER_SLOTS;
+        kb_rwsem_owner_t *slot = &kb_rwsem_owners[index];
+        void *held = __atomic_load_n(&slot->sem, __ATOMIC_ACQUIRE);
+        if (held == sem) {
+            slot->task = task;
+            slot->caller = caller;
+            slot->site = site;
+            return;
+        }
+        if (held == NULL) {
+            if (reusable == KB_RWSEM_OWNER_SLOTS) {
+                reusable = index;
+            }
+            break;
+        }
+        if (held == kb_rwsem_owner_free && reusable == KB_RWSEM_OWNER_SLOTS) {
+            reusable = index;
+        }
+    }
+    if (reusable == KB_RWSEM_OWNER_SLOTS) {
+        /* The table is a diagnostic, not a correctness requirement: a full
+         * table loses the owner of this lock and nothing else. */
+        return;
+    }
+    kb_rwsem_owner_t *slot = &kb_rwsem_owners[reusable];
+    slot->task = task;
+    slot->caller = caller;
+    slot->site = site;
+    __atomic_store_n(&slot->sem, sem, __ATOMIC_RELEASE);
+}
+
+/* Read ownership is diagnostic only.  A writer blocked on reader bias must
+ * be able to distinguish a live kthread from a recursive lock attempt by the
+ * task currently dispatching the filesystem request. */
+enum { KB_RWSEM_READER_OWNER_SLOTS = 512 };
+
+typedef struct kb_rwsem_reader_owner {
+    void *sem;
+    void *task;
+    void *caller;
+    const char *site;
+    unsigned long depth;
+} kb_rwsem_reader_owner_t;
+
+static kb_rwsem_reader_owner_t
+    kb_rwsem_reader_owners[KB_RWSEM_READER_OWNER_SLOTS];
+
+static void kb_rwsem_reader_owner_set(
+    void *sem,
+    void *caller,
+    const char *site)
+{
+    void *task = kb_kthread_current_task();
+    size_t reusable = KB_RWSEM_READER_OWNER_SLOTS;
+    for (size_t index = 0; index < KB_RWSEM_READER_OWNER_SLOTS; index++) {
+        kb_rwsem_reader_owner_t *slot = &kb_rwsem_reader_owners[index];
+        void *held = __atomic_load_n(&slot->sem, __ATOMIC_ACQUIRE);
+        if (held == sem && slot->task == task) {
+            slot->caller = caller;
+            slot->site = site;
+            slot->depth++;
+            return;
+        }
+        if (held == NULL && reusable == KB_RWSEM_READER_OWNER_SLOTS) {
+            reusable = index;
+        }
+    }
+    if (reusable == KB_RWSEM_READER_OWNER_SLOTS) {
+        return;
+    }
+    kb_rwsem_reader_owner_t *slot = &kb_rwsem_reader_owners[reusable];
+    slot->task = task;
+    slot->caller = caller;
+    slot->site = site;
+    slot->depth = 1;
+    __atomic_store_n(&slot->sem, sem, __ATOMIC_RELEASE);
+}
+
+static void kb_rwsem_reader_owner_clear(void *sem)
+{
+    void *task = kb_kthread_current_task();
+    for (size_t index = 0; index < KB_RWSEM_READER_OWNER_SLOTS; index++) {
+        kb_rwsem_reader_owner_t *slot = &kb_rwsem_reader_owners[index];
+        if (__atomic_load_n(&slot->sem, __ATOMIC_ACQUIRE) != sem ||
+            slot->task != task)
+        {
+            continue;
+        }
+        if (slot->depth > 1) {
+            slot->depth--;
+            return;
+        }
+        slot->task = NULL;
+        slot->caller = NULL;
+        slot->site = NULL;
+        slot->depth = 0;
+        __atomic_store_n(&slot->sem, NULL, __ATOMIC_RELEASE);
+        return;
+    }
+}
+
+static int kb_rwsem_reader_owner_lookup(
+    void *sem,
+    void **out_task,
+    void **out_caller,
+    const char **out_site,
+    unsigned long *out_depth)
+{
+    for (size_t index = 0; index < KB_RWSEM_READER_OWNER_SLOTS; index++) {
+        kb_rwsem_reader_owner_t *slot = &kb_rwsem_reader_owners[index];
+        if (__atomic_load_n(&slot->sem, __ATOMIC_ACQUIRE) != sem) {
+            continue;
+        }
+        *out_task = slot->task;
+        *out_caller = slot->caller;
+        *out_site = slot->site;
+        *out_depth = slot->depth;
+        return 1;
+    }
+    return 0;
+}
+
+static void kb_rwsem_owner_clear(void *sem)
+{
+    const size_t start = kb_rwsem_owner_hash(sem);
+    for (size_t probe = 0; probe < KB_RWSEM_OWNER_SLOTS; probe++) {
+        kb_rwsem_owner_t *slot = &kb_rwsem_owners[(start + probe) % KB_RWSEM_OWNER_SLOTS];
+        void *held = __atomic_load_n(&slot->sem, __ATOMIC_ACQUIRE);
+        if (held == NULL) {
+            return;
+        }
+        if (held != sem) {
+            continue;
+        }
+        slot->task = NULL;
+        slot->caller = NULL;
+        slot->site = NULL;
+        __atomic_store_n(&slot->sem, kb_rwsem_owner_free, __ATOMIC_RELEASE);
+        return;
+    }
+}
+
+static int kb_rwsem_owner_lookup(
+    void *sem,
+    void **out_task,
+    void **out_caller,
+    const char **out_site)
+{
+    const size_t start = kb_rwsem_owner_hash(sem);
+    for (size_t probe = 0; probe < KB_RWSEM_OWNER_SLOTS; probe++) {
+        kb_rwsem_owner_t *slot = &kb_rwsem_owners[(start + probe) % KB_RWSEM_OWNER_SLOTS];
+        void *held = __atomic_load_n(&slot->sem, __ATOMIC_ACQUIRE);
+        if (held == NULL) {
+            return 0;
+        }
+        if (held != sem) {
+            continue;
+        }
+        *out_task = slot->task;
+        *out_caller = slot->caller;
+        *out_site = slot->site;
+        return 1;
+    }
+    return 0;
+}
+
+int kb_rwsem_writer_held_by_current(const void *sem)
+{
+    void *owner_task = NULL;
+    void *owner_caller = NULL;
+    const char *owner_site = NULL;
+    return sem != NULL &&
+        kb_rwsem_owner_lookup(
+            (void *)sem,
+            &owner_task,
+            &owner_caller,
+            &owner_site) &&
+        owner_task == kb_kthread_current_task();
+}
+
 static int trace_lock_enabled(void)
 {
     static int cached = -1;
@@ -52,21 +290,100 @@ static unsigned long kb_rwsem_read_failed_mask(void)
         kb_rwsem_readfail;
 }
 
+static unsigned long kb_rwsem_writer_gate_mask(void)
+{
+    return kb_rwsem_flag_waiters | kb_rwsem_flag_handoff;
+}
+
+static int kb_rwsem_has_only_writer_gate(unsigned long state)
+{
+    const unsigned long gate = state & kb_rwsem_writer_gate_mask();
+    return gate != 0 && (state & ~kb_rwsem_writer_gate_mask()) == 0;
+}
+
+static const char *kb_rwsem_daemon_name(void)
+{
+    const char *name = getenv("KOBOX_DAEMON_NAME");
+    return name == NULL || name[0] == '\0' ? "(unknown)" : name;
+}
+
 static void kb_rwsem_report_long_wait(
     const char *operation,
     void *sem,
     unsigned long state,
     unsigned long attempts,
-    void *caller)
+    void *caller,
+    const char *wait_site)
 {
-    if (attempts != 1) {
+    if (attempts < KB_RWSEM_LONG_WAIT_REPORT_INTERVAL ||
+        (attempts & (attempts - 1ul)) != 0)
+    {
         return;
     }
+    char comm[17];
+    void *task = kb_kthread_current_task();
+    (void)kb_get_task_comm(comm, sizeof(comm), task);
+    void *owner_task = NULL;
+    void *owner_caller = NULL;
+    const char *owner_site = NULL;
+    const int owner_known =
+        kb_rwsem_owner_lookup(sem, &owner_task, &owner_caller, &owner_site);
+    void *reader_task = NULL;
+    void *reader_caller = NULL;
+    const char *reader_site = NULL;
+    unsigned long reader_depth = 0;
+    const int reader_known = kb_rwsem_reader_owner_lookup(
+        sem,
+        &reader_task,
+        &reader_caller,
+        &reader_site,
+        &reader_depth);
     fprintf(stderr,
-        "kobox rwsem: long wait op=%s sem=%p state=%#lx caller=%p\n",
+        "kobox rwsem: long wait op=%s sem=%p state=%#lx attempts=%lu "
+        "daemon=%s task=%p comm=%s caller=%p owner=%s owner_task=%p "
+        "owner_caller=%p self=%d owner_site=%s wait_site=%s "
+        "reader=%s reader_task=%p reader_caller=%p reader_self=%d "
+        "reader_depth=%lu reader_site=%s\n",
         operation,
         sem,
         state,
+        attempts,
+        kb_rwsem_daemon_name(),
+        task,
+        comm[0] == '\0' ? "(unknown)" : comm,
+        caller,
+        owner_known ? "yes" : "none",
+        owner_task,
+        owner_caller,
+        owner_known && owner_task == task ? 1 : 0,
+        owner_site == NULL ? "(unlabelled)" : owner_site,
+        wait_site == NULL ? "(unlabelled)" : wait_site,
+        reader_known ? "yes" : "none",
+        reader_task,
+        reader_caller,
+        reader_known && reader_task == task ? 1 : 0,
+        reader_depth,
+        reader_site == NULL ? "(unlabelled)" : reader_site);
+}
+
+static void kb_rwsem_report_orphan_gate(
+    void *sem,
+    unsigned long state,
+    unsigned long attempts,
+    void *caller)
+{
+    char comm[17];
+    void *task = kb_kthread_current_task();
+    (void)kb_get_task_comm(comm, sizeof(comm), task);
+    fprintf(stderr,
+        "kobox rwsem: reclaimed orphan writer gate sem=%p state=%#lx "
+        "attempts=%lu daemon=%s task=%p comm=%s caller=%p\n",
+        sem,
+        state,
+        attempts,
+        kb_rwsem_daemon_name(),
+        task,
+        comm[0] == '\0' ? "(unknown)" : comm,
         caller);
 }
 
@@ -420,7 +737,10 @@ void kb_down_read(void *sem)
         return;
     }
     unsigned long attempts = 0;
+    unsigned long orphan_gate_attempts = 0;
+    unsigned long orphan_gate_state = 0;
     void *caller = __builtin_return_address(0);
+    const char *site = kb_rwsem_take_pending_site();
     for (;;) {
         unsigned long observed = __atomic_load_n(
             (unsigned long *)sem, __ATOMIC_RELAXED);
@@ -434,14 +754,43 @@ void kb_down_read(void *sem)
                 __ATOMIC_ACQUIRE,
                 __ATOMIC_RELAXED))
         {
+            kb_rwsem_reader_owner_set(sem, caller, site);
             if (trace_lock_enabled()) {
                 fprintf(stderr, "kobox lock: down_read sem=%p\n", sem);
             }
             return;
         }
         attempts++;
+        if (kb_rwsem_has_only_writer_gate(observed)) {
+            if (observed == orphan_gate_state) {
+                orphan_gate_attempts++;
+            } else {
+                orphan_gate_state = observed;
+                orphan_gate_attempts = 1;
+            }
+            if (orphan_gate_attempts >= KB_RWSEM_ORPHAN_GATE_ATTEMPTS) {
+                unsigned long stale_gate = observed;
+                if (__atomic_compare_exchange_n(
+                        (unsigned long *)sem,
+                        &stale_gate,
+                        0ul,
+                        0,
+                        __ATOMIC_ACQ_REL,
+                        __ATOMIC_RELAXED))
+                {
+                    kb_rwsem_report_orphan_gate(
+                        sem, observed, attempts, caller);
+                    orphan_gate_attempts = 0;
+                    orphan_gate_state = 0;
+                    continue;
+                }
+            }
+        } else {
+            orphan_gate_attempts = 0;
+            orphan_gate_state = 0;
+        }
         kb_rwsem_report_long_wait(
-            "read", sem, observed, attempts, caller);
+            "read", sem, observed, attempts, caller, site);
         if (!kb_kthread_yield_current()) {
             kb_kthread_run_ready();
         }
@@ -453,9 +802,11 @@ int kb_down_read_trylock(void *sem)
     if (sem == NULL) {
         return 0;
     }
+    const char *site = kb_rwsem_take_pending_site();
     unsigned long observed = __atomic_load_n(
         (unsigned long *)sem, __ATOMIC_RELAXED);
-    return (observed & kb_rwsem_read_failed_mask()) == 0 &&
+    const int acquired =
+        (observed & kb_rwsem_read_failed_mask()) == 0 &&
         observed <= ULONG_MAX - kb_rwsem_reader_bias &&
         __atomic_compare_exchange_n(
             (unsigned long *)sem,
@@ -464,6 +815,13 @@ int kb_down_read_trylock(void *sem)
             0,
             __ATOMIC_ACQUIRE,
             __ATOMIC_RELAXED);
+    if (acquired) {
+        kb_rwsem_reader_owner_set(
+            sem,
+            __builtin_return_address(0),
+            site);
+    }
+    return acquired;
 }
 
 void kb_up_read(void *sem)
@@ -484,6 +842,7 @@ void kb_up_read(void *sem)
                 __ATOMIC_RELEASE,
                 __ATOMIC_RELAXED))
         {
+            kb_rwsem_reader_owner_clear(sem);
             break;
         }
     }
@@ -499,6 +858,7 @@ void kb_down_write(void *sem)
     }
     unsigned long attempts = 0;
     void *caller = __builtin_return_address(0);
+    const char *site = kb_rwsem_take_pending_site();
     for (;;) {
         unsigned long expected = __atomic_load_n(
             (unsigned long *)sem, __ATOMIC_RELAXED);
@@ -514,6 +874,7 @@ void kb_down_write(void *sem)
                     __ATOMIC_ACQUIRE,
                     __ATOMIC_RELAXED))
             {
+                kb_rwsem_owner_set(sem, caller, site);
                 if (trace_lock_enabled()) {
                     fprintf(stderr, "kobox lock: down_write sem=%p\n", sem);
                 }
@@ -528,7 +889,7 @@ void kb_down_write(void *sem)
         }
         attempts++;
         kb_rwsem_report_long_wait(
-            "write", sem, expected, attempts, caller);
+            "write", sem, expected, attempts, caller, site);
         if (!kb_kthread_yield_current()) {
             kb_kthread_run_ready();
         }
@@ -541,13 +902,21 @@ int kb_down_write_trylock(void *sem)
         return 0;
     }
     unsigned long expected = 0;
-    return __atomic_compare_exchange_n(
-        (unsigned long *)sem,
-        &expected,
-        kb_rwsem_writer_locked,
-        0,
-        __ATOMIC_ACQUIRE,
-        __ATOMIC_RELAXED);
+    if (!__atomic_compare_exchange_n(
+            (unsigned long *)sem,
+            &expected,
+            kb_rwsem_writer_locked,
+            0,
+            __ATOMIC_ACQUIRE,
+            __ATOMIC_RELAXED))
+    {
+        return 0;
+    }
+    kb_rwsem_owner_set(
+        sem,
+        __builtin_return_address(0),
+        kb_rwsem_take_pending_site());
+    return 1;
 }
 
 void kb_downgrade_write(void *sem)
@@ -555,9 +924,13 @@ void kb_downgrade_write(void *sem)
     if (sem == NULL) {
         return;
     }
+    /* The writer becomes a reader, so it no longer holds the lock for write. */
+    kb_rwsem_owner_clear(sem);
     unsigned long observed = __atomic_load_n(
         (unsigned long *)sem, __ATOMIC_RELAXED);
     while ((observed & kb_rwsem_writer_locked) != 0) {
+        /* Preserve a real successor's gate.  If it was orphaned, the last
+         * reader leaves a gate-only state that kb_down_read can reclaim. */
         unsigned long desired =
             (observed & (kb_rwsem_flag_waiters | kb_rwsem_flag_handoff)) |
             kb_rwsem_reader_bias;
@@ -569,6 +942,10 @@ void kb_downgrade_write(void *sem)
                 __ATOMIC_RELEASE,
                 __ATOMIC_RELAXED))
         {
+            kb_rwsem_reader_owner_set(
+                sem,
+                __builtin_return_address(0),
+                "downgrade_write");
             break;
         }
     }
@@ -579,6 +956,9 @@ void kb_up_write(void *sem)
     if (sem == NULL) {
         return;
     }
+    /* A queued writer may already own the gate.  Preserve it here; readers
+     * reclaim it only if no holder exists and no writer takes it in time. */
+    kb_rwsem_owner_clear(sem);
     (void)__atomic_fetch_and(
         (unsigned long *)sem,
         ~kb_rwsem_writer_locked,

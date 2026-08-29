@@ -23,6 +23,7 @@ static void *execution_context_parent_task;
 static void *execution_context_child_task;
 static unsigned long wait_bit_word;
 static int wait_bit_stage;
+static int rwsem_writer_stage;
 static int sync_dirty_inode_count;
 static int sync_write_inode_count;
 static int sync_super_count;
@@ -31,6 +32,12 @@ static int evict_inode_count;
 static int evict_inode_saw_freeing;
 static unsigned long write_cache_indices[4];
 static size_t write_cache_count;
+static size_t reclaim_writepages_count;
+static int64_t reclaim_writepages_start;
+static int64_t reclaim_writepages_end;
+static void *reclaim_writepages_mapping;
+static void *reclaim_nested_mapping;
+static size_t reclaim_nested_allocations;
 static int rcu_callback_count;
 static int mempool_allow_alloc;
 static int mempool_free_count;
@@ -357,6 +364,48 @@ static int write_cache_smoke_page(void *folio, void *writeback_control, void *da
     return 0;
 }
 
+static int reclaim_writepages_smoke(void *mapping, void *writeback_control)
+{
+    enum { PAGE_SIZE = 4096 };
+    if (mapping == NULL || writeback_control == NULL) {
+        return -22;
+    }
+    memcpy(&reclaim_writepages_start,
+        (const unsigned char *)writeback_control + 0x10,
+        sizeof(reclaim_writepages_start));
+    memcpy(&reclaim_writepages_end,
+        (const unsigned char *)writeback_control + 0x18,
+        sizeof(reclaim_writepages_end));
+    reclaim_writepages_mapping = mapping;
+    reclaim_writepages_count++;
+    if (reclaim_writepages_start < 0 ||
+        reclaim_writepages_end < reclaim_writepages_start)
+    {
+        return -22;
+    }
+    const unsigned long index =
+        (unsigned long)((uint64_t)reclaim_writepages_start / PAGE_SIZE);
+    void *folio = kb_fs_subsystem_filemap_get_folio(mapping, index, 0, 0);
+    if (folio == NULL || (uintptr_t)folio >= (uintptr_t)-4095) {
+        return -5;
+    }
+    (void)kb_fs_subsystem_folio_clear_dirty_for_io(folio);
+    kb_fs_subsystem_folio_put(folio);
+    if (reclaim_nested_mapping != NULL) {
+        void *nested = kb_fs_subsystem_filemap_get_folio(
+            reclaim_nested_mapping,
+            0,
+            0x4u,
+            0);
+        if (nested == NULL || (uintptr_t)nested >= (uintptr_t)-4095) {
+            return -12;
+        }
+        reclaim_nested_allocations++;
+        kb_fs_subsystem_folio_put(nested);
+    }
+    return 0;
+}
+
 static int cooperative_kthread_smoke(void *data)
 {
     int *value = data;
@@ -518,6 +567,92 @@ static int run_cooperative_waitqueue_smoke(void)
     {
         return 134;
     }
+    return 0;
+}
+
+static int cooperative_rwsem_writer_smoke(void *data)
+{
+    rwsem_writer_stage = 1;
+    kb_down_write(data);
+    rwsem_writer_stage = 2;
+    kb_up_write(data);
+    return 0;
+}
+
+static int run_rwsem_writer_gate_smoke(void)
+{
+    enum {
+        RWSEM_WRITER_LOCKED = 1ul << 0,
+        RWSEM_FLAG_WAITERS = 1ul << 1,
+        RWSEM_FLAG_HANDOFF = 1ul << 2,
+        RWSEM_READER_BIAS = 1ul << 8,
+    };
+    _Alignas(unsigned long) unsigned char rwsem[64] = {0};
+
+    /* A runnable writer keeps priority over readers and acquires as soon as
+     * the active reader drains. */
+    kb_init_rwsem(rwsem);
+    kb_down_read(rwsem);
+    rwsem_writer_stage = 0;
+    void *writer = kb_kthread_create_on_node(
+        cooperative_rwsem_writer_smoke,
+        rwsem,
+        -1,
+        "kobox-rwsem-writer");
+    if (writer == NULL || kb_wake_up_process(writer) != 1) {
+        return 162;
+    }
+    kb_kthread_run_ready();
+    unsigned long state = __atomic_load_n(
+        (unsigned long *)rwsem, __ATOMIC_ACQUIRE);
+    if (rwsem_writer_stage != 1 ||
+        (state & RWSEM_FLAG_WAITERS) == 0 ||
+        (state & RWSEM_READER_BIAS) == 0)
+    {
+        return 163;
+    }
+    kb_up_read(rwsem);
+    kb_kthread_run_ready();
+    if (rwsem_writer_stage != 2 ||
+        kb_kthread_stop(writer) != 0 ||
+        __atomic_load_n((unsigned long *)rwsem, __ATOMIC_ACQUIRE) != 0)
+    {
+        return 164;
+    }
+
+    /* Reproduce the original failure deterministically: the writer that set
+     * WAITERS is gone, leaving no holder that could ever clear the gate. */
+    __atomic_store_n(
+        (unsigned long *)rwsem, RWSEM_FLAG_WAITERS, __ATOMIC_RELEASE);
+    kb_down_read(rwsem);
+    state = __atomic_load_n((unsigned long *)rwsem, __ATOMIC_ACQUIRE);
+    if (state != RWSEM_READER_BIAS) {
+        return 165;
+    }
+    kb_up_read(rwsem);
+
+    /* downgrade_write must preserve a possible successor while the
+     * downgraded reader is active.  Once it drains, an orphan gate is
+     * recoverable under the same rule as up_write. */
+    __atomic_store_n(
+        (unsigned long *)rwsem,
+        RWSEM_WRITER_LOCKED | RWSEM_FLAG_WAITERS | RWSEM_FLAG_HANDOFF,
+        __ATOMIC_RELEASE);
+    kb_downgrade_write(rwsem);
+    state = __atomic_load_n((unsigned long *)rwsem, __ATOMIC_ACQUIRE);
+    if (state != (RWSEM_READER_BIAS |
+                  RWSEM_FLAG_WAITERS |
+                  RWSEM_FLAG_HANDOFF))
+    {
+        return 166;
+    }
+    kb_up_read(rwsem);
+    kb_down_read(rwsem);
+    state = __atomic_load_n((unsigned long *)rwsem, __ATOMIC_ACQUIRE);
+    if (state != RWSEM_READER_BIAS) {
+        return 167;
+    }
+    kb_up_read(rwsem);
     return 0;
 }
 
@@ -1381,6 +1516,98 @@ static int run_write_cache_pages_smoke(void)
     return status == 0 && write_cache_count == 2 &&
         write_cache_indices[0] == 2 && write_cache_indices[1] == 4 &&
         nr_to_write == 0 ? 0 : 108;
+}
+
+static int run_pagecache_reclaim_range_smoke(void)
+{
+    enum {
+        PAGE_SIZE = 4096,
+        FILEMAP_FOLIO_CACHE_MAX = 2048,
+        MAPPING_AOPS_OFFSET = 0x68,
+        AOPS_WRITEPAGES_OFFSET = 0x10,
+    };
+    unsigned char mapping[256] = {0};
+    unsigned char other_mapping[256] = {0};
+    unsigned char nested_mapping[256] = {0};
+    unsigned char aops[128] = {0};
+    void *pointer = aops;
+    memcpy(mapping + MAPPING_AOPS_OFFSET, &pointer, sizeof(pointer));
+    memcpy(other_mapping + MAPPING_AOPS_OFFSET, &pointer, sizeof(pointer));
+    pointer = (void *)(uintptr_t)&reclaim_writepages_smoke;
+    memcpy(aops + AOPS_WRITEPAGES_OFFSET, &pointer, sizeof(pointer));
+
+    void *locked_folio = NULL;
+    int result = 0;
+    for (unsigned long index = 0;
+         index < FILEMAP_FOLIO_CACHE_MAX;
+         ++index)
+    {
+        void *folio_mapping = index == 1u ? other_mapping : mapping;
+        void *folio = kb_fs_subsystem_filemap_get_folio(
+            folio_mapping,
+            index,
+            0x4u,
+            0);
+        if (folio == NULL || (uintptr_t)folio >= (uintptr_t)-4095) {
+            result = 180;
+            break;
+        }
+        if (!kb_fs_subsystem_folio_mark_dirty(folio)) {
+            kb_fs_subsystem_folio_put(folio);
+            result = 181;
+            break;
+        }
+        if (index == 2u) {
+            kb_fs_subsystem_folio_lock(folio);
+            locked_folio = folio;
+        }
+        kb_fs_subsystem_folio_put(folio);
+    }
+
+    reclaim_writepages_count = 0;
+    reclaim_writepages_start = -1;
+    reclaim_writepages_end = -1;
+    reclaim_writepages_mapping = NULL;
+    reclaim_nested_mapping = nested_mapping;
+    reclaim_nested_allocations = 0;
+    void *replacement = NULL;
+    if (result == 0) {
+        replacement = kb_fs_subsystem_filemap_get_folio(
+            mapping,
+            FILEMAP_FOLIO_CACHE_MAX,
+            0x4u,
+            0);
+        if (replacement == NULL ||
+            (uintptr_t)replacement >= (uintptr_t)-4095)
+        {
+            result = 182;
+        } else if (reclaim_writepages_count != 1u ||
+            reclaim_writepages_mapping != mapping ||
+            reclaim_writepages_start != 0 ||
+            reclaim_writepages_end != 2 * PAGE_SIZE - 1 ||
+            reclaim_nested_allocations != 1u)
+        {
+            result = 183;
+        }
+    }
+    reclaim_nested_mapping = NULL;
+    if (locked_folio != NULL) {
+        uint64_t flags = 0;
+        memcpy(&flags, locked_folio, sizeof(flags));
+        if (result == 0 && (flags & 0x1u) == 0) {
+            result = 184;
+        }
+        kb_fs_subsystem_folio_unlock(locked_folio);
+    }
+    if (replacement != NULL &&
+        (uintptr_t)replacement < (uintptr_t)-4095)
+    {
+        kb_fs_subsystem_folio_put(replacement);
+    }
+    kb_fs_subsystem_truncate_inode_pages_final(mapping);
+    kb_fs_subsystem_truncate_inode_pages_final(other_mapping);
+    kb_fs_subsystem_truncate_inode_pages_final(nested_mapping);
+    return result;
 }
 
 static int run_setattr_helpers_smoke(void)
@@ -3429,6 +3656,10 @@ int main(void)
     if (waitqueue_result != 0) {
         return waitqueue_result;
     }
+    int rwsem_gate_result = run_rwsem_writer_gate_smoke();
+    if (rwsem_gate_result != 0) {
+        return rwsem_gate_result;
+    }
     int core_helpers_result = run_linux_core_helpers_smoke();
     if (core_helpers_result != 0) {
         return core_helpers_result;
@@ -3630,6 +3861,10 @@ int main(void)
     int write_cache_result = run_write_cache_pages_smoke();
     if (write_cache_result != 0) {
         return write_cache_result;
+    }
+    int reclaim_range_result = run_pagecache_reclaim_range_smoke();
+    if (reclaim_range_result != 0) {
+        return reclaim_range_result;
     }
     int setattr_result = run_setattr_helpers_smoke();
     if (setattr_result != 0) {

@@ -48,6 +48,10 @@ enum {
     KB_JIFFIES_STORAGE_MAX = 64,
     KB_WORK_STRUCT_PENDING_BIT = 0,
     KB_TASKLET_STATE_SCHED = 0,
+    /* Linux 6.12 ext4 BTF: ext4_inode_info.i_rsv_conversion_work is at
+     * byte 1080 and i_data_sem is at byte 256.  This personality is built
+     * together with that module ABI. */
+    KB_EXT4_RSV_WORK_TO_DATA_SEM_BYTES = 1080 - 256,
 };
 
 typedef enum kb_deferred_kind {
@@ -78,6 +82,7 @@ typedef struct kb_workqueue {
     unsigned int flags;
     int max_active;
     int destroying;
+    char name[48];
     struct kb_workqueue *next;
 } kb_workqueue_t;
 
@@ -327,6 +332,23 @@ static void write_ulong(void *base, size_t offset, unsigned long value)
 
 static void refresh_deferred_tail(void);
 static int run_work(void *work, unsigned long fallback_gs);
+static kb_workqueue_t *find_workqueue(void *workqueue);
+
+static int workqueue_waits_for_current_rwsem_writer(
+    void *workqueue,
+    void *work)
+{
+    kb_workqueue_t *record = find_workqueue(workqueue);
+    if (record == NULL || work == NULL ||
+        strcmp(record->name, "ext4-rsv-conversion") != 0 ||
+        (uintptr_t)work < KB_EXT4_RSV_WORK_TO_DATA_SEM_BYTES)
+    {
+        return 0;
+    }
+    const void *data_sem =
+        (const unsigned char *)work - KB_EXT4_RSV_WORK_TO_DATA_SEM_BYTES;
+    return kb_rwsem_writer_held_by_current(data_sem);
+}
 
 static void repair_deferred_tail(const char *op)
 {
@@ -595,6 +617,10 @@ static kb_deferred_item_t *pop_due_deferred_at(int include_work, uint64_t now_ns
         kb_deferred_item_t *item = *cursor;
         if ((include_work || item->kind != KB_DEFERRED_WORK) &&
             (item->kind != KB_DEFERRED_WORK || !work_is_active(item->object)) &&
+            (item->kind != KB_DEFERRED_WORK ||
+                !workqueue_waits_for_current_rwsem_writer(
+                    item->workqueue,
+                    item->object)) &&
             (item->due_ns == 0 || item->due_ns <= now_ns))
         {
             *cursor = item->next;
@@ -648,7 +674,6 @@ static kb_workqueue_t *find_workqueue(void *workqueue)
 
 void *kb_alloc_workqueue(const char *name, unsigned int flags, int max_active, ...)
 {
-    (void)name;
     kb_workqueue_t *record = kb_kzalloc(sizeof(*record), 0);
     if (record == NULL) {
         return NULL;
@@ -656,6 +681,9 @@ void *kb_alloc_workqueue(const char *name, unsigned int flags, int max_active, .
     record->magic = KB_WORKQUEUE_MAGIC;
     record->flags = flags;
     record->max_active = max_active;
+    if (name != NULL) {
+        (void)snprintf(record->name, sizeof(record->name), "%s", name);
+    }
     record->next = workqueues;
     workqueues = record;
     return record;

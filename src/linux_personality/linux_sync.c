@@ -21,6 +21,11 @@ static atomic_flag rcu_callbacks_lock = ATOMIC_FLAG_INIT;
 static kb_rcu_callback_t *rcu_callbacks_head;
 static kb_rcu_callback_t *rcu_callbacks_tail;
 
+static int kb_should_report_long_wait(size_t attempts)
+{
+    return attempts >= 4096u && (attempts & (attempts - 1u)) == 0;
+}
+
 static void rcu_callbacks_acquire(void)
 {
     while (atomic_flag_test_and_set_explicit(
@@ -777,10 +782,23 @@ int kb_out_of_line_wait_on_bit(
     kb_wait_bit_queue_entry_t entry;
     kb_init_wait_bit_entry(&entry, word, bit);
     void *wq_head = kb_bit_waitqueue(word, bit);
+    const void *caller = __builtin_return_address(0);
+    size_t attempts = 0;
     int result = 0;
     do {
         kb_prepare_to_wait(wq_head, entry.wq_entry, (int)mode);
         if (kb_wait_bit_test(&entry.key)) {
+            attempts++;
+            if (kb_should_report_long_wait(attempts)) {
+                fprintf(stderr,
+                    "kobox bitwait: long wait op=wait word=%p bit=%d value=0x%lx attempts=%zu task=%p caller=%p\n",
+                    word,
+                    bit,
+                    __atomic_load_n((unsigned long *)word, __ATOMIC_ACQUIRE),
+                    attempts,
+                    kb_kthread_current_task(),
+                    caller);
+            }
             result = action(&entry.key, (int)mode);
         }
     } while (kb_wait_bit_test(&entry.key) && result == 0);
@@ -804,6 +822,8 @@ int kb_out_of_line_wait_on_bit_lock(
     kb_init_wait_bit_entry(&entry, word, bit);
     void *wq_head = kb_bit_waitqueue(word, bit);
     const unsigned long mask = 1ul << (unsigned int)bit;
+    const void *caller = __builtin_return_address(0);
+    size_t attempts = 0;
     int result = 0;
     for (;;) {
         (void)kb_prepare_to_wait_exclusive(wq_head, entry.wq_entry, (int)mode);
@@ -822,6 +842,17 @@ int kb_out_of_line_wait_on_bit_lock(
                 kb_finish_wait(wq_head, entry.wq_entry);
             }
             return 0;
+        }
+        attempts++;
+        if (kb_should_report_long_wait(attempts)) {
+            fprintf(stderr,
+                "kobox bitwait: long wait op=lock word=%p bit=%d value=0x%lx attempts=%zu task=%p caller=%p\n",
+                word,
+                bit,
+                old | mask,
+                attempts,
+                kb_kthread_current_task(),
+                caller);
         }
         if (result != 0) {
             return result;

@@ -552,6 +552,8 @@ int kb_kthread_yield_current(void);
 void kb_kthread_run_ready(void);
 int kb_kthread_has_runnable(void);
 void *kb_kthread_current_task(void);
+void kb_rwsem_note_site(const char *site);
+int kb_rwsem_writer_held_by_current(const void *sem);
 void kb_kthread_prepare_wait(void *task);
 void kb_kthread_finish_wait(void *task);
 int kb_wake_up_process(void *task);

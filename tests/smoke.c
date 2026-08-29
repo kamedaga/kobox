@@ -29,6 +29,16 @@ static unsigned char execution_primary_work[64];
 static unsigned char execution_nested_work[64];
 static unsigned char execution_cancel_work[64];
 static unsigned char execution_kthread_work[64];
+enum { EXECUTION_RSV_WORK_TO_DATA_SEM_BYTES = 824 };
+_Alignas(unsigned long) static unsigned char
+    execution_rsv_storage[EXECUTION_RSV_WORK_TO_DATA_SEM_BYTES + 64];
+static void *const execution_rsv_work =
+    execution_rsv_storage + EXECUTION_RSV_WORK_TO_DATA_SEM_BYTES;
+static unsigned char execution_unrelated_work[64];
+static int execution_rsv_calls;
+static int execution_unrelated_calls;
+static unsigned long execution_other_writer_sem;
+static int execution_other_writer_stage;
 static void *execution_outer_task;
 static void *execution_primary_task;
 static void *execution_nested_task;
@@ -119,6 +129,16 @@ static void executable_work_host_callback(void *work)
         return;
     }
 
+    if (work == execution_rsv_work) {
+        execution_rsv_calls++;
+        return;
+    }
+
+    if (work == execution_unrelated_work) {
+        execution_unrelated_calls++;
+        return;
+    }
+
     execution_test_error = 12;
 }
 
@@ -126,6 +146,16 @@ static int execution_helper_kthread(void *data)
 {
     (void)data;
     execution_helper_calls++;
+    return 0;
+}
+
+static int execution_other_writer_kthread(void *data)
+{
+    kb_down_write(data);
+    execution_other_writer_stage = 1;
+    kb_schedule();
+    kb_up_write(data);
+    execution_other_writer_stage = 2;
     return 0;
 }
 
@@ -1118,10 +1148,16 @@ static int test_executable_module(kb_device_backend_t *backend)
     memset(execution_nested_work, 0, sizeof(execution_nested_work));
     memset(execution_cancel_work, 0, sizeof(execution_cancel_work));
     memset(execution_kthread_work, 0, sizeof(execution_kthread_work));
+    memset(execution_rsv_storage, 0, sizeof(execution_rsv_storage));
+    memset(execution_unrelated_work, 0, sizeof(execution_unrelated_work));
     memcpy(execution_primary_work + 24, &work_callback, sizeof(work_callback));
     memcpy(execution_nested_work + 24, &work_callback, sizeof(work_callback));
     memcpy(execution_cancel_work + 24, &work_callback, sizeof(work_callback));
     memcpy(execution_kthread_work + 24, &work_callback, sizeof(work_callback));
+    memcpy((unsigned char *)execution_rsv_work + 24,
+        &work_callback,
+        sizeof(work_callback));
+    memcpy(execution_unrelated_work + 24, &work_callback, sizeof(work_callback));
     execution_outer_task = kb_loader_current_task();
     execution_primary_task = NULL;
     execution_nested_task = NULL;
@@ -1131,6 +1167,10 @@ static int test_executable_module(kb_device_backend_t *backend)
     execution_cancel_calls = 0;
     execution_kthread_calls = 0;
     execution_helper_calls = 0;
+    execution_rsv_calls = 0;
+    execution_unrelated_calls = 0;
+    execution_other_writer_sem = 0;
+    execution_other_writer_stage = 0;
     execution_primary_active = 0;
     execution_test_error = 0;
     void *outer_marker = (void *)(uintptr_t)0x4b42574f524b4d4eull;
@@ -1163,6 +1203,89 @@ static int test_executable_module(kb_device_backend_t *backend)
         kb_module_close(module);
         return 5;
     }
+
+    void *rsv_workqueue = kb_alloc_workqueue(
+        "ext4-rsv-conversion", 0, 1);
+    unsigned long *writer_sem = (unsigned long *)execution_rsv_storage;
+    if (rsv_workqueue == NULL) {
+        kb_module_close(module);
+        return 8;
+    }
+    kb_down_write(writer_sem);
+    if (kb_queue_work_on(-1, rsv_workqueue, execution_rsv_work) != 1 ||
+        kb_queue_work_on(-1, NULL, execution_unrelated_work) != 1)
+    {
+        kb_up_write(writer_sem);
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 9;
+    }
+    kb_run_deferred_work();
+    if (execution_rsv_calls != 0 || execution_unrelated_calls != 1) {
+        kb_up_write(writer_sem);
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 10;
+    }
+    kb_up_write(writer_sem);
+    kb_run_deferred_work();
+    if (execution_rsv_calls != 1 || execution_unrelated_calls != 1) {
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 11;
+    }
+
+    /* An unrelated writer held by this task must not suppress the ext4
+     * conversion either.  Only the target inode's i_data_sem conflicts. */
+    kb_down_write(&execution_other_writer_sem);
+    if (kb_queue_work_on(-1, rsv_workqueue, execution_rsv_work) != 1) {
+        kb_up_write(&execution_other_writer_sem);
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 12;
+    }
+    kb_run_deferred_work();
+    kb_up_write(&execution_other_writer_sem);
+    if (execution_rsv_calls != 2) {
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 13;
+    }
+
+    /* A writer held by another resumable task is not an execution-stack
+     * recursion.  It must not suppress this queue globally: doing so can
+     * strand the I/O completion that will eventually wake that task. */
+    void *other_writer = kb_kthread_create_on_node(
+        execution_other_writer_kthread,
+        writer_sem,
+        -1,
+        "kobox-other-rwsem-writer");
+    if (other_writer == NULL || kb_wake_up_process(other_writer) != 1) {
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 14;
+    }
+    kb_kthread_run_ready();
+    if (execution_other_writer_stage != 1 ||
+        kb_queue_work_on(-1, rsv_workqueue, execution_rsv_work) != 1)
+    {
+        (void)kb_wake_up_process(other_writer);
+        kb_kthread_run_ready();
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 15;
+    }
+    kb_run_deferred_work();
+    (void)kb_wake_up_process(other_writer);
+    kb_kthread_run_ready();
+    if (execution_rsv_calls != 3 || execution_other_writer_stage != 2 ||
+        kb_kthread_stop(other_writer) != 0)
+    {
+        kb_destroy_workqueue(rsv_workqueue);
+        kb_module_close(module);
+        return 16;
+    }
+    kb_destroy_workqueue(rsv_workqueue);
 
     void *helper = kb_kthread_create_on_node(
         execution_helper_kthread,

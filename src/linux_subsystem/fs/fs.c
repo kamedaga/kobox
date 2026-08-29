@@ -34,9 +34,18 @@ enum {
     KB_FS_MOUNT_MAX = 64,
     KB_FS_FILE_MAX = 256,
     KB_FS_DEVPTS_DENTRY_MAX = 256,
-    /* Keep file-backed folios within half of the 4096-page KVM arena, leaving
-     * the other half for buffer heads, BIOs and module allocations. */
-    KB_FS_FILEMAP_FOLIO_CACHE_MAX = 2048,
+    /* Normal page-cache pressure starts at half of the 4096-page KVM arena.
+     * A small writeback-only reserve lets ext4 allocate the metadata folios
+     * needed to clean one of those pages without recursively starting a
+     * second writeback while filesystem locks are held. */
+    KB_FS_FILEMAP_FOLIO_CACHE_NORMAL_MAX = 2048,
+    KB_FS_FILEMAP_FOLIO_WRITEBACK_RESERVE = 64,
+    KB_FS_FILEMAP_FOLIO_CACHE_MAX =
+        KB_FS_FILEMAP_FOLIO_CACHE_NORMAL_MAX +
+        KB_FS_FILEMAP_FOLIO_WRITEBACK_RESERVE,
+    KB_FS_FILEMAP_FOLIO_HASH_BUCKETS = 4096,
+    KB_FS_FILEMAP_RECLAIM_BATCH_PAGES = 64,
+    KB_FS_FILEMAP_WRITEBACK_STACK_MAX = 64,
     KB_FS_CONTEXT_BYTES = 512,
     KB_FS_SUPER_BLOCK_BYTES = 2048,
     KB_FS_FAKE_INODE_HEADROOM_BYTES = 512,
@@ -345,6 +354,13 @@ enum {
     KB_FS_INODE_VERSION_INCREMENT = 2u,
 };
 
+_Static_assert(
+    (KB_FS_FILEMAP_FOLIO_HASH_BUCKETS &
+        (KB_FS_FILEMAP_FOLIO_HASH_BUCKETS - 1u)) == 0,
+    "filemap folio hash bucket count must be a power of two");
+_Static_assert(
+    KB_FS_FILEMAP_FOLIO_CACHE_MAX < UINT32_MAX,
+    "filemap folio hash links must hold every cache slot");
 _Static_assert(KB_FS_FAKE_DISK_BYTES >= KB_FS_GENDISK_STATE_OFFSET + sizeof(unsigned long),
     "synthetic gendisk must include Linux 6.12 state");
 _Static_assert(KB_FS_INODE_DATA_OFFSET + KB_FS_FAKE_INODE_MAPPING_BYTES <= KB_FS_INODE_BYTES,
@@ -488,6 +504,7 @@ typedef struct kb_fs_filemap_folio_record {
     void *mapping;
     unsigned long index;
     void *folio;
+    uint32_t hash_next;
 } kb_fs_filemap_folio_record_t;
 
 typedef struct kb_fs_xarray_entry {
@@ -573,6 +590,9 @@ static kb_fs_buffer_cache_record_t buffer_cache[KB_FS_BUFFER_CACHE_MAX];
 static size_t buffer_cache_dirty_count;
 static size_t buffer_cache_evict_cursor;
 static kb_fs_filemap_folio_record_t filemap_folio_cache[KB_FS_FILEMAP_FOLIO_CACHE_MAX];
+static uint32_t filemap_folio_hash_heads[KB_FS_FILEMAP_FOLIO_HASH_BUCKETS];
+static void *filemap_writeback_stack[KB_FS_FILEMAP_WRITEBACK_STACK_MAX];
+static size_t filemap_writeback_depth;
 static atomic_flag xarray_records_lock = ATOMIC_FLAG_INIT;
 static kb_fs_xarray_record_t *xarray_records;
 static kb_fs_inode_allocation_record_t inode_allocations[KB_FS_INODE_ALLOCATION_MAX];
@@ -751,6 +771,14 @@ void kb_fs_read_profile_snapshot(kb_fs_read_profile_t *out_profile)
     KB_FS_PROFILE_LOAD(overlay_cycles);
     KB_FS_PROFILE_LOAD(partial_copy_calls);
     KB_FS_PROFILE_LOAD(partial_copy_cycles);
+    KB_FS_PROFILE_LOAD(cache_folio_calls);
+    KB_FS_PROFILE_LOAD(cache_folio_cycles);
+    KB_FS_PROFILE_LOAD(copy_to_iter_calls);
+    KB_FS_PROFILE_LOAD(copy_to_iter_cycles);
+    KB_FS_PROFILE_LOAD(folio_put_calls);
+    KB_FS_PROFILE_LOAD(folio_put_cycles);
+    KB_FS_PROFILE_LOAD(atime_calls);
+    KB_FS_PROFILE_LOAD(atime_cycles);
 #undef KB_FS_PROFILE_LOAD
 #endif
 }
@@ -793,6 +821,81 @@ static void xarray_write_head(void *xarray, void *head)
     }
 }
 
+static size_t filemap_folio_hash(void *mapping, unsigned long index)
+{
+    uintptr_t mixed = ((uintptr_t)mapping >> 4u) ^
+        ((uintptr_t)mapping >> 19u) ^
+        (uintptr_t)index * (uintptr_t)11400714819323198485ull;
+    mixed ^= mixed >> 23u;
+    return (size_t)(mixed & (KB_FS_FILEMAP_FOLIO_HASH_BUCKETS - 1u));
+}
+
+static kb_fs_filemap_folio_record_t *filemap_folio_hash_lookup(
+    void *mapping,
+    unsigned long index)
+{
+    uint32_t link = filemap_folio_hash_heads[
+        filemap_folio_hash(mapping, index)];
+    for (size_t visited = 0;
+         link != 0 && visited < KB_FS_FILEMAP_FOLIO_CACHE_MAX;
+         visited++)
+    {
+        const size_t slot = (size_t)link - 1u;
+        if (slot >= KB_FS_FILEMAP_FOLIO_CACHE_MAX) {
+            return NULL;
+        }
+        kb_fs_filemap_folio_record_t *record = &filemap_folio_cache[slot];
+        if (record->active && record->mapping == mapping &&
+            record->index == index)
+        {
+            return record;
+        }
+        link = record->hash_next;
+    }
+    return NULL;
+}
+
+static void filemap_folio_hash_insert(
+    kb_fs_filemap_folio_record_t *record)
+{
+    if (record == NULL || !record->active || record->mapping == NULL) {
+        return;
+    }
+    const size_t slot = (size_t)(record - filemap_folio_cache);
+    if (slot >= KB_FS_FILEMAP_FOLIO_CACHE_MAX) {
+        return;
+    }
+    const size_t bucket = filemap_folio_hash(record->mapping, record->index);
+    record->hash_next = filemap_folio_hash_heads[bucket];
+    filemap_folio_hash_heads[bucket] = (uint32_t)(slot + 1u);
+}
+
+static void filemap_folio_hash_remove(
+    kb_fs_filemap_folio_record_t *record)
+{
+    if (record == NULL || !record->active || record->mapping == NULL) {
+        return;
+    }
+    const size_t bucket = filemap_folio_hash(record->mapping, record->index);
+    uint32_t *link = &filemap_folio_hash_heads[bucket];
+    for (size_t visited = 0;
+         *link != 0 && visited < KB_FS_FILEMAP_FOLIO_CACHE_MAX;
+         visited++)
+    {
+        const size_t slot = (size_t)*link - 1u;
+        if (slot >= KB_FS_FILEMAP_FOLIO_CACHE_MAX) {
+            return;
+        }
+        kb_fs_filemap_folio_record_t *candidate = &filemap_folio_cache[slot];
+        if (candidate == record) {
+            *link = candidate->hash_next;
+            candidate->hash_next = 0;
+            return;
+        }
+        link = &candidate->hash_next;
+    }
+}
+
 static void filemap_refresh_xarray_head(void *mapping)
 {
     if (mapping == NULL) {
@@ -800,14 +903,11 @@ static void filemap_refresh_xarray_head(void *mapping)
     }
     FS_HOTPATH_BEGIN(profile_start);
     void *head = NULL;
-    unsigned long first_index = ULONG_MAX;
     for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
         const kb_fs_filemap_folio_record_t *record = &filemap_folio_cache[i];
-        if (record->active && record->mapping == mapping &&
-            record->folio != NULL && record->index < first_index)
-        {
-            first_index = record->index;
+        if (record->active && record->mapping == mapping && record->folio != NULL) {
             head = record->folio;
+            break;
         }
     }
     xarray_write_head((uint8_t *)mapping + 8u, head);
@@ -821,18 +921,11 @@ static void *filemap_xarray_load(void *xarray, unsigned long index)
     }
     FS_HOTPATH_BEGIN(profile_start);
     void *mapping = (uint8_t *)xarray - 8u;
-    for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
-        if (filemap_folio_cache[i].active &&
-            filemap_folio_cache[i].mapping == mapping &&
-            filemap_folio_cache[i].index == index)
-        {
-            void *folio = filemap_folio_cache[i].folio;
-            FS_HOTPATH_END(xarray_load, profile_start);
-            return folio;
-        }
-    }
+    kb_fs_filemap_folio_record_t *record =
+        filemap_folio_hash_lookup(mapping, index);
+    void *folio = record == NULL ? NULL : record->folio;
     FS_HOTPATH_END(xarray_load, profile_start);
-    return NULL;
+    return folio;
 }
 
 int kb_fs_subsystem_xa_insert(
@@ -1305,6 +1398,7 @@ static void clear_mount_probe_objects(void)
         kb_fs_subsystem_folio_put(filemap_folio_cache[i].folio);
     }
     memset(filemap_folio_cache, 0, sizeof(filemap_folio_cache));
+    memset(filemap_folio_hash_heads, 0, sizeof(filemap_folio_hash_heads));
     free(mount_probe_super_block);
     free(mount_probe_bdev);
     free(mount_probe_bdev_inode);
@@ -1349,6 +1443,11 @@ static int fs_trace_enabled(void)
 {
     const char *value = getenv("KOBOX_TRACE_FS");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int fs_should_report_long_wait(size_t attempts)
+{
+    return attempts >= 4096u && (attempts & (attempts - 1u)) == 0;
 }
 
 static void *read_pointer_field(const void *base, size_t offset);
@@ -1555,6 +1654,7 @@ static long kb_fs_ext4_smoke_perform_write_locked(
         return -22;
     }
     void *rwsem = (uint8_t *)inode + KB_FS_INODE_RWSEM_OFFSET;
+    kb_rwsem_note_site("perform_write");
     kb_down_write(rwsem);
     const long result = kb_fs_subsystem_generic_perform_write(kiocb, iter);
     kb_up_write(rwsem);
@@ -1599,6 +1699,7 @@ static void kb_fs_ext4_smoke_inode_lock_set_acquire(
         set->inodes[j] = inode;
     }
     for (size_t i = 0; i < set->count; ++i) {
+        kb_rwsem_note_site("inode_lock_set");
         kb_down_write((uint8_t *)set->inodes[i] + KB_FS_INODE_RWSEM_OFFSET);
     }
 }
@@ -1630,6 +1731,7 @@ static int kb_fs_ext4_smoke_apply_iattr(
 
     static uint8_t smoke_mnt_idmap[136];
     void *rwsem = (uint8_t *)inode + KB_FS_INODE_RWSEM_OFFSET;
+    kb_rwsem_note_site("apply_iattr");
     kb_down_write(rwsem);
     unsigned long old_gs = 0;
     int has_gs = kb_fs_enter_ext4_call((void *)ops->setattr, &old_gs);
@@ -3980,7 +4082,7 @@ void kb_fs_subsystem_blk_finish_plug(void *plug)
         fs_hotpath_profile.plug_max_queued_bios = bio_queue_depth;
     }
 #endif
-    if (block_plug_depth == 0) {
+    if (block_plug_depth == 0 && bio_auto_drain) {
         (void)kb_fs_subsystem_bio_drain();
     }
 }
@@ -4186,6 +4288,8 @@ void kb_fs_subsystem_lock_buffer(void *buffer_head)
     if (buffer_head == NULL) {
         return;
     }
+    const void *caller = __builtin_return_address(0);
+    size_t attempts = 0;
     for (;;) {
         uint64_t state = 0;
         memcpy(&state, buffer_head, sizeof(state));
@@ -4193,6 +4297,17 @@ void kb_fs_subsystem_lock_buffer(void *buffer_head)
             state |= KB_FS_BH_LOCK;
             write_u64_field(buffer_head, 0, state);
             return;
+        }
+        attempts++;
+        if (fs_should_report_long_wait(attempts)) {
+            fprintf(stderr,
+                "kobox-fs: long wait op=lock_buffer bh=%p state=0x%llx attempts=%zu task=%p caller=%p bio_queue=%zu\n",
+                buffer_head,
+                (unsigned long long)state,
+                attempts,
+                kb_kthread_current_task(),
+                caller,
+                bio_queue_depth);
         }
         (void)kb_fs_subsystem_bio_drain();
         kb_run_deferred_work();
@@ -4255,8 +4370,21 @@ void kb_fs_subsystem_wait_on_buffer(void *buffer_head)
     if (fs_trace_enabled()) {
         fprintf(stderr, "kobox-fs: wait_on_buffer begin bh=%p\n", buffer_head);
     }
+    const void *caller = __builtin_return_address(0);
+    size_t attempts = 0;
     memcpy(&state, buffer_head, sizeof(state));
     while ((state & KB_FS_BH_LOCK) != 0) {
+        attempts++;
+        if (fs_should_report_long_wait(attempts)) {
+            fprintf(stderr,
+                "kobox-fs: long wait op=wait_on_buffer bh=%p state=0x%llx attempts=%zu task=%p caller=%p bio_queue=%zu\n",
+                buffer_head,
+                (unsigned long long)state,
+                attempts,
+                kb_kthread_current_task(),
+                caller,
+                bio_queue_depth);
+        }
         (void)kb_fs_subsystem_bio_drain();
         kb_run_deferred_work();
         memcpy(&state, buffer_head, sizeof(state));
@@ -4467,15 +4595,53 @@ static kb_fs_filemap_folio_record_t *filemap_folio_record(void *folio)
         return NULL;
     }
     FS_HOTPATH_BEGIN(profile_start);
-    for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
-        if (filemap_folio_cache[i].active && filemap_folio_cache[i].folio == folio) {
-            kb_fs_filemap_folio_record_t *record = &filemap_folio_cache[i];
-            FS_HOTPATH_END(folio_lookup, profile_start);
-            return record;
-        }
+    void *mapping = read_pointer_field(folio, KB_FS_FOLIO_MAPPING_OFFSET);
+    const unsigned long index = (unsigned long)read_u64_field(
+        folio,
+        KB_FS_FOLIO_INDEX_OFFSET);
+    kb_fs_filemap_folio_record_t *record =
+        filemap_folio_hash_lookup(mapping, index);
+    if (record != NULL && record->folio != folio) {
+        record = NULL;
     }
     FS_HOTPATH_END(folio_lookup, profile_start);
-    return NULL;
+    return record;
+}
+
+static int filemap_writeback_is_active(void *mapping)
+{
+    for (size_t i = 0; i < filemap_writeback_depth; ++i) {
+        if (filemap_writeback_stack[i] == mapping) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int filemap_writeback_enter(void *mapping)
+{
+    if (filemap_writeback_is_active(mapping)) {
+        return -35;
+    }
+    if (filemap_writeback_depth >= KB_FS_FILEMAP_WRITEBACK_STACK_MAX) {
+        return -12;
+    }
+    filemap_writeback_stack[filemap_writeback_depth++] = mapping;
+    return 0;
+}
+
+static void filemap_writeback_leave(void *mapping)
+{
+    for (size_t i = filemap_writeback_depth; i > 0; --i) {
+        if (filemap_writeback_stack[i - 1u] != mapping) {
+            continue;
+        }
+        for (size_t j = i; j < filemap_writeback_depth; ++j) {
+            filemap_writeback_stack[j - 1u] = filemap_writeback_stack[j];
+        }
+        filemap_writeback_stack[--filemap_writeback_depth] = NULL;
+        return;
+    }
 }
 
 static void *filemap_get_folio_internal(
@@ -4488,14 +4654,10 @@ static void *filemap_get_folio_internal(
     if (mapping == NULL) {
         return (void *)(uintptr_t)-22;
     }
-    for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
-        if (!filemap_folio_cache[i].active ||
-            filemap_folio_cache[i].mapping != mapping ||
-            filemap_folio_cache[i].index != index)
-        {
-            continue;
-        }
-        void *folio = filemap_folio_cache[i].folio;
+    kb_fs_filemap_folio_record_t *cached_record =
+        filemap_folio_hash_lookup(mapping, index);
+    if (cached_record != NULL) {
+        void *folio = cached_record->folio;
         uint32_t *refcount =
             (uint32_t *)((uint8_t *)folio + KB_FS_FOLIO_REFCOUNT_OFFSET);
         uint32_t observed = __atomic_load_n(refcount, __ATOMIC_ACQUIRE);
@@ -4524,18 +4686,28 @@ static void *filemap_get_folio_internal(
         return (void *)(intptr_t)-2;
     }
 
-    size_t cache_slot = KB_FS_FILEMAP_FOLIO_CACHE_MAX;
-    for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
+    const size_t cache_limit = filemap_writeback_depth == 0 ?
+        KB_FS_FILEMAP_FOLIO_CACHE_NORMAL_MAX :
+        KB_FS_FILEMAP_FOLIO_CACHE_MAX;
+    size_t reclaim_ref_busy = 0;
+    size_t reclaim_lock_busy = 0;
+    size_t reclaim_dirty_seen = 0;
+    size_t reclaim_writeback_attempted = 0;
+    size_t reclaim_writeback_failed = 0;
+    size_t reclaim_still_dirty = 0;
+    int reclaim_last_status = 0;
+    size_t cache_slot = cache_limit;
+    for (size_t i = 0; i < cache_limit; i++) {
         if (!filemap_folio_cache[i].active) {
             cache_slot = i;
             break;
         }
     }
-    if (cache_slot == KB_FS_FILEMAP_FOLIO_CACHE_MAX) {
+    if (cache_slot == cache_limit) {
         /* Give registered filesystem metadata caches their native pressure
          * notification before reclaiming a page-cache slot. */
         (void)kb_shrinker_reclaim(32, gfp);
-        for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
+        for (size_t i = 0; i < cache_limit; i++) {
             void *cached = filemap_folio_cache[i].folio;
             uint32_t refcount = UINT32_MAX;
             if (cached != NULL) {
@@ -4565,12 +4737,15 @@ static void *filemap_get_folio_internal(
             break;
         }
     }
-    if (cache_slot == KB_FS_FILEMAP_FOLIO_CACHE_MAX) {
+    if (cache_slot == cache_limit && filemap_writeback_depth == 0) {
         /* A bounded Kobox page cache must reclaim through the filesystem's
          * native writepages path.  Dropping dirty folios here would bypass
          * ext4 ordering and merely enlarging the array only postpones the
          * same failure under package-sized workloads. */
-        for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
+        for (size_t i = 0;
+             i < KB_FS_FILEMAP_FOLIO_CACHE_NORMAL_MAX;
+             i++)
+        {
             kb_fs_filemap_folio_record_t *record = &filemap_folio_cache[i];
             if (!record->active || record->folio == NULL || record->mapping == NULL) {
                 continue;
@@ -4581,7 +4756,13 @@ static void *filemap_get_folio_internal(
                 (const uint8_t *)record->folio + KB_FS_FOLIO_REFCOUNT_OFFSET,
                 sizeof(refcount));
             memcpy(&flags, record->folio, sizeof(flags));
-            if (refcount > 1u || (flags & KB_FS_FOLIO_FLAG_WRITEBACK) != 0) {
+            if (refcount > 1u) {
+                reclaim_ref_busy++;
+                continue;
+            }
+            if ((flags & (KB_FS_FOLIO_FLAG_LOCKED |
+                          KB_FS_FOLIO_FLAG_WRITEBACK)) != 0) {
+                reclaim_lock_busy++;
                 continue;
             }
             if (preserve_unconsumed_readahead &&
@@ -4589,13 +4770,75 @@ static void *filemap_get_folio_internal(
             {
                 continue;
             }
-            if ((flags & KB_FS_FOLIO_FLAG_DIRTY) != 0 &&
-                filemap_writeback_range(record->mapping, 0, INT64_MAX) != 0)
-            {
-                continue;
+            if ((flags & KB_FS_FOLIO_FLAG_DIRTY) != 0) {
+                reclaim_dirty_seen++;
+                if (filemap_writeback_is_active(record->mapping)) {
+                    continue;
+                }
+                if (record->index >
+                    (unsigned long)(INT64_MAX / KB_FS_PAGE_SIZE))
+                {
+                    continue;
+                }
+                const int64_t folio_start =
+                    (int64_t)record->index * KB_FS_PAGE_SIZE;
+                const unsigned long max_end_index =
+                    (unsigned long)(INT64_MAX / KB_FS_PAGE_SIZE);
+                unsigned long writeback_end_index = record->index;
+                if (writeback_end_index <=
+                    ULONG_MAX - (KB_FS_FILEMAP_RECLAIM_BATCH_PAGES - 1u))
+                {
+                    writeback_end_index +=
+                        KB_FS_FILEMAP_RECLAIM_BATCH_PAGES - 1u;
+                } else {
+                    writeback_end_index = ULONG_MAX;
+                }
+                if (writeback_end_index > max_end_index) {
+                    writeback_end_index = max_end_index;
+                }
+                /* Do not include a folio already locked by the caller.  A
+                 * bounded run up to that point amortizes writeback without
+                 * recreating the original whole-mapping self wait. */
+                for (size_t j = 0;
+                     j < KB_FS_FILEMAP_FOLIO_CACHE_MAX;
+                     ++j)
+                {
+                    kb_fs_filemap_folio_record_t *peer =
+                        &filemap_folio_cache[j];
+                    if (!peer->active || peer->folio == NULL ||
+                        peer->mapping != record->mapping ||
+                        peer->index <= record->index ||
+                        peer->index > writeback_end_index)
+                    {
+                        continue;
+                    }
+                    uint64_t peer_flags = 0;
+                    memcpy(&peer_flags, peer->folio, sizeof(peer_flags));
+                    if ((peer_flags & KB_FS_FOLIO_FLAG_LOCKED) != 0) {
+                        writeback_end_index = peer->index - 1u;
+                    }
+                }
+                const int64_t folio_end = writeback_end_index == max_end_index ?
+                    INT64_MAX :
+                    (int64_t)writeback_end_index * KB_FS_PAGE_SIZE +
+                        (KB_FS_PAGE_SIZE - 1u);
+                /* If ext4 needs another cache folio while cleaning this
+                 * range, the writeback-only reserve supplies it without
+                 * starting nested writeback. */
+                reclaim_writeback_attempted++;
+                reclaim_last_status = filemap_writeback_range(
+                    record->mapping,
+                    folio_start,
+                    folio_end);
+                if (reclaim_last_status != 0) {
+                    reclaim_writeback_failed++;
+                    continue;
+                }
+                kb_fs_subsystem_folio_wait_writeback(record->folio);
             }
             memcpy(&flags, record->folio, sizeof(flags));
             if ((flags & (KB_FS_FOLIO_FLAG_DIRTY | KB_FS_FOLIO_FLAG_WRITEBACK)) != 0) {
+                reclaim_still_dirty++;
                 continue;
             }
             filemap_folio_discard(record->folio);
@@ -4603,10 +4846,10 @@ static void *filemap_get_folio_internal(
             break;
         }
     }
-    if (cache_slot == KB_FS_FILEMAP_FOLIO_CACHE_MAX) {
+    if (cache_slot == cache_limit) {
         size_t active = 0;
         size_t pinned = 0;
-        for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
+        for (size_t i = 0; i < cache_limit; i++) {
             if (!filemap_folio_cache[i].active) {
                 continue;
             }
@@ -4623,11 +4866,22 @@ static void *filemap_get_folio_internal(
         }
         fprintf(stderr,
             "FILED_STORAGE_FAULT layer=filemap_folio_capacity status=-12 "
-            "active=%zu pinned=%zu mapping=%p index=%lu\n",
+            "active=%zu pinned=%zu mapping=%p index=%lu writeback_depth=%zu "
+            "reclaim_ref_busy=%zu reclaim_lock_busy=%zu dirty_seen=%zu "
+            "writeback_attempted=%zu writeback_failed=%zu "
+            "still_dirty=%zu last_status=%d\n",
             active,
             pinned,
             mapping,
-            index);
+            index,
+            filemap_writeback_depth,
+            reclaim_ref_busy,
+            reclaim_lock_busy,
+            reclaim_dirty_seen,
+            reclaim_writeback_attempted,
+            reclaim_writeback_failed,
+            reclaim_still_dirty,
+            reclaim_last_status);
         return (void *)(uintptr_t)-12;
     }
 
@@ -4653,7 +4907,11 @@ static void *filemap_get_folio_internal(
     filemap_folio_cache[cache_slot].mapping = mapping;
     filemap_folio_cache[cache_slot].index = index;
     filemap_folio_cache[cache_slot].folio = folio;
-    filemap_refresh_xarray_head(mapping);
+    filemap_folio_hash_insert(&filemap_folio_cache[cache_slot]);
+    /* The shim's xa_load implementation uses the exact hash index above;
+     * xa_head only needs to remain a live non-NULL cache entry. Publishing
+     * the newest folio also keeps streaming eviction away from the head. */
+    xarray_write_head((uint8_t *)mapping + 8u, folio);
     uint64_t nrpages = 0;
     memcpy(&nrpages,
         (const uint8_t *)mapping + KB_FS_ADDRESS_SPACE_NRPAGES_OFFSET,
@@ -5208,14 +5466,17 @@ static void filemap_folio_discard(void *folio)
         return;
     }
     void *mapping = NULL;
-    for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
-        if (!filemap_folio_cache[i].active || filemap_folio_cache[i].folio != folio) {
-            continue;
+    kb_fs_filemap_folio_record_t *record = filemap_folio_record(folio);
+    if (record != NULL) {
+        mapping = record->mapping;
+        void *published_head = read_pointer_field(
+            (uint8_t *)mapping + 8u,
+            8u);
+        filemap_folio_hash_remove(record);
+        memset(record, 0, sizeof(*record));
+        if (published_head == folio) {
+            filemap_refresh_xarray_head(mapping);
         }
-        mapping = filemap_folio_cache[i].mapping;
-        memset(&filemap_folio_cache[i], 0, sizeof(filemap_folio_cache[i]));
-        filemap_refresh_xarray_head(mapping);
-        break;
     }
     if (mapping != NULL) {
         uint64_t nrpages = 0;
@@ -5932,10 +6193,7 @@ void kb_fs_subsystem_folio_put(void *folio)
 
     uint32_t *refcount =
         (uint32_t *)((uint8_t *)folio + KB_FS_FOLIO_REFCOUNT_OFFSET);
-    for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
-        if (!filemap_folio_cache[i].active || filemap_folio_cache[i].folio != folio) {
-            continue;
-        }
+    if (filemap_folio_record(folio) != NULL) {
         /* The shim cache owns one non-releasable reference. Linux may drop
          * more than the caller reference while completing buffered I/O. */
         uint32_t observed = __atomic_load_n(refcount, __ATOMIC_ACQUIRE);
@@ -6133,8 +6391,21 @@ void kb_fs_subsystem_folio_wait_writeback(void *folio)
     if (folio == NULL) {
         return;
     }
+    const void *caller = __builtin_return_address(0);
+    size_t attempts = 0;
     uint64_t flags = __atomic_load_n((uint64_t *)folio, __ATOMIC_ACQUIRE);
     while ((flags & KB_FS_FOLIO_FLAG_WRITEBACK) != 0) {
+        attempts++;
+        if (fs_should_report_long_wait(attempts)) {
+            fprintf(stderr,
+                "kobox-fs: long wait op=folio_writeback folio=%p flags=0x%llx attempts=%zu task=%p caller=%p bio_queue=%zu\n",
+                folio,
+                (unsigned long long)flags,
+                attempts,
+                kb_kthread_current_task(),
+                caller,
+                bio_queue_depth);
+        }
         (void)kb_fs_subsystem_bio_drain();
         kb_run_deferred_work();
         flags = __atomic_load_n((uint64_t *)folio, __ATOMIC_ACQUIRE);
@@ -6555,6 +6826,10 @@ static int filemap_writeback_range(void *mapping, int64_t start, int64_t end)
     if (operation == NULL) {
         return -95;
     }
+    const int enter_status = filemap_writeback_enter(mapping);
+    if (enter_status != 0) {
+        return enter_status;
+    }
     uint8_t writeback_control[KB_FS_WRITEBACK_CONTROL_BYTES];
     memset(writeback_control, 0, sizeof(writeback_control));
     write_u64_field(writeback_control, 0, (uint64_t)LONG_MAX);
@@ -6578,6 +6853,7 @@ static int filemap_writeback_range(void *mapping, int64_t start, int64_t end)
     const int drain_status = bio_last_drain_status;
     bio_auto_drain = previous_auto_drain;
     filemap_mapping_refresh_marks(mapping);
+    filemap_writeback_leave(mapping);
     return status != 0 ? status : drain_status;
 }
 
@@ -9261,6 +9537,8 @@ static int kb_fs_iomap_dio_invalidate_range(
     return 0;
 }
 
+static void kb_fs_subsystem_iov_iter_advance(void *iter, size_t bytes);
+
 static int64_t kb_fs_iomap_dio_transfer(
     const uint8_t *iomap,
     uint64_t position,
@@ -9292,9 +9570,39 @@ static int64_t kb_fs_iomap_dio_transfer(
     if (logical_block_size == 0 ||
         (disk_offset % logical_block_size) != 0 ||
         (length % logical_block_size) != 0 ||
-        ((uintptr_t)iter_buffer % logical_block_size) != 0)
+        ((uintptr_t)iter_buffer % logical_block_size) != 0 ||
+        disk_offset > UINT64_MAX - length)
     {
         return -22;
+    }
+
+    /* FileD fills immutable file VMOs into page-aligned mappings while the
+     * block layer has a cached 512 KiB DMA staging window for those mappings.
+     * Reading that data through one temporary KVM page and one BIO per 4 KiB
+     * needlessly dominates program startup.  Keep writes on the conservative
+     * BIO path, but let aligned reads consume the existing block-device bulk
+     * operation directly.  kb_fs_block_device_read() still overlays dirty
+     * metadata buffers, and iomap_dio_rw() has already flushed this file's
+     * page-cache range before reaching here. */
+    if (!write) {
+        uint64_t transferred = 0;
+        while (transferred < length) {
+            size_t chunk = (size_t)(length - transferred);
+            if (chunk > KOBOX_FILE_READ_BULK_BYTES) {
+                chunk = KOBOX_FILE_READ_BULK_BYTES;
+            }
+            const int status = kb_fs_block_device_read(
+                device,
+                disk_offset + transferred,
+                (uint8_t *)iter_buffer + transferred,
+                chunk);
+            if (status != 0) {
+                return transferred == 0 ? status : (int64_t)transferred;
+            }
+            kb_fs_subsystem_iov_iter_advance(iter, chunk);
+            transferred += chunk;
+        }
+        return (int64_t)transferred;
     }
 
     uint64_t transferred = 0;
@@ -9794,9 +10102,11 @@ void kb_fs_subsystem_lock_two_nondirectories(void *inode1, void *inode2)
         inode2 = swap;
     }
     if (!low_or_err_pointer(inode1)) {
+        kb_rwsem_note_site("rename_inode1");
         kb_down_write((uint8_t *)inode1 + KB_FS_INODE_RWSEM_OFFSET);
     }
     if (!low_or_err_pointer(inode2) && inode2 != inode1) {
+        kb_rwsem_note_site("rename_inode2");
         kb_down_write((uint8_t *)inode2 + KB_FS_INODE_RWSEM_OFFSET);
     }
 }
@@ -11709,12 +12019,14 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
         if ((uint64_t)chunk > remaining) {
             chunk = (size_t)remaining;
         }
+        FS_READ_PROFILE_BEGIN(cache_folio_start);
         void *folio = filemap_read_cache_folio(
             mapping,
             index,
             page_offset,
             remaining,
             file);
+        FS_READ_PROFILE_END(cache_folio, cache_folio_start);
         if (low_or_err_pointer(folio)) {
             const int error = (int)(intptr_t)folio;
             FS_READ_PROFILE_RETURN(
@@ -11724,6 +12036,7 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
         void *payload = folio_page_payload(folio);
         size_t copied_to_iter = 0;
         if (payload != NULL) {
+            FS_READ_PROFILE_BEGIN(copy_to_iter_start);
             if (page_offset != 0 || chunk != KB_FS_PAGE_SIZE) {
                 FS_READ_PROFILE_BEGIN(copy_start);
                 copied_to_iter = kb_fs_subsystem_copy_to_iter(
@@ -11737,14 +12050,19 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
                     chunk,
                     iter);
             }
+            FS_READ_PROFILE_END(copy_to_iter, copy_to_iter_start);
         }
         if (payload == NULL || copied_to_iter != chunk) {
+            FS_READ_PROFILE_BEGIN(folio_put_error_start);
             kb_fs_subsystem_folio_put(folio);
+            FS_READ_PROFILE_END(folio_put, folio_put_error_start);
             FS_READ_PROFILE_RETURN(
                 profile_start,
                 copied != 0 ? (long)copied : -14);
         }
+        FS_READ_PROFILE_BEGIN(folio_put_start);
         kb_fs_subsystem_folio_put(folio);
+        FS_READ_PROFILE_END(folio_put, folio_put_start);
         pos += chunk;
         copied += chunk;
         remaining -= chunk;
@@ -11755,8 +12073,10 @@ long kb_fs_subsystem_generic_file_read_iter(void *kiocb, void *iter)
         KB_FS_FILE_RA_PREV_POS_OFFSET,
         pos);
     if (copied != 0) {
+        FS_READ_PROFILE_BEGIN(atime_start);
         kb_fs_subsystem_touch_atime(
             (uint8_t *)file + KB_FS_NATIVE_FILE_PATH_MNT_OFFSET);
+        FS_READ_PROFILE_END(atime, atime_start);
     }
     FS_READ_PROFILE_RETURN(profile_start, (long)copied);
 }

@@ -205,6 +205,14 @@ typedef struct kb_fs_read_profile {
     uint64_t overlay_cycles;
     uint64_t partial_copy_calls;
     uint64_t partial_copy_cycles;
+    uint64_t cache_folio_calls;
+    uint64_t cache_folio_cycles;
+    uint64_t copy_to_iter_calls;
+    uint64_t copy_to_iter_cycles;
+    uint64_t folio_put_calls;
+    uint64_t folio_put_cycles;
+    uint64_t atime_calls;
+    uint64_t atime_cycles;
 } kb_fs_read_profile_t;
 
 typedef struct kb_fs_storage_trace {

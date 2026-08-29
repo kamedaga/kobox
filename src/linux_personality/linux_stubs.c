@@ -10,9 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(__pachaos__)
 #include <time.h>
-#endif
 
 enum {
     KB_STUB_PAGE_SIZE = 4096,
@@ -1314,13 +1312,8 @@ int kb_match_octal(const void *substring, int *result)
 
 int64_t kb_ktime_get_real_seconds(void)
 {
-#if defined(__pachaos__)
-    static int64_t synthetic_seconds = 1;
-    return synthetic_seconds++;
-#else
     time_t now = time(NULL);
     return now > 0 ? (int64_t)now : 1;
-#endif
 }
 
 void kb_string_get_size(uint64_t size, uint64_t blk_size, int units, char *buf, int len)
