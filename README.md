@@ -164,4 +164,5 @@ KOBOX_PACHAOS_BAR0_SIZE=0x1000
 
 ## License
 
-Apache-2.0
+GPLv2
+Everyone is permitted to copy and distribute verbatim copies of this license document, but changing it is not allowed.
