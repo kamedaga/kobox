@@ -3572,6 +3572,107 @@ static int symbol_is_static_trace_call(const kb_elf_symbol_t *symbol)
         strncmp(symbol->name, prefix, sizeof(prefix) - 1u) == 0;
 }
 
+/* Linux encodes BUG() and WARN_ON() on x86-64 as a two-byte ud2 described by
+ * a __bug_table entry.  Its #UD handler consults that table: a warning entry
+ * prints the report and resumes at the instruction after the trap, while a
+ * plain BUG() stays fatal.  Kobox runs module text inside a user process where
+ * an unhandled ud2 terminates the whole service, so a warning Linux merely
+ * logs would take the filesystem service down with it.  Rewrite the warning
+ * traps into a two-byte nop at load time, which reproduces exactly the control
+ * flow Linux takes once report_bug() returns, and leave BUG() untouched. */
+enum {
+    KB_BUG_TABLE_ENTRY_SIZE = 12,
+    KB_BUGFLAG_WARNING = 1u << 0,
+};
+
+typedef struct kb_bug_entry {
+    int32_t bug_addr_disp;
+    int32_t file_disp;
+    uint16_t line;
+    uint16_t flags;
+} kb_bug_entry_t;
+
+_Static_assert(
+    sizeof(kb_bug_entry_t) == KB_BUG_TABLE_ENTRY_SIZE,
+    "CONFIG_GENERIC_BUG_RELATIVE_POINTERS bug_entry layout");
+
+static kb_status_t patch_module_warn_traps(kb_module_t *module)
+{
+    const size_t section_count = kb_elf_section_count(&module->elf);
+    size_t patched_count = 0;
+    size_t fatal_count = 0;
+
+    for (size_t section_index = 0; section_index < section_count; section_index++) {
+        kb_elf_section_t section;
+        kb_status_t status = kb_elf_section(&module->elf, section_index, &section);
+        if (status != KB_OK) {
+            return status;
+        }
+        if (section.name == NULL || strcmp(section.name, "__bug_table") != 0 ||
+            section_index >= module->section_count)
+        {
+            continue;
+        }
+        const loaded_section_t *loaded = &module->sections[section_index];
+        if (loaded->base == NULL) {
+            continue;
+        }
+
+        const size_t entry_count = (size_t)(loaded->size / KB_BUG_TABLE_ENTRY_SIZE);
+        for (size_t entry_index = 0; entry_index < entry_count; entry_index++) {
+            const kb_bug_entry_t *entry = (const kb_bug_entry_t *)
+                ((const uint8_t *)loaded->base + (entry_index * KB_BUG_TABLE_ENTRY_SIZE));
+            if ((entry->flags & KB_BUGFLAG_WARNING) == 0) {
+                fatal_count++;
+                continue;
+            }
+
+            const uintptr_t trap_address =
+                (uintptr_t)&entry->bug_addr_disp + (intptr_t)entry->bug_addr_disp;
+            if (!module_contains_executable_address(module, trap_address)) {
+                continue;
+            }
+            uint8_t *code = (uint8_t *)trap_address;
+            if (code[0] != 0x0fu || code[1] != 0x0bu) {
+                continue;
+            }
+            code[0] = 0x66u;
+            code[1] = 0x90u;
+            patched_count++;
+
+            if (trace_modules_enabled()) {
+                const char *file = "(unknown)";
+                if (entry->file_disp != 0) {
+                    const uintptr_t file_address =
+                        (uintptr_t)&entry->file_disp + (intptr_t)entry->file_disp;
+                    if (module_contains_address(module, file_address)) {
+                        file = (const char *)file_address;
+                    }
+                }
+                fprintf(
+                    stderr,
+                    "kobox-loader: warn trap neutralised module=%s addr=%p flags=0x%x site=%s:%u\n",
+                    module->module_name != NULL ? module->module_name : "(unnamed)",
+                    (void *)code,
+                    (unsigned)entry->flags,
+                    file,
+                    (unsigned)entry->line);
+            }
+        }
+    }
+
+    if (patched_count != 0 && trace_modules_enabled()) {
+        fprintf(
+            stderr,
+            "kobox-loader: warn traps neutralised module=%s count=%zu fatal_kept=%zu\n",
+            module->module_name != NULL ? module->module_name : "(unnamed)",
+            patched_count,
+            fatal_count);
+        fflush(stderr);
+    }
+    return KB_OK;
+}
+
 static kb_status_t patch_module_static_trace_calls(kb_module_t *module)
 {
     const size_t section_count = kb_elf_section_count(&module->elf);
@@ -3873,6 +3974,14 @@ static kb_status_t prepare_module(kb_module_t *module)
         fflush(stderr);
     }
     status = patch_module_xhci_command_doorbell(module);
+    if (status != KB_OK) {
+        return status;
+    }
+    if (trace_modules_enabled()) {
+        fprintf(stderr, "kobox-loader: prepare stage=patch_warn_traps module=%s\n", module->module_name);
+        fflush(stderr);
+    }
+    status = patch_module_warn_traps(module);
     if (status != KB_OK) {
         return status;
     }
