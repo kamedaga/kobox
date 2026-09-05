@@ -122,7 +122,9 @@ enum {
     KB_FS_FOLIO_FLAG_LOCKED = 0x1,
     KB_FS_FOLIO_FLAG_UPTODATE = 0x8,
     KB_FS_FOLIO_FLAG_DIRTY = 0x10,
-    KB_FS_FOLIO_FLAG_WRITEBACK = 0x100,
+    /* Linux 6.12 enum pageflags: PG_locked=0, PG_writeback=1.  Keep this
+     * aligned with module-side inline folio_test_writeback() checks. */
+    KB_FS_FOLIO_FLAG_WRITEBACK = 1u << 1,
     KB_FS_FOLIO_FLAG_READAHEAD = 1u << 16,
     KB_FS_PAGE_SIZE = 4096,
     KB_FS_KVM_STRUCT_PAGE_SIZE = 64,
@@ -5543,6 +5545,12 @@ void kb_fs_subsystem_truncate_inode_pages_range(
         if (folio_end < range_start || folio_start > range_end) {
             continue;
         }
+        /* truncate_inode_pages_range() cannot detach a folio, its mapping,
+         * or its buffer_heads while a filesystem BIO still owns them.
+         * The module completes writeback through folio_end_writeback(), and
+         * draining here preserves that lifetime before either full removal
+         * or partial zeroing. */
+        kb_fs_subsystem_folio_wait_writeback(record->folio);
         if (range_start <= folio_start && range_end >= folio_end) {
             filemap_folio_discard(record->folio);
             continue;

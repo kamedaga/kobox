@@ -51,6 +51,13 @@ static uint16_t acl_set_other_permission;
 static unsigned int readahead_smoke_calls;
 static unsigned int readahead_smoke_error;
 static unsigned long readahead_smoke_indices[16];
+static void *truncate_writeback_folio;
+
+static void truncate_writeback_end_io(void *bio)
+{
+    kb_fs_subsystem_folio_end_writeback(truncate_writeback_folio);
+    kb_fs_subsystem_bio_put(bio);
+}
 
 static void readahead_smoke_aop(void *opaque_control)
 {
@@ -1030,6 +1037,59 @@ static int run_pagecache_truncate_smoke(void)
         &start,
         (unsigned long)-1,
         batch) == 0 ? 0 : 95;
+}
+
+static int run_pagecache_truncate_writeback_smoke(void)
+{
+    enum {
+        PG_WRITEBACK_MASK = 1u << 1,
+        STALE_PG_WRITEBACK_MASK = 1u << 8,
+    };
+    unsigned char mapping[256] = {0};
+    void *folio = kb_fs_subsystem_filemap_get_folio(
+        mapping,
+        0,
+        0x4u,
+        0);
+    if (folio == NULL || (uintptr_t)folio >= (uintptr_t)-4095) {
+        return 283;
+    }
+    kb_fs_subsystem_folio_put(folio);
+    kb_fs_subsystem_folio_start_writeback(folio, 0);
+    uint64_t flags = 0;
+    memcpy(&flags, folio, sizeof(flags));
+    if ((flags & PG_WRITEBACK_MASK) == 0 ||
+        (flags & STALE_PG_WRITEBACK_MASK) != 0)
+    {
+        kb_fs_subsystem_folio_end_writeback(folio);
+        kb_fs_subsystem_truncate_inode_pages_final(mapping);
+        return 284;
+    }
+
+    void *bio = kb_fs_subsystem_bio_alloc_bioset(
+        (void *)(uintptr_t)1,
+        0,
+        0,
+        0,
+        NULL);
+    if (bio == NULL) {
+        kb_fs_subsystem_folio_end_writeback(folio);
+        kb_fs_subsystem_truncate_inode_pages_final(mapping);
+        return 285;
+    }
+    truncate_writeback_folio = folio;
+    kb_fs_subsystem_bio_set_end_io(bio, truncate_writeback_end_io);
+    kb_fs_subsystem_bio_set_auto_drain(0);
+    kb_fs_subsystem_submit_bio(bio);
+    kb_fs_subsystem_truncate_inode_pages_final(mapping);
+    kb_fs_subsystem_bio_set_auto_drain(1);
+    truncate_writeback_folio = NULL;
+    if (kb_fs_subsystem_bio_queue_depth() != 0 ||
+        kb_fs_subsystem_xa_load(mapping + 8u, 0) != NULL)
+    {
+        return 286;
+    }
+    return 0;
 }
 
 static int run_pagecache_readahead_smoke(void)
@@ -3849,6 +3909,11 @@ int main(void)
     int pagecache_result = run_pagecache_truncate_smoke();
     if (pagecache_result != 0) {
         return pagecache_result;
+    }
+    int truncate_writeback_result =
+        run_pagecache_truncate_writeback_smoke();
+    if (truncate_writeback_result != 0) {
+        return truncate_writeback_result;
     }
     int invalidate_result = run_pagecache_invalidate_smoke();
     if (invalidate_result != 0) {
