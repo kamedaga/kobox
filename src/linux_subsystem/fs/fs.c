@@ -3398,6 +3398,54 @@ void kb_fs_subsystem_bio_set_end_io(void *bio, void (*end_io)(void *))
     }
 }
 
+static int bio_end_io_is_ext4_data(void (*end_io)(void *))
+{
+    if (end_io == NULL) {
+        return 0;
+    }
+    kb_module_t *owner = kb_module_find_owner_for_address((const void *)end_io);
+    void *expected = NULL;
+    return owner != NULL &&
+        kb_module_find_symbol(owner, "ext4_end_bio", &expected) == KB_OK &&
+        expected == (void *)end_io;
+}
+
+static void trace_ext4_data_bio(const char *stage, kb_fs_bio_record_t *record)
+{
+    if (record == NULL || !bio_end_io_is_ext4_data(record->bio.end_io) ||
+        record->bio.private_data == NULL)
+    {
+        return;
+    }
+    const uint8_t *io_end = record->bio.private_data;
+    void *handle = read_pointer_field(io_end, 0x10u);
+    void *inode = read_pointer_field(io_end, 0x18u);
+    const uint32_t flag = read_u32_field(io_end, 0x28u);
+    const uint32_t count = read_u32_field(io_end, 0x2cu);
+    const void *vec_head = io_end + 0x30u;
+    void *vec_next = read_pointer_field(io_end, 0x30u);
+    uint64_t folio_flags = 0;
+    if (record->bio.vector_count != 0 && record->bio.vectors != NULL &&
+        record->bio.vectors[0].page != NULL)
+    {
+        folio_flags = read_u64_field(record->bio.vectors[0].page, 0);
+    }
+    fprintf(stderr,
+        "APK_CAUSE_BIO stage=%s bio=%p io_end=%p handle=%p inode=%p flag=0x%x count=%u vec_nonempty=%u folio_flags=0x%llx queued=%u depth=%zu\n",
+        stage,
+        (void *)record,
+        (void *)io_end,
+        handle,
+        inode,
+        flag,
+        count,
+        vec_next != vec_head,
+        (unsigned long long)folio_flags,
+        record->queued,
+        bio_queue_depth);
+    fflush(stderr);
+}
+
 static void bio_call_end_io(kb_fs_bio_record_t *record)
 {
     if (record == NULL || record->completed) {
@@ -3407,6 +3455,7 @@ static void bio_call_end_io(kb_fs_bio_record_t *record)
     if (record->bio.end_io == NULL) {
         return;
     }
+    trace_ext4_data_bio("complete", record);
     void (*end_io)(void *) = record->bio.end_io;
     unsigned long kernel_gs = kb_module_kernel_gs_for_address((const void *)end_io);
     if (kernel_gs != 0) {
@@ -3926,6 +3975,7 @@ void kb_fs_subsystem_submit_bio(void *bio)
 #endif
     record->result = -115;
     bio_queue_push(record);
+    trace_ext4_data_bio("submit", record);
     if (fs_trace_enabled()) {
         fprintf(stderr,
             "kobox-fs: submit_bio bio=%p bdev=%p op=%u sector=%llu len=%zu queued=%u depth=%zu\n",
