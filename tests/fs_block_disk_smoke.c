@@ -9,7 +9,7 @@
 
 enum {
     SMOKE_SECTOR_SIZE = 512,
-    SMOKE_SECTOR_COUNT = 16,
+    SMOKE_SECTOR_COUNT = 2048,
     SMOKE_BUFFER_HEAD_BYTES = 128,
     SMOKE_BUFFER_HEAD_BLOCKNR_OFFSET = 0x18,
     SMOKE_BUFFER_HEAD_SIZE_OFFSET = 0x20,
@@ -897,6 +897,40 @@ int main(void)
     if (!flush_only_ok) {
         kb_fs_block_device_destroy(fs_device);
         return 22;
+    }
+
+    /* Hold more metadata buffers than the initial 512-entry cache. getblk
+     * must retain one identity per block even while every entry is pinned. */
+    void *pinned[1025] = {0};
+    for (size_t i = 0; i < 1025; ++i) {
+        pinned[i] = kb_fs_subsystem_bdev_getblk(NULL, 32u + i, SMOKE_SECTOR_SIZE, 0);
+        if (pinned[i] == NULL) return 23;
+    }
+    void *again = kb_fs_subsystem_bdev_getblk(NULL, 1056u, SMOKE_SECTOR_SIZE, 0);
+    if (again != pinned[1024]) {
+        fprintf(stderr, "buffer cache overflow lost block identity\n");
+        return 24;
+    }
+    kb_fs_subsystem_buffer_head_put(again);
+    for (size_t i = 0; i < 1025; ++i) {
+        void *data = NULL;
+        memcpy(&data, (char *)pinned[i] + SMOKE_BUFFER_HEAD_DATA_OFFSET, sizeof(data));
+        memset(data, (unsigned char)(i + 0x7b), SMOKE_SECTOR_SIZE);
+        kb_fs_subsystem_mark_buffer_dirty(pinned[i]);
+    }
+    for (size_t i = 0; i < 1025; ++i) kb_fs_subsystem_buffer_head_put(pinned[i]);
+    if (kb_fs_subsystem_flush_dirty_buffers() != 0) return 25;
+    for (size_t i = 0; i < 1025; ++i) {
+        for (size_t j = 0; j < SMOKE_SECTOR_SIZE; ++j) {
+            if (backing[(32u + i) * SMOKE_SECTOR_SIZE + j] != (unsigned char)(i + 0x7b)) return 25;
+        }
+    }
+    /* Reuse released entries across many more allocations than the page
+     * arena capacity; this must not leak untracked buffer folios. */
+    for (size_t i = 0; i < 8192; ++i) {
+        void *bh = kb_fs_subsystem_bdev_getblk(NULL, 2048u + i, SMOKE_SECTOR_SIZE, 0);
+        if (bh == NULL) return 26;
+        kb_fs_subsystem_buffer_head_put(bh);
     }
 
     kb_fs_subsystem_set_mount_probe_block_device(NULL);

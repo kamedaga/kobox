@@ -25,6 +25,8 @@
 
 #if defined(__pachaos__)
 #include "pacha/abi.h"
+#define KB_STRINGIFY_VALUE(value) #value
+#define KB_STRINGIFY(value) KB_STRINGIFY_VALUE(value)
 #endif
 
 #include <ctype.h>
@@ -718,7 +720,7 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         KB_EXTERNAL_CROSS_PROFILE_ASM
         "test %rdi, %rdi\n\t"
         "jz 1f\n\t"
-        "mov $16, %eax\n\t"
+        "mov $" KB_STRINGIFY(PACHA_THREAD_SYSCALL_SET_GS_BASE) ", %eax\n\t"
         "syscall\n\t"
         "1:\n\t"
         "mov 528(%rsp), %rdi\n\t"
@@ -740,7 +742,7 @@ __attribute__((naked)) static void kb_shim_external_call_trampoline(void)
         "mov 624(%rsp), %rdi\n\t"
         "cmp 648(%rsp), %rdi\n\t"
         "je 2f\n\t"
-        "mov $16, %eax\n\t"
+        "mov $" KB_STRINGIFY(PACHA_THREAD_SYSCALL_SET_GS_BASE) ", %eax\n\t"
         "syscall\n\t"
         "2:\n\t"
         "movq $0, kb_current_external_call_target(%rip)\n\t"

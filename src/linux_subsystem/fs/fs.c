@@ -63,7 +63,7 @@ enum {
     KB_FS_FAKE_QUEUE_BYTES = 128,
     KB_FS_FAKE_BUFFER_HEAD_BYTES = 128,
     KB_FS_FAKE_DENTRY_BYTES = 512,
-    KB_FS_BUFFER_CACHE_MAX = 512,
+    KB_FS_BUFFER_CACHE_INITIAL = 512,
     /* Linux 6.12 LTS struct inode layout used by the storage modules. */
     KB_FS_INODE_BYTES = 0x270,
     KB_FS_TYPE_INIT_FS_CONTEXT_OFFSET = 16,
@@ -588,9 +588,29 @@ static size_t bio_queue_depth;
 static int bio_auto_drain = 1;
 static int bio_last_drain_status;
 static unsigned int block_plug_depth;
-static kb_fs_buffer_cache_record_t buffer_cache[KB_FS_BUFFER_CACHE_MAX];
+static kb_fs_buffer_cache_record_t initial_buffer_cache[KB_FS_BUFFER_CACHE_INITIAL];
+static kb_fs_buffer_cache_record_t *buffer_cache = initial_buffer_cache;
+static size_t buffer_cache_capacity = KB_FS_BUFFER_CACHE_INITIAL;
 static size_t buffer_cache_dirty_count;
 static size_t buffer_cache_evict_cursor;
+
+/* Every live getblk buffer must remain indexed: JBD2 and ext4 rely on its
+ * unique identity, and release/dirty tracking must not lose overflow folios.
+ * The initial size is a reclaim target, not permission to return an unhashed
+ * allocation. Records are private bookkeeping; only buffer_head/folio
+ * pointers escape, and those allocations do not move when this table grows. */
+static int buffer_cache_grow(void)
+{
+    if (buffer_cache_capacity > SIZE_MAX / 2u / sizeof(*buffer_cache)) return -12;
+    const size_t capacity = buffer_cache_capacity * 2u;
+    kb_fs_buffer_cache_record_t *records = calloc(capacity, sizeof(*records));
+    if (records == NULL) return -12;
+    memcpy(records, buffer_cache, buffer_cache_capacity * sizeof(*records));
+    if (buffer_cache != initial_buffer_cache) free(buffer_cache);
+    buffer_cache = records;
+    buffer_cache_capacity = capacity;
+    return 0;
+}
 static kb_fs_filemap_folio_record_t filemap_folio_cache[KB_FS_FILEMAP_FOLIO_CACHE_MAX];
 static uint32_t filemap_folio_hash_heads[KB_FS_FILEMAP_FOLIO_HASH_BUCKETS];
 static void *filemap_writeback_stack[KB_FS_FILEMAP_WRITEBACK_STACK_MAX];
@@ -1161,7 +1181,7 @@ static kb_fs_buffer_cache_record_t *buffer_cache_record_for_head(void *buffer_he
     if (buffer_head == NULL) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (buffer_cache[i].active && buffer_cache[i].buffer_head == buffer_head) {
             return &buffer_cache[i];
         }
@@ -1194,7 +1214,7 @@ static void overlay_dirty_buffer_cache_on_read(uint64_t offset, void *buffer, si
         FS_READ_PROFILE_END(overlay, profile_start);
         return;
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (!buffer_cache[i].active ||
             !buffer_cache[i].dirty ||
             buffer_cache[i].data == NULL ||
@@ -1222,9 +1242,25 @@ static void overlay_dirty_buffer_cache_on_read(uint64_t offset, void *buffer, si
     FS_READ_PROFILE_END(overlay, profile_start);
 }
 
+static int buffer_cache_finish_write_batch(void **submitted, size_t count)
+{
+    (void)kb_fs_subsystem_bio_drain();
+    int status = bio_last_drain_status;
+    for (size_t i = 0; i < count; ++i) {
+        kb_fs_subsystem_wait_on_buffer(submitted[i]);
+        uint64_t state = 0;
+        memcpy(&state, submitted[i], sizeof(state));
+        if ((state & (KB_FS_BH_WRITE_EIO | KB_FS_BH_UPTODATE)) != KB_FS_BH_UPTODATE && status == 0) {
+            status = -5;
+        }
+    }
+    return status;
+}
+
 int kb_fs_subsystem_flush_dirty_buffers(void)
 {
-    void *submitted[KB_FS_BUFFER_CACHE_MAX];
+    /* Registry growth must not create an unbounded writeback stack frame. */
+    void *submitted[KB_FS_BUFFER_CACHE_INITIAL];
     size_t submitted_count = 0;
     int first_error = 0;
 
@@ -1234,7 +1270,7 @@ int kb_fs_subsystem_flush_dirty_buffers(void)
      * drain from batching adjacent writes. */
     const int previous_auto_drain = bio_auto_drain;
     bio_auto_drain = 0;
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (!buffer_cache[i].active || !buffer_cache[i].dirty) {
             continue;
         }
@@ -1247,25 +1283,16 @@ int kb_fs_subsystem_flush_dirty_buffers(void)
         } else if ((state & KB_FS_BH_DIRTY) != 0 && first_error == 0) {
             first_error = -75;
         }
-    }
-
-    (void)kb_fs_subsystem_bio_drain();
-    if (bio_last_drain_status != 0 && first_error == 0) {
-        first_error = bio_last_drain_status;
-    }
-    bio_auto_drain = previous_auto_drain;
-
-    for (size_t i = 0; i < submitted_count; ++i) {
-        kb_fs_subsystem_wait_on_buffer(submitted[i]);
-        uint64_t state = 0;
-        memcpy(&state, submitted[i], sizeof(state));
-        if ((state & (KB_FS_BH_WRITE_EIO | KB_FS_BH_UPTODATE)) !=
-                KB_FS_BH_UPTODATE &&
-            first_error == 0)
-        {
-            first_error = -5;
+        if (submitted_count == KB_FS_BUFFER_CACHE_INITIAL) {
+            const int status = buffer_cache_finish_write_batch(submitted, submitted_count);
+            if (first_error == 0) first_error = status;
+            submitted_count = 0;
         }
     }
+
+    const int status = buffer_cache_finish_write_batch(submitted, submitted_count);
+    if (first_error == 0) first_error = status;
+    bio_auto_drain = previous_auto_drain;
     return first_error;
 }
 
@@ -1278,7 +1305,7 @@ static void update_buffer_cache_from_write(uint64_t offset, const void *buffer, 
     if (__builtin_add_overflow(offset, (uint64_t)size, &write_end)) {
         return;
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (!buffer_cache[i].active || buffer_cache[i].data == NULL || buffer_cache[i].block_size == 0) {
             continue;
         }
@@ -1385,14 +1412,18 @@ static void unmount_probe_super_block(void)
 static void clear_mount_probe_objects(void)
 {
     unmount_probe_super_block();
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (!buffer_cache[i].active) {
             continue;
         }
         buffer_cache_release_storage(&buffer_cache[i]);
     }
-    memset(buffer_cache, 0, sizeof(buffer_cache));
+    if (buffer_cache != initial_buffer_cache) free(buffer_cache);
+    buffer_cache = initial_buffer_cache;
+    buffer_cache_capacity = KB_FS_BUFFER_CACHE_INITIAL;
+    memset(initial_buffer_cache, 0, sizeof(initial_buffer_cache));
     buffer_cache_dirty_count = 0;
+    buffer_cache_evict_cursor = 0;
     for (size_t i = 0; i < KB_FS_FILEMAP_FOLIO_CACHE_MAX; i++) {
         if (!filemap_folio_cache[i].active || filemap_folio_cache[i].folio == NULL) {
             continue;
@@ -3398,54 +3429,6 @@ void kb_fs_subsystem_bio_set_end_io(void *bio, void (*end_io)(void *))
     }
 }
 
-static int bio_end_io_is_ext4_data(void (*end_io)(void *))
-{
-    if (end_io == NULL) {
-        return 0;
-    }
-    kb_module_t *owner = kb_module_find_owner_for_address((const void *)end_io);
-    void *expected = NULL;
-    return owner != NULL &&
-        kb_module_find_symbol(owner, "ext4_end_bio", &expected) == KB_OK &&
-        expected == (void *)end_io;
-}
-
-static void trace_ext4_data_bio(const char *stage, kb_fs_bio_record_t *record)
-{
-    if (record == NULL || !bio_end_io_is_ext4_data(record->bio.end_io) ||
-        record->bio.private_data == NULL)
-    {
-        return;
-    }
-    const uint8_t *io_end = record->bio.private_data;
-    void *handle = read_pointer_field(io_end, 0x10u);
-    void *inode = read_pointer_field(io_end, 0x18u);
-    const uint32_t flag = read_u32_field(io_end, 0x28u);
-    const uint32_t count = read_u32_field(io_end, 0x2cu);
-    const void *vec_head = io_end + 0x30u;
-    void *vec_next = read_pointer_field(io_end, 0x30u);
-    uint64_t folio_flags = 0;
-    if (record->bio.vector_count != 0 && record->bio.vectors != NULL &&
-        record->bio.vectors[0].page != NULL)
-    {
-        folio_flags = read_u64_field(record->bio.vectors[0].page, 0);
-    }
-    fprintf(stderr,
-        "APK_CAUSE_BIO stage=%s bio=%p io_end=%p handle=%p inode=%p flag=0x%x count=%u vec_nonempty=%u folio_flags=0x%llx queued=%u depth=%zu\n",
-        stage,
-        (void *)record,
-        (void *)io_end,
-        handle,
-        inode,
-        flag,
-        count,
-        vec_next != vec_head,
-        (unsigned long long)folio_flags,
-        record->queued,
-        bio_queue_depth);
-    fflush(stderr);
-}
-
 static void bio_call_end_io(kb_fs_bio_record_t *record)
 {
     if (record == NULL || record->completed) {
@@ -3455,7 +3438,6 @@ static void bio_call_end_io(kb_fs_bio_record_t *record)
     if (record->bio.end_io == NULL) {
         return;
     }
-    trace_ext4_data_bio("complete", record);
     void (*end_io)(void *) = record->bio.end_io;
     unsigned long kernel_gs = kb_module_kernel_gs_for_address((const void *)end_io);
     if (kernel_gs != 0) {
@@ -3975,7 +3957,6 @@ void kb_fs_subsystem_submit_bio(void *bio)
 #endif
     record->result = -115;
     bio_queue_push(record);
-    trace_ext4_data_bio("submit", record);
     if (fs_trace_enabled()) {
         fprintf(stderr,
             "kobox-fs: submit_bio bio=%p bdev=%p op=%u sector=%llu len=%zu queued=%u depth=%zu\n",
@@ -5687,7 +5668,7 @@ void kb_fs_subsystem_invalidate_bdev(void *bdev)
     if (mapping != NULL) {
         (void)kb_fs_subsystem_invalidate_mapping_pages(mapping, 0, ULONG_MAX);
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; ++i) {
+    for (size_t i = 0; i < buffer_cache_capacity; ++i) {
         kb_fs_buffer_cache_record_t *record = &buffer_cache[i];
         if (!record->active || record->bdev != bdev || record->dirty ||
             record->buffer_head == NULL)
@@ -7267,7 +7248,7 @@ void *kb_fs_subsystem_find_get_block(
     if (block_size == 0) {
         return NULL;
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; ++i) {
+    for (size_t i = 0; i < buffer_cache_capacity; ++i) {
         kb_fs_buffer_cache_record_t *record = &buffer_cache[i];
         if (!record->active ||
             record->bdev != bdev ||
@@ -7334,7 +7315,7 @@ void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned in
     void *buffer_head = NULL;
     void *folio = NULL;
     void *data = NULL;
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (buffer_cache[i].active &&
             buffer_cache[i].bdev == bdev &&
             buffer_cache[i].block_number == block_number &&
@@ -7355,16 +7336,16 @@ void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned in
         memcpy((uint8_t *)buffer_head + KB_FS_BUFFER_HEAD_REFCOUNT_OFFSET, &refcount, sizeof(refcount));
     }
     if (!cache_hit) {
-        size_t cache_slot = KB_FS_BUFFER_CACHE_MAX;
-        for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+        size_t cache_slot = buffer_cache_capacity;
+        for (size_t i = 0; i < buffer_cache_capacity; i++) {
             if (!buffer_cache[i].active) {
                 cache_slot = i;
                 break;
             }
         }
-        if (cache_slot == KB_FS_BUFFER_CACHE_MAX) {
-            for (size_t distance = 0; distance < KB_FS_BUFFER_CACHE_MAX; distance++) {
-                size_t i = (buffer_cache_evict_cursor + distance) % KB_FS_BUFFER_CACHE_MAX;
+        if (cache_slot == buffer_cache_capacity) {
+            for (size_t distance = 0; distance < buffer_cache_capacity; distance++) {
+                size_t i = (buffer_cache_evict_cursor + distance) % buffer_cache_capacity;
                 kb_fs_buffer_cache_record_t *record = &buffer_cache[i];
                 if (record->dirty || record->buffer_head == NULL) {
                     continue;
@@ -7376,12 +7357,19 @@ void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned in
                 if (refcount != 0) {
                     continue;
                 }
+                uint64_t state = 0;
+                memcpy(&state, record->buffer_head, sizeof(state));
+                if ((state & (KB_FS_BH_LOCK | KB_FS_BH_DIRTY)) != 0) continue;
                 buffer_cache_release_storage(record);
                 memset(record, 0, sizeof(*record));
                 cache_slot = i;
-                buffer_cache_evict_cursor = (i + 1u) % KB_FS_BUFFER_CACHE_MAX;
+                buffer_cache_evict_cursor = (i + 1u) % buffer_cache_capacity;
                 break;
             }
+        }
+
+        if (cache_slot == buffer_cache_capacity && buffer_cache_grow() != 0) {
+            return NULL;
         }
 
         unsigned int folio_order = 0;
@@ -7441,7 +7429,7 @@ void *kb_fs_subsystem_bdev_getblk(void *bdev, uint64_t block_number, unsigned in
         write_pointer_field(folio, KB_FS_FOLIO_MAPPING_OFFSET, mount_probe_bdev_mapping);
         memcpy((uint8_t *)buffer_head + KB_FS_BUFFER_HEAD_REFCOUNT_OFFSET, &refcount, sizeof(refcount));
 
-        if (cache_slot != KB_FS_BUFFER_CACHE_MAX) {
+        if (cache_slot != buffer_cache_capacity) {
             buffer_cache[cache_slot].active = 1;
             buffer_cache[cache_slot].bdev = bdev;
             buffer_cache[cache_slot].block_number = block_number;
@@ -7518,7 +7506,7 @@ void kb_fs_subsystem_buffer_head_put(void *buffer_head)
     if (buffer_head == NULL) {
         return;
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (!buffer_cache[i].active || buffer_cache[i].buffer_head != buffer_head) {
             continue;
         }
@@ -7577,7 +7565,7 @@ void kb_fs_subsystem_free_buffer_head(void *buffer_head)
     if (buffer_head == NULL) {
         return;
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; i++) {
+    for (size_t i = 0; i < buffer_cache_capacity; i++) {
         if (buffer_cache[i].active && buffer_cache[i].buffer_head == buffer_head) {
             return;
         }
@@ -7748,7 +7736,7 @@ void kb_fs_subsystem_invalidate_inode_buffers(void *inode)
     if (mapping == NULL) {
         return;
     }
-    for (size_t i = 0; i < KB_FS_BUFFER_CACHE_MAX; ++i) {
+    for (size_t i = 0; i < buffer_cache_capacity; ++i) {
         if (buffer_cache[i].active) {
             buffer_head_clear_association(
                 buffer_cache[i].buffer_head,

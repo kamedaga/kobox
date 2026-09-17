@@ -701,7 +701,7 @@ static kb_status_t pachaos_capsule_map_bar(kb_device_t *device, unsigned bar_ind
             bar_index,
             map_addr,
             (size_t)map_size,
-            PACHA_CAPSULE_MMIO_REPLACE_EXISTING,
+            0, /* Fresh hint, not an existing mapping we have authority to replace. */
             &mmio);
         if (status == 0) {
             break;
