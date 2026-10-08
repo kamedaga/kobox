@@ -23,6 +23,7 @@ static void *execution_context_parent_task;
 static void *execution_context_child_task;
 static unsigned long wait_bit_word;
 static int wait_bit_stage;
+static uint32_t wait_bit_waker_lock;
 static int rwsem_writer_stage;
 static int sync_dirty_inode_count;
 static int sync_write_inode_count;
@@ -134,6 +135,92 @@ static int mmap_smoke_read_folio(void *file, void *folio)
     memset(payload, 0x6d, 4096);
     kb_fs_subsystem_folio_end_read(folio, 1);
     return 0;
+}
+
+static int failed_completion_read_folio(void *file, void *folio)
+{
+    (void)file;
+    /* Submission succeeds, but completion reports an I/O error. The newly
+     * allocated, zero-filled page must not be returned as valid file data. */
+    kb_fs_subsystem_folio_end_read(folio, 0);
+    return 0;
+}
+
+static void *read_completion_folio;
+static unsigned read_completion_submissions;
+
+static void queued_read_end_io(void *bio)
+{
+    (void)mmap_smoke_read_folio(NULL, read_completion_folio);
+    kb_fs_subsystem_bio_put(bio);
+}
+
+static int queued_completion_read_folio(void *file, void *folio)
+{
+    (void)file;
+    void *bio = kb_fs_subsystem_bio_alloc_bioset(
+        (void *)(uintptr_t)1, 0, 0, 0, NULL);
+    if (!bio) {
+        kb_fs_subsystem_folio_end_read(folio, 0);
+        return -12;
+    }
+    read_completion_folio = folio;
+    read_completion_submissions++;
+    kb_fs_subsystem_bio_set_end_io(bio, queued_read_end_io);
+    kb_fs_subsystem_submit_bio(bio);
+    return 0;
+}
+
+static int run_read_cache_completion_smoke(void)
+{
+    unsigned char mapping[0x100] = {0};
+    void *folio = kb_fs_subsystem_read_cache_folio(
+        mapping, 0, failed_completion_read_folio, NULL);
+    if ((intptr_t)folio != -5) {
+        if ((uintptr_t)folio > 4096 && (intptr_t)folio > 0)
+            kb_fs_subsystem_folio_put(folio);
+        kb_fs_subsystem_truncate_inode_pages_final(mapping);
+        return 196;
+    }
+    /* A failed read remains retryable; the next successful fill must return
+     * the actual data, unlocked, with one caller reference. */
+    kb_fs_subsystem_bio_set_auto_drain(0);
+    read_completion_submissions = 0;
+    folio = kb_fs_subsystem_read_cache_folio(
+        mapping, 0, queued_completion_read_folio, NULL);
+    kb_fs_subsystem_bio_set_auto_drain(1);
+    if ((intptr_t)folio <= 0) return 197;
+    unsigned char *payload = kb_linux_kvm_page_payload(folio, 0, 4096);
+    uint64_t flags;
+    memcpy(&flags, folio, sizeof(flags));
+    int valid = payload && payload[0] == 0x6d && payload[4095] == 0x6d &&
+        (flags & 9u) == 8u && read_completion_submissions == 1 &&
+        kb_fs_subsystem_bio_queue_depth() == 0;
+    kb_fs_subsystem_folio_put(folio);
+    kb_fs_subsystem_truncate_inode_pages_final(mapping);
+    if (!valid) return 198;
+
+    /* A pending readahead owns a locked folio before read_cache_folio is
+     * entered. Complete that read instead of submitting it a second time. */
+    folio = kb_fs_subsystem_filemap_get_folio(mapping, 0, 0x4u, 0);
+    if ((intptr_t)folio <= 0) return 199;
+    kb_fs_subsystem_folio_lock(folio);
+    kb_fs_subsystem_bio_set_auto_drain(0);
+    if (queued_completion_read_folio(NULL, folio)) return 200;
+    kb_fs_subsystem_folio_put(folio);
+    folio = kb_fs_subsystem_read_cache_folio(
+        mapping, 0, queued_completion_read_folio, NULL);
+    kb_fs_subsystem_bio_set_auto_drain(1);
+    if ((intptr_t)folio <= 0) return 201;
+    payload = kb_linux_kvm_page_payload(folio, 0, 4096);
+    memcpy(&flags, folio, sizeof(flags));
+    valid = payload && payload[0] == 0x6d && payload[4095] == 0x6d &&
+        (flags & 9u) == 8u && read_completion_submissions == 2 &&
+        kb_fs_subsystem_bio_queue_depth() == 0;
+    kb_fs_subsystem_folio_put(folio);
+    kb_fs_subsystem_truncate_inode_pages_final(mapping);
+    read_completion_folio = NULL;
+    return valid ? 0 : 202;
 }
 
 static int mmap_smoke_get_block(
@@ -500,6 +587,12 @@ static int cooperative_bit_waiter_smoke(void *data)
     if (result != 0) {
         return result;
     }
+    /* A wake from an atomic section must return to its caller before the
+     * runnable waiter executes. Fail explicitly instead of deadlocking on
+     * the lock if wake_up_bit incorrectly schedules the waiter itself. */
+    if (__atomic_load_n(&wait_bit_waker_lock, __ATOMIC_ACQUIRE) != 0) {
+        return -154;
+    }
     wait_bit_stage = 3;
     return 0;
 }
@@ -511,8 +604,10 @@ static int cooperative_bit_waker_smoke(void *data)
         return -22;
     }
     wait_bit_stage = 2;
+    kb_raw_spin_lock(&wait_bit_waker_lock);
     __atomic_fetch_and(word, ~(1ul << 3), __ATOMIC_RELEASE);
     kb_wake_up_bit(word, 3);
+    kb_raw_spin_unlock(&wait_bit_waker_lock);
     return 0;
 }
 
@@ -705,6 +800,7 @@ static int run_cooperative_bit_wait_smoke(void)
 
     wait_bit_word = 1ul << 3;
     wait_bit_stage = 0;
+    wait_bit_waker_lock = 0;
     void *waker = kb_kthread_create_on_node(
         cooperative_bit_waker_smoke,
         &wait_bit_word,
@@ -725,6 +821,23 @@ static int run_cooperative_bit_wait_smoke(void)
         kb_kthread_stop(waiter) != 0 || kb_kthread_stop(waker) != 0)
     {
         return 153;
+    }
+
+    /* An outer service call may hold locks too. Waking an unrelated bit
+     * must not synchronously run an already-runnable background task. */
+    wait_bit_word = 1ul << 3;
+    task = kb_kthread_create_on_node(
+        cooperative_bit_clear_smoke, &wait_bit_word, -1, "kobox-bit-no-dispatch");
+    if (task == NULL || kb_wake_up_process(task) != 1) {
+        return 154;
+    }
+    kb_wake_up_bit(&wait_bit_word, 0);
+    if (wait_bit_word != (1ul << 3)) {
+        return 155;
+    }
+    kb_run_deferred_work();
+    if (wait_bit_word != 0 || kb_kthread_stop(task) != 0) {
+        return 156;
     }
 
     wait_bit_word = 0;
@@ -1576,6 +1689,116 @@ static int run_write_cache_pages_smoke(void)
     return status == 0 && write_cache_count == 2 &&
         write_cache_indices[0] == 2 && write_cache_indices[1] == 4 &&
         nr_to_write == 0 ? 0 : 108;
+}
+
+static unsigned int release_reclaim_calls;
+static int release_reclaim_allow;
+static int release_reclaim_unlocked;
+
+static int release_reclaim_aop(void *folio, unsigned int gfp)
+{
+    (void)gfp;
+    release_reclaim_calls++;
+    uint64_t flags = 0;
+    memcpy(&flags, folio, sizeof(flags));
+    if ((flags & 1u) == 0) release_reclaim_unlocked = 1;
+    return release_reclaim_allow ?
+        kb_fs_subsystem_try_to_free_buffers(folio) : 0;
+}
+
+/* Clean folios can still have filesystem-owned journal/buffer state. */
+static int run_pagecache_release_reclaim_smoke(void)
+{
+    unsigned char mapping[256] = {0};
+    unsigned char aops[128] = {0};
+    void *pointer = aops;
+    memcpy(mapping + 0x68, &pointer, sizeof(pointer));
+    pointer = (void *)(uintptr_t)&release_reclaim_aop;
+    memcpy(aops + 0x48, &pointer, sizeof(pointer));
+    void *protected_folio = NULL;
+    int result = 0;
+    release_reclaim_calls = 0;
+    release_reclaim_allow = 0;
+    release_reclaim_unlocked = 0;
+    for (unsigned long index = 0; index < 2049; index++) {
+        void *folio = kb_fs_subsystem_filemap_get_folio(mapping, index, 0x4u, 0);
+        if (folio == NULL || (uintptr_t)folio >= (uintptr_t)-4095) {
+            result = 193;
+            break;
+        }
+        if (index == 0) {
+            protected_folio = folio;
+            if (kb_fs_subsystem_create_empty_buffers(folio, 4096, 0) == NULL) {
+                result = 194;
+            }
+        }
+        kb_fs_subsystem_folio_put(folio);
+        if (result != 0) break;
+    }
+    void *original = kb_fs_subsystem_filemap_get_folio(mapping, 0, 0, 0);
+    if (result == 0 && (original != protected_folio || release_reclaim_calls == 0 ||
+                       release_reclaim_unlocked)) {
+        result = 195;
+    }
+    if (original != NULL && (uintptr_t)original < (uintptr_t)-4095) {
+        kb_fs_subsystem_folio_put(original);
+    }
+    release_reclaim_allow = 1;
+    if (result == 0) {
+        void *folio = kb_fs_subsystem_filemap_get_folio(mapping, 2049, 0x4u, 0);
+        if (folio == NULL || (uintptr_t)folio >= (uintptr_t)-4095) {
+            result = 196;
+        } else {
+            kb_fs_subsystem_folio_put(folio);
+            original = kb_fs_subsystem_filemap_get_folio(mapping, 0, 0, 0);
+            if ((intptr_t)original != -2) {
+                result = 197;
+                if (original != NULL && (uintptr_t)original < (uintptr_t)-4095)
+                    kb_fs_subsystem_folio_put(original);
+            }
+        }
+    }
+    kb_fs_subsystem_truncate_inode_pages_final(mapping);
+    return result;
+}
+
+static int run_pagecache_locked_reclaim_smoke(void)
+{
+    unsigned char mapping[256] = {0};
+    void *locked = NULL;
+    int result = 0;
+    for (unsigned long index = 0; index < 2048; index++) {
+        void *folio = kb_fs_subsystem_filemap_get_folio(mapping, index, 0x4u, 0);
+        if (folio == NULL || (uintptr_t)folio >= (uintptr_t)-4095) {
+            result = 190;
+            break;
+        }
+        if (index == 0) {
+            locked = folio;
+            kb_fs_subsystem_folio_lock(folio);
+        }
+        kb_fs_subsystem_folio_put(folio);
+    }
+    if (result == 0) {
+        void *replacement = kb_fs_subsystem_filemap_get_folio(mapping, 2048, 0x4u, 0);
+        if (replacement == NULL || (uintptr_t)replacement >= (uintptr_t)-4095) {
+            result = 191;
+        } else {
+            kb_fs_subsystem_folio_put(replacement);
+            void *original = kb_fs_subsystem_filemap_get_folio(mapping, 0, 0, 0);
+            if (original != locked) {
+                result = 192;
+            }
+            if (original != NULL && (uintptr_t)original < (uintptr_t)-4095) {
+                kb_fs_subsystem_folio_put(original);
+            }
+        }
+    }
+    if (locked != NULL) {
+        kb_fs_subsystem_folio_unlock(locked);
+    }
+    kb_fs_subsystem_truncate_inode_pages_final(mapping);
+    return result;
 }
 
 static int run_pagecache_reclaim_range_smoke(void)
@@ -3748,6 +3971,8 @@ int main(void)
     if (parser_result != 0) {
         return parser_result;
     }
+    int completion_result = run_read_cache_completion_smoke();
+    if (completion_result != 0) return completion_result;
     int mmap_result = run_filemap_fault_and_mkwrite_smoke();
     if (mmap_result != 0) {
         return mmap_result;
@@ -3926,6 +4151,14 @@ int main(void)
     int write_cache_result = run_write_cache_pages_smoke();
     if (write_cache_result != 0) {
         return write_cache_result;
+    }
+    int release_reclaim_result = run_pagecache_release_reclaim_smoke();
+    if (release_reclaim_result != 0) {
+        return release_reclaim_result;
+    }
+    int locked_reclaim_result = run_pagecache_locked_reclaim_smoke();
+    if (locked_reclaim_result != 0) {
+        return locked_reclaim_result;
     }
     int reclaim_range_result = run_pagecache_reclaim_range_smoke();
     if (reclaim_range_result != 0) {

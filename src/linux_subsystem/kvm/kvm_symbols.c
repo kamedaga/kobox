@@ -491,6 +491,13 @@ int kb_linux_kvm_dma_addr_in_payload_arena(uint64_t dma_addr, size_t size)
     return offset < arena_size && size <= arena_size - offset;
 }
 
+int kb_linux_kvm_is_page_record(const void *page)
+{
+    const uintptr_t base = (uintptr_t)kb_kvm_page_records;
+    const uintptr_t addr = (uintptr_t)page;
+    return base != 0 && addr >= base && addr - base < KB_KVM_PAGE_RECORD_BYTES;
+}
+
 void *kb_linux_kvm_page_payload(void *page, unsigned long offset, size_t size)
 {
     if (page == NULL || size == 0) {

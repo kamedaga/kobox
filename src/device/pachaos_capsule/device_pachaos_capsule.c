@@ -72,6 +72,9 @@ struct kb_device {
     kb_pci_location_t location;
     uint64_t dma_mask;
     uint64_t coherent_dma_mask;
+    /* MSI-X table programming precedes request_irq(). Keep the capability
+     * that allocates the route until the eventual handler takes ownership. */
+    struct pacha_capsule_irq staged_msix[KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT];
 };
 
 struct kb_device_irq {
@@ -566,6 +569,11 @@ static void pachaos_capsule_destroy(kb_device_backend_t *backend)
         free(mapping);
     }
     for (size_t i = 0; i < pacha->device_count; i++) {
+        for (size_t entry = 0; entry < KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT; entry++) {
+            if (pacha_capsule_is_fd(pacha->devices[i].staged_msix[entry].fd)) {
+                (void)pacha_capsule_close(pacha->devices[i].staged_msix[entry].fd);
+            }
+        }
         if (pacha_capsule_is_fd(pacha->devices[i].device_fd)) {
             (void)pacha_capsule_close(pacha->devices[i].device_fd);
             pacha->devices[i].device_fd = -1;
@@ -1351,18 +1359,46 @@ static kb_status_t pachaos_capsule_msix_delivery_vector(
 {
     enum {
         PACHAOS_MSIX_DELIVERY_VECTOR_BASE = 0x50,
-        PACHAOS_MSIX_DELIVERY_VECTOR_LIMIT = 0xd0,
+        PACHAOS_MSIX_DELIVERY_VECTOR_LIMIT = 0xf0,
     };
 
     if (device == NULL || out_vector == NULL || entry >= KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) {
         return KB_ERR_INVALID;
     }
 
-    const uint64_t base = device->info.index;
+    uint64_t base = device->info.index;
+    if (base == 0) {
+        /* The kernel assigns a vector block lazily at IRQ derivation, not at
+         * PCI claim. Derive the exact entry before writing its MSI-X table
+         * slot; request_irq() later consumes this same IRQ capability. */
+        struct pacha_capsule_irq irq = {0};
+        int status = pacha_capsule_device_derive_irq(
+            device->device_fd, PACHA_CAPSULE_IRQ_MSIX, entry, 0, &irq);
+        if (status != 0)
+            return status_from_pacha(status);
+        struct pacha_capsule_info info = {0};
+        status = pacha_capsule_expect_kind(
+            device->device_fd, PACHA_CAPSULE_KIND_DEVICE, &info);
+        base = info.index;
+        if (status != 0 ||
+            base < PACHAOS_MSIX_DELIVERY_VECTOR_BASE ||
+            base > PACHAOS_MSIX_DELIVERY_VECTOR_LIMIT - KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT ||
+            ((base - PACHAOS_MSIX_DELIVERY_VECTOR_BASE) % KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) != 0) {
+            (void)pacha_capsule_close(irq.fd);
+            return status != 0 ? status_from_pacha(status) : KB_ERR_INVALID;
+        }
+        device->info.index = base;
+        device->staged_msix[entry] = irq;
+    }
+
     if (base < PACHAOS_MSIX_DELIVERY_VECTOR_BASE ||
         base > PACHAOS_MSIX_DELIVERY_VECTOR_LIMIT - KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT ||
         ((base - PACHAOS_MSIX_DELIVERY_VECTOR_BASE) % KB_DEVICE_ROUTED_MSIX_ENTRY_COUNT) != 0)
     {
+        if (pacha_capsule_is_fd(device->staged_msix[entry].fd)) {
+            (void)pacha_capsule_close(device->staged_msix[entry].fd);
+            device->staged_msix[entry] = (struct pacha_capsule_irq){0};
+        }
         return KB_ERR_INVALID;
     }
 
@@ -1398,11 +1434,14 @@ static kb_status_t pachaos_capsule_irq_register(
     }
     (void)delivery_vector;
 
-    struct pacha_capsule_irq irq_fd = {0};
-    const int status = pacha_capsule_device_derive_irq(
-        device->device_fd, PACHA_CAPSULE_IRQ_MSIX, irq_vector, 0, &irq_fd);
-    if (status != 0) {
-        return status_from_pacha(status);
+    struct pacha_capsule_irq irq_fd = device->staged_msix[irq_vector];
+    device->staged_msix[irq_vector] = (struct pacha_capsule_irq){0};
+    if (!pacha_capsule_is_fd(irq_fd.fd)) {
+        const int status = pacha_capsule_device_derive_irq(
+            device->device_fd, PACHA_CAPSULE_IRQ_MSIX, irq_vector, 0, &irq_fd);
+        if (status != 0) {
+            return status_from_pacha(status);
+        }
     }
 
     kb_device_irq_t *irq = calloc(1, sizeof(*irq));

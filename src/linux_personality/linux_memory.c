@@ -31,6 +31,7 @@ enum {
     KB_KMALLOC_RECORD_ALIGN = 16u,
     KB_KMALLOC_MMAP_ALIGN = 4096u,
     KB_KMALLOC_ARENA_CHUNK_MIN = 1024u * 1024u,
+    KB_KMALLOC_INDEX_BITS = 12u,
 };
 
 typedef struct kb_kmem_cache_page {
@@ -284,7 +285,11 @@ typedef struct kb_heap_arena_free_block {
     size_t size;
 } kb_heap_arena_free_block_t;
 
-static kb_heap_allocation_t *heap_allocations;
+/* Address membership, not allocation order, is used by free/usable_size.
+ * Keep the existing record link and backing lifetime, but avoid walking all
+ * live allocations for each release. No per-allocation storage is added.
+ * Like the arena itself, this index uses the runtime's existing serialization. */
+static kb_heap_allocation_t *heap_allocations[1u << KB_KMALLOC_INDEX_BITS];
 static kb_heap_arena_chunk_t *heap_arena_chunks;
 static kb_heap_arena_free_block_t *heap_arena_free_blocks;
 static kb_memory_hotpath_profile_t memory_hotpath_profile;
@@ -660,18 +665,28 @@ static int allocation_guards_ok(const kb_heap_allocation_t *record)
         guard_matches(user + record->size, KB_KMALLOC_GUARD_SIZE, 0x5au);
 }
 
+static size_t heap_allocation_bucket(const void *ptr)
+{
+    /* Multiply before taking the high bits so page-aligned backing addresses
+     * do not collapse into one bucket. No memory at ptr is inspected. */
+    uint64_t value = (uint64_t)(uintptr_t)ptr >> 4;
+    value *= UINT64_C(0x9e3779b97f4a7c15);
+    return (size_t)(value >> (64u - KB_KMALLOC_INDEX_BITS));
+}
+
 static void track_heap_allocation(kb_heap_allocation_t *record)
 {
     if (record == NULL) {
         return;
     }
-    record->next = heap_allocations;
-    heap_allocations = record;
+    const size_t bucket = heap_allocation_bucket(record->ptr);
+    record->next = heap_allocations[bucket];
+    heap_allocations[bucket] = record;
 }
 
 static kb_heap_allocation_t *take_heap_allocation(void *ptr)
 {
-    kb_heap_allocation_t **cursor = &heap_allocations;
+    kb_heap_allocation_t **cursor = &heap_allocations[heap_allocation_bucket(ptr)];
     while (*cursor != NULL) {
         MEMORY_PROFILE_INCREMENT(allocation_search_steps);
         kb_heap_allocation_t *record = *cursor;
@@ -687,7 +702,8 @@ static kb_heap_allocation_t *take_heap_allocation(void *ptr)
 
 size_t kb_kmalloc_usable_size(const void *ptr)
 {
-    for (kb_heap_allocation_t *record = heap_allocations; record != NULL; record = record->next) {
+    for (kb_heap_allocation_t *record = heap_allocations[heap_allocation_bucket(ptr)];
+         record != NULL; record = record->next) {
         if (record->ptr == ptr) {
             return record->size;
         }

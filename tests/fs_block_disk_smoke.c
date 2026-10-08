@@ -332,6 +332,46 @@ int main(void)
     kb_fs_subsystem_free_buffer_head(temporary_head);
     kb_kvm_free_pages_stub(temporary_folio, 0);
 
+    /* An expired arena page is metadata, not a raw host I/O buffer. */
+    void *stale_bio = kb_fs_subsystem_bio_alloc_bioset(
+        NULL, 1, KB_FS_BIO_OP_READ, 0, NULL);
+    if (stale_bio == NULL ||
+        kb_fs_subsystem_bio_add_page(stale_bio, temporary_folio, 512, 0) != 0 ||
+        kb_fs_subsystem_bio_add_folio(stale_bio, temporary_folio, 512, 0) != 0)
+    {
+        kb_fs_subsystem_bio_put(stale_bio);
+        kb_fs_block_device_destroy(fs_device);
+        return 90;
+    }
+    kb_fs_subsystem_bio_put(stale_bio);
+
+    temporary_folio = kb_kvm_alloc_pages_stub(0, 0);
+    stale_bio = kb_fs_subsystem_bio_alloc_bioset(
+        NULL, 1, KB_FS_BIO_OP_READ, 0, NULL);
+    if (temporary_folio == NULL || stale_bio == NULL ||
+        kb_fs_subsystem_bio_add_page(stale_bio, temporary_folio, 512, 0) != 512)
+    {
+        kb_fs_subsystem_bio_put(stale_bio);
+        kb_kvm_free_pages_stub(temporary_folio, 0);
+        kb_fs_block_device_destroy(fs_device);
+        return 91;
+    }
+    kb_kvm_free_pages_stub(temporary_folio, 0);
+    unsigned char stale_metadata[64];
+    memcpy(stale_metadata, temporary_folio, sizeof(stale_metadata));
+    kb_fs_subsystem_bio_set_sector(stale_bio, 2);
+    kb_fs_subsystem_submit_bio(stale_bio);
+    kb_fs_bio_snapshot_t stale_snapshot;
+    if (kb_fs_subsystem_bio_snapshot(stale_bio, &stale_snapshot) != 0 ||
+        stale_snapshot.completed != 1 || stale_snapshot.result == 0 ||
+        memcmp(stale_metadata, temporary_folio, sizeof(stale_metadata)) != 0)
+    {
+        kb_fs_subsystem_bio_put(stale_bio);
+        kb_fs_block_device_destroy(fs_device);
+        return 92;
+    }
+    kb_fs_subsystem_bio_put(stale_bio);
+
     unsigned char bio_read_buffer[SMOKE_SECTOR_SIZE];
     memset(bio_read_buffer, 0, sizeof(bio_read_buffer));
     void *read_bio = kb_fs_subsystem_bio_alloc_bioset(NULL, 1, KB_FS_BIO_OP_READ, 0, NULL);

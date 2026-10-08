@@ -34,6 +34,8 @@ enum {
     KB_NVME_QUEUE_PHASE_OFFSET = 0x76,
     KB_NVME_QUEUE_QES_OFFSET = 0x77,
     KB_NVME_QUEUE_CQ_OFFSET = 0x48,
+    KB_NVME_QUEUE_DBBUF_CQ_DB_OFFSET = 0x88,
+    KB_NVME_QUEUE_DBBUF_CQ_EI_OFFSET = 0x98,
     KB_NVME_DEV_DB_STRIDE_OFFSET = 0x198,
     KB_NVME_DEV_TAGSET_OFFSET = 0x08,
 
@@ -1302,28 +1304,17 @@ static void nvme_reset_dbbuf_shadow(void)
     kb_nvme_subsystem_reset_dbbuf_shadow();
 }
 
-static void nvme_write_dbbuf_shadow(unsigned char *nvmeq, unsigned int doorbell, uint32_t value)
+static int nvme_update_cq_dbbuf(unsigned char *nvmeq, uint16_t value)
 {
-    unsigned char *dev = nvmeq == NULL ? NULL : read_ptr(nvmeq + KB_NVME_QUEUE_DEV_OFFSET);
-    if (dev == NULL || !kb_nvme_subsystem_dbbuf_ready()) {
-        return;
-    }
-
-    uint32_t db_stride = 0;
-    memcpy(&db_stride, dev + KB_NVME_DEV_DB_STRIDE_OFFSET, sizeof(db_stride));
-    if (db_stride == 0) {
-        db_stride = 1;
-    }
-
-    uint16_t qid = read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET);
-    const size_t db_index = ((size_t)qid * 2u * (size_t)db_stride) + doorbell;
-    size_t dbs_size = 0;
-    uint32_t *dbs = kb_nvme_subsystem_dbbuf_dbs_cpu(&dbs_size);
-    if (dbs == NULL || (db_index + 1u) * sizeof(*dbs) > dbs_size) {
-        return;
-    }
-    dbs[db_index] = value;
-    atomic_thread_fence(memory_order_release);
+    if (nvmeq == NULL || read_u16(nvmeq + KB_NVME_QUEUE_QID_OFFSET) == 0)
+        return 1;
+    /* Use the pinned module's per-queue pointers: it clears these if DBBUF
+     * configuration fails, and already accounts for the device's stride.
+     * Tracked DMA allocation alone does not prove DBBUF is enabled. Admin
+     * queues retain MMIO, including during configuration and reset. */
+    volatile uint32_t *shadow = read_ptr(nvmeq + KB_NVME_QUEUE_DBBUF_CQ_DB_OFFSET);
+    const volatile uint32_t *event = read_ptr(nvmeq + KB_NVME_QUEUE_DBBUF_CQ_EI_OFFSET);
+    return kb_nvme_update_dbbuf(value, shadow, event);
 }
 
 static int nvme_wait_ready(unsigned char *bar, int ready)
@@ -1614,11 +1605,11 @@ static int nvme_block_drain_io_completion(unsigned char *nvmeq, void *reference_
         *(uint8_t *)(nvmeq + KB_NVME_QUEUE_PHASE_OFFSET) = phase;
     }
     write_u16(nvmeq + KB_NVME_QUEUE_CQ_HEAD_OFFSET, head);
-    nvme_write_dbbuf_shadow(nvmeq, 1u, head);
+    const int notify_cq = nvme_update_cq_dbbuf(nvmeq, head);
 
     unsigned char *dev = read_ptr(nvmeq + KB_NVME_QUEUE_DEV_OFFSET);
     volatile uint32_t *sq_tail_db = read_ptr(nvmeq + KB_NVME_QUEUE_SQ_DB_OFFSET);
-    if (dev != NULL && sq_tail_db != NULL) {
+    if (notify_cq && dev != NULL && sq_tail_db != NULL) {
         uint32_t db_stride = 0;
         memcpy(&db_stride, dev + KB_NVME_DEV_DB_STRIDE_OFFSET, sizeof(db_stride));
         volatile uint32_t *cq_head_db = sq_tail_db + db_stride;
@@ -1850,8 +1841,7 @@ static int nvme_block_complete_execute(void *request)
         *(uint8_t *)(nvmeq + KB_NVME_QUEUE_PHASE_OFFSET) = phase;
     }
     write_u16(nvmeq + KB_NVME_QUEUE_CQ_HEAD_OFFSET, head);
-    nvme_write_dbbuf_shadow(nvmeq, 1u, head);
-    if (cq_head_db != NULL) {
+    if (nvme_update_cq_dbbuf(nvmeq, head) && cq_head_db != NULL) {
         *cq_head_db = head;
     }
     kb_linux_block_request_mark_complete(request, (unsigned)(completion_status >> 1));

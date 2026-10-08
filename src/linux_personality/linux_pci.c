@@ -1422,8 +1422,14 @@ int kb_pci_register_driver(void *driver, void *owner, const char *mod_name)
     if (!registration_reentry) {
         size_t device_count = 0;
         if (backend_ops == NULL || backend_ops->device_count == NULL ||
-            backend_ops->device_count(backend, &device_count) != KB_OK || device_count == 0) {
+            backend_ops->device_count(backend, &device_count) != KB_OK) {
             return -19;
+        }
+        /* Linux keeps a registered PCI driver even when no device currently
+         * matches.  A zero-device backend is valid for a service whose PCI
+         * transport is optional, and must not abort that module's init. */
+        if (device_count == 0) {
+            return 0;
         }
         if (device_count > KB_PCI_BINDING_MAX) {
             return -28;

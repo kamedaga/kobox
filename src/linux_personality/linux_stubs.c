@@ -1952,6 +1952,48 @@ void *kb_rb_next(void *node)
     return parent;
 }
 
+static void *rb_first_leaf(void *node)
+{
+    while (!low_or_error_ptr(node)) {
+        void *child = rb_child(node, KB_RB_LEFT_OFFSET);
+        if (child == NULL) {
+            child = rb_child(node, KB_RB_RIGHT_OFFSET);
+        }
+        if (child == NULL) {
+            return node;
+        }
+        node = child;
+    }
+    return NULL;
+}
+
+void *kb_rb_first_postorder(void *root)
+{
+    if (low_or_error_ptr(root)) {
+        return NULL;
+    }
+    void *node = NULL;
+    memcpy(&node, root, sizeof(node));
+    return rb_first_leaf(node);
+}
+
+void *kb_rb_next_postorder(void *node)
+{
+    if (low_or_error_ptr(node)) {
+        return NULL;
+    }
+    void *parent = rb_parent(node);
+    /* ext4 frees each directory-name node after computing its successor.
+     * Visit children before parents without revisiting freed descendants. */
+    if (parent != NULL && node == rb_child(parent, KB_RB_LEFT_OFFSET)) {
+        void *sibling = rb_child(parent, KB_RB_RIGHT_OFFSET);
+        if (sibling != NULL) {
+            return rb_first_leaf(sibling);
+        }
+    }
+    return parent;
+}
+
 void *kb_rb_prev(void *node)
 {
     if (low_or_error_ptr(node)) {

@@ -1503,6 +1503,25 @@ static int test_net_backend_and_page_lifetime(kb_device_backend_t *backend)
     return failed ? 10 : 0;
 }
 
+static kb_status_t empty_pci_device_count(kb_device_backend_t *backend, size_t *out_count)
+{
+    (void)backend;
+    if (out_count == NULL) return KB_ERR_INVALID;
+    *out_count = 0;
+    return KB_OK;
+}
+
+static int test_pci_driver_registration_without_devices(void)
+{
+    const kb_device_backend_ops_t empty_ops = { .device_count = empty_pci_device_count };
+    kb_device_backend_t empty_backend = { .ops = &empty_ops };
+    int driver_token = 0;
+    kb_shim_set_device_backend(&empty_backend);
+    const int status = kb_pci_register_driver(&driver_token, NULL, "empty-pci-smoke");
+    kb_shim_set_device_backend(NULL);
+    return status;
+}
+
 int main(void)
 {
     if (getenv("KOBOX_TEST_NVME_SCATTER_ONLY") != NULL) {
@@ -1790,6 +1809,10 @@ int main(void)
     if (test_linux_host_interfaces() != 0) {
         kb_device_backend_destroy(backend);
         return 41;
+    }
+    if (test_pci_driver_registration_without_devices() != 0) {
+        kb_device_backend_destroy(backend);
+        return 50;
     }
 
     const int nvme_scattered_prps_status = test_nvme_scattered_prps();

@@ -3377,20 +3377,40 @@ static int bio_add_vector(
     return (int)len;
 }
 
+static void *bio_vector_payload(void *page, size_t len, size_t offset)
+{
+    if (kb_linux_kvm_is_page_record(page)) {
+        void *payload = kb_linux_kvm_page_payload(page, offset, len);
+        if (payload == NULL) {
+            fprintf(stderr, "FILED_STORAGE_FAULT layer=bio_page_lifetime "
+                "page=%p len=%zu offset=%zu caller=%p\n",
+                page, len, offset, __builtin_return_address(0));
+        }
+        return payload;
+    }
+    /* The host-only block API also accepts raw buffers. Never reinterpret
+     * an arena page record as one when its allocation has been released. */
+    if (page == NULL || len == 0 || offset > UINTPTR_MAX - (uintptr_t)page ||
+        len > UINTPTR_MAX - ((uintptr_t)page + offset)) {
+        return NULL;
+    }
+    return (uint8_t *)page + offset;
+}
+
 int kb_fs_subsystem_bio_add_folio(void *bio, void *folio, size_t len, size_t offset)
 {
     kb_fs_bio_record_t *record = bio_record_from_handle(bio);
     if (record == NULL || folio == NULL) {
         return 0;
     }
-    void *payload = folio_page_payload(folio);
+    void *payload = bio_vector_payload(folio, len, offset);
     if (payload == NULL) {
-        payload = folio;
+        return 0;
     }
     return bio_add_vector(
         record,
         folio,
-        (uint8_t *)payload + offset,
+        payload,
         len,
         offset) != 0;
 }
@@ -3401,14 +3421,14 @@ int kb_fs_subsystem_bio_add_page(void *bio, void *page, unsigned int len, unsign
     if (record == NULL || page == NULL) {
         return 0;
     }
-    void *payload = folio_page_payload(page);
+    void *payload = bio_vector_payload(page, len, offset);
     if (payload == NULL) {
-        payload = page;
+        return 0;
     }
     return bio_add_vector(
         record,
         page,
-        (uint8_t *)payload + offset,
+        payload,
         len,
         offset);
 }
@@ -3515,17 +3535,14 @@ static int bio_submit_now(kb_fs_bio_record_t *record)
             {
                 const kb_fs_linux_bio_vec_t *vector =
                     &record->bio.vectors[vector_index++];
-                void *payload = folio_page_payload(vector->page);
-                if (payload == NULL) {
-                    payload = vector->page;
-                }
+                void *payload = bio_vector_payload(
+                    vector->page, vector->length, vector->offset);
                 if (payload == NULL || vector->length == 0) {
                     status = -22;
                     break;
                 }
                 requests[request_count].offset = offset;
-                requests[request_count].buffer =
-                    (uint8_t *)payload + vector->offset;
+                requests[request_count].buffer = payload;
                 requests[request_count].size = vector->length;
                 request_count++;
                 if (__builtin_add_overflow(
@@ -3561,17 +3578,14 @@ static int bio_submit_now(kb_fs_bio_record_t *record)
             {
                 const kb_fs_linux_bio_vec_t *vector =
                     &record->bio.vectors[vector_index++];
-                void *payload = folio_page_payload(vector->page);
-                if (payload == NULL) {
-                    payload = vector->page;
-                }
+                void *payload = bio_vector_payload(
+                    vector->page, vector->length, vector->offset);
                 if (payload == NULL || vector->length == 0) {
                     status = -22;
                     break;
                 }
                 requests[request_count].offset = offset;
-                requests[request_count].buffer =
-                    (const uint8_t *)payload + vector->offset;
+                requests[request_count].buffer = payload;
                 requests[request_count].size = vector->length;
                 request_count++;
                 if (__builtin_add_overflow(offset, (uint64_t)vector->length, &offset)) {
@@ -3599,11 +3613,12 @@ static int bio_submit_now(kb_fs_bio_record_t *record)
     int fua_satisfied = 0;
     for (uint16_t i = 0; i < record->bio.vector_count; ++i) {
         const kb_fs_linux_bio_vec_t *vector = &record->bio.vectors[i];
-        void *payload = folio_page_payload(vector->page);
-        if (payload == NULL) {
-            payload = vector->page;
+        void *buffer = bio_vector_payload(
+            vector->page, vector->length, vector->offset);
+        if (buffer == NULL) {
+            status = -22;
+            break;
         }
-        void *buffer = (uint8_t *)payload + vector->offset;
         if (op == KB_FS_BIO_OP_READ) {
             status = kb_fs_block_device_read(
                 device, offset, buffer, vector->length);
@@ -3744,18 +3759,15 @@ static int bio_append_write_requests(
     size_t total_size = 0;
     for (uint16_t i = 0; i < record->bio.vector_count; ++i) {
         const kb_fs_linux_bio_vec_t *vector = &record->bio.vectors[i];
-        void *payload = folio_page_payload(vector->page);
-        if (payload == NULL) {
-            payload = vector->page;
-        }
+        void *payload = bio_vector_payload(
+            vector->page, vector->length, vector->offset);
         if (payload == NULL || vector->length == 0 ||
             total_size > SIZE_MAX - vector->length)
         {
             return -22;
         }
         out_requests[i].offset = offset;
-        out_requests[i].buffer =
-            (const uint8_t *)payload + vector->offset;
+        out_requests[i].buffer = payload;
         out_requests[i].size = vector->length;
         total_size += vector->length;
         if (__builtin_add_overflow(
@@ -3785,10 +3797,8 @@ static int bio_prepare_read_request(
     }
     kb_fs_block_device_t *device = block_device_for_bdev(record->bio.bdev);
     const kb_fs_linux_bio_vec_t *vector = &record->bio.vectors[0];
-    void *payload = folio_page_payload(vector->page);
-    if (payload == NULL) {
-        payload = vector->page;
-    }
+    void *payload = bio_vector_payload(
+        vector->page, vector->length, vector->offset);
     uint64_t offset = 0;
     if (device == NULL || payload == NULL || vector->length != record->bio.size ||
         __builtin_mul_overflow(record->bio.sector, 512ull, &offset))
@@ -3796,7 +3806,7 @@ static int bio_prepare_read_request(
         return -22;
     }
     out_request->offset = offset;
-    out_request->buffer = (uint8_t *)payload + vector->offset;
+    out_request->buffer = payload;
     out_request->size = vector->length;
     *out_device = device;
     return 0;
@@ -4554,6 +4564,37 @@ void *kb_fs_subsystem_create_empty_buffers(void *folio, unsigned long block_size
 static void filemap_folio_release_buffers(void *folio);
 static void filemap_folio_discard(void *folio);
 
+static int filemap_folio_reclaim(void *folio, unsigned int gfp)
+{
+    if (folio == NULL) return 0;
+    uint64_t *flags = folio;
+    const uint64_t busy = KB_FS_FOLIO_FLAG_LOCKED |
+        KB_FS_FOLIO_FLAG_DIRTY | KB_FS_FOLIO_FLAG_WRITEBACK;
+    uint64_t observed = __atomic_load_n(flags, __ATOMIC_ACQUIRE);
+    do {
+        if ((observed & busy) != 0) return 0;
+    } while (!__atomic_compare_exchange_n(flags, &observed,
+        observed | KB_FS_FOLIO_FLAG_LOCKED, 0,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+
+    /* A clean folio may still have journal-owned buffer state.  Let the
+     * filesystem release it while locked before removing the cache owner. */
+    const int released = kb_fs_subsystem_filemap_release_folio(folio, gfp);
+    const uint32_t refs = __atomic_load_n(
+        (uint32_t *)((uint8_t *)folio + KB_FS_FOLIO_REFCOUNT_OFFSET),
+        __ATOMIC_ACQUIRE);
+    observed = __atomic_load_n(flags, __ATOMIC_ACQUIRE);
+    if (!released || refs > 1u ||
+        (observed & (KB_FS_FOLIO_FLAG_DIRTY | KB_FS_FOLIO_FLAG_WRITEBACK)) != 0)
+    {
+        kb_fs_subsystem_folio_unlock(folio);
+        return 0;
+    }
+    kb_fs_subsystem_folio_unlock(folio);
+    filemap_folio_discard(folio);
+    return 1;
+}
+
 static void filemap_mapping_set_mark(void *mapping, uint32_t mark, int set)
 {
     if (mapping == NULL) {
@@ -4752,8 +4793,11 @@ static void *filemap_get_folio_internal(
             if (cached != NULL) {
                 memcpy(&flags, cached, sizeof(flags));
             }
+            /* Readahead drops its caller reference before I/O completion.
+             * The locked cache reference must keep that folio resident. */
             if (refcount > 1u ||
-                (flags & (KB_FS_FOLIO_FLAG_DIRTY | KB_FS_FOLIO_FLAG_WRITEBACK)) != 0)
+                (flags & (KB_FS_FOLIO_FLAG_LOCKED | KB_FS_FOLIO_FLAG_DIRTY |
+                          KB_FS_FOLIO_FLAG_WRITEBACK)) != 0)
             {
                 continue;
             }
@@ -4765,7 +4809,7 @@ static void *filemap_get_folio_internal(
             {
                 continue;
             }
-            filemap_folio_discard(cached);
+            if (!filemap_folio_reclaim(cached, gfp)) continue;
             cache_slot = i;
             break;
         }
@@ -4870,11 +4914,12 @@ static void *filemap_get_folio_internal(
                 kb_fs_subsystem_folio_wait_writeback(record->folio);
             }
             memcpy(&flags, record->folio, sizeof(flags));
-            if ((flags & (KB_FS_FOLIO_FLAG_DIRTY | KB_FS_FOLIO_FLAG_WRITEBACK)) != 0) {
+            if ((flags & (KB_FS_FOLIO_FLAG_LOCKED | KB_FS_FOLIO_FLAG_DIRTY |
+                          KB_FS_FOLIO_FLAG_WRITEBACK)) != 0) {
                 reclaim_still_dirty++;
                 continue;
             }
-            filemap_folio_discard(record->folio);
+            if (!filemap_folio_reclaim(record->folio, gfp)) continue;
             cache_slot = i;
             break;
         }
@@ -4991,6 +5036,19 @@ void kb_fs_subsystem_folio_end_read(void *folio, int success)
     kb_wake_up_bit(folio, 0);
 }
 
+static void filemap_wait_read_completion(void *folio)
+{
+    /* A read_folio return value describes submission, not completion.
+     * Progress plugged BIOs before waiting for the filesystem's end_read.
+     * As with writeback waits, the shim itself drives deferred work. */
+    while ((__atomic_load_n((uint64_t *)folio, __ATOMIC_ACQUIRE) &
+            KB_FS_FOLIO_FLAG_LOCKED) != 0)
+    {
+        (void)kb_fs_subsystem_bio_drain();
+        kb_run_deferred_work();
+    }
+}
+
 void *kb_fs_subsystem_read_cache_folio(
     void *mapping,
     unsigned long index,
@@ -5010,9 +5068,18 @@ void *kb_fs_subsystem_read_cache_folio(
         return folio;
     }
 
-    uint64_t flags = 0;
-    memcpy(&flags, folio, sizeof(flags));
+    uint64_t flags = __atomic_load_n((uint64_t *)folio, __ATOMIC_ACQUIRE);
     if ((flags & KB_FS_FOLIO_FLAG_UPTODATE) != 0) {
+        return folio;
+    }
+
+    /* Readahead may already own the read. Never submit a second fill of its
+     * locked folio or expose its zero-initialized payload to the caller. */
+    filemap_wait_read_completion(folio);
+    kb_fs_subsystem_folio_lock(folio);
+    flags = __atomic_load_n((uint64_t *)folio, __ATOMIC_ACQUIRE);
+    if ((flags & KB_FS_FOLIO_FLAG_UPTODATE) != 0) {
+        kb_fs_subsystem_folio_unlock(folio);
         return folio;
     }
 
@@ -5025,12 +5092,11 @@ void *kb_fs_subsystem_read_cache_folio(
         }
     }
     if (filler == NULL) {
+        kb_fs_subsystem_folio_unlock(folio);
         kb_fs_subsystem_folio_put(folio);
         return (void *)(uintptr_t)-95;
     }
 
-    flags |= KB_FS_FOLIO_FLAG_LOCKED;
-    write_u64_field(folio, 0, flags);
     unsigned long old_gs = 0;
     int has_gs = kb_fs_enter_ext4_call((void *)filler, &old_gs);
     FS_READ_PROFILE_EXTENT_BEGIN(profile_start);
@@ -5043,6 +5109,13 @@ void *kb_fs_subsystem_read_cache_folio(
         kb_fs_subsystem_folio_unlock(folio);
         kb_fs_subsystem_folio_put(folio);
         return (void *)(intptr_t)status;
+    }
+    filemap_wait_read_completion(folio);
+    if ((__atomic_load_n((uint64_t *)folio, __ATOMIC_ACQUIRE) &
+            KB_FS_FOLIO_FLAG_UPTODATE) == 0)
+    {
+        kb_fs_subsystem_folio_put(folio);
+        return (void *)(intptr_t)-5;
     }
     return folio;
 }

@@ -2,6 +2,7 @@
 #include "linux_subsystem/dma/dma.h"
 
 #include <string.h>
+#include <stdatomic.h>
 
 typedef struct kb_nvme_dbbuf_state {
     uint64_t dbs_dma;
@@ -13,6 +14,23 @@ typedef struct kb_nvme_dbbuf_state {
 } kb_nvme_dbbuf_state_t;
 
 static kb_nvme_dbbuf_state_t dbbuf_state;
+
+int kb_nvme_update_dbbuf(uint16_t value, volatile uint32_t *shadow,
+    const volatile uint32_t *event_index)
+{
+    if (shadow == NULL) return 1;
+
+    /* The controller must see queue progress before the shadow doorbell, and
+     * our event-index read must follow the shadow store. Without the latter
+     * store/load barrier, both sides can miss the notification handshake. */
+    atomic_thread_fence(memory_order_release);
+    const uint16_t old = (uint16_t)*shadow;
+    *shadow = value;
+    atomic_thread_fence(memory_order_seq_cst);
+    if (event_index == NULL) return 1;
+    const uint16_t event = (uint16_t)*event_index;
+    return (uint16_t)(value - event - 1u) < (uint16_t)(value - old);
+}
 
 void kb_nvme_subsystem_track_dbbuf(uint64_t dbs_dma, uint64_t eis_dma)
 {

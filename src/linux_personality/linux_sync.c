@@ -871,13 +871,11 @@ void kb_wake_up_bit(void *word, int bit)
         .timeout = 0,
     };
     (void)kb_wake_up_waitqueue(kb_bit_waitqueue(word, bit), 3u, 1, &key);
-    /* Linux can preempt the caller after making a waiter runnable.  Preserve
-     * that progress point in the cooperative runtime: an active kthread
-     * yields once, while an outer filed call dispatches ready kthreads.  This
-     * does not drain unrelated work or recursively dispatch a kthread. */
-    if (!kb_kthread_yield_current()) {
-        kb_kthread_run_ready();
-    }
+    /* Wakeups are valid while holding a spinlock. Do not yield the caller
+     * or dispatch another task here: that task can require the same lock,
+     * leaving its owner suspended forever. The waitqueue callback makes
+     * waiters runnable; existing explicit scheduling/wait points run them
+     * after the caller can leave its atomic section. */
 }
 
 static void run_wait_progress(void)

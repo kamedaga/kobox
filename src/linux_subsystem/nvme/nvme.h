@@ -10,3 +10,5 @@ uint64_t kb_nvme_subsystem_dbbuf_eis_dma(void);
 void *kb_nvme_subsystem_dbbuf_dbs_cpu(size_t *out_size);
 void *kb_nvme_subsystem_dbbuf_eis_cpu(size_t *out_size);
 void kb_nvme_subsystem_reset_dbbuf_shadow(void);
+int kb_nvme_update_dbbuf(uint16_t value, volatile uint32_t *shadow,
+    const volatile uint32_t *event_index);

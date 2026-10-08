@@ -2319,7 +2319,9 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
     if (strcmp(name, "_printk") == 0 || strcmp(name, "printk") == 0) {
         return module->shim_printk;
     }
-    if (strcmp(name, "kfree") == 0) {
+    /* Linux kfree_link(void *) is the delayed get_link cleanup callback;
+     * it has exactly kfree's signature and semantics, not a data symbol. */
+    if (strcmp(name, "kfree") == 0 || strcmp(name, "kfree_link") == 0) {
         return module->shim_kfree;
     }
     if (strcmp(name, "kmalloc") == 0) {
@@ -2473,7 +2475,6 @@ static void *lookup_module_shim_symbol(kb_module_t *module, const char *name)
         strcmp(name, "fs_kobj") == 0 ||
         strcmp(name, "latent_entropy") == 0 ||
         strcmp(name, "l1tf_mitigation") == 0 ||
-        strcmp(name, "kfree_link") == 0 ||
         strcmp(name, "kmalloc_caches") == 0 ||
         strcmp(name, "ms_hyperv") == 0 ||
         strcmp(name, "nop_posix_acl_access") == 0 ||
