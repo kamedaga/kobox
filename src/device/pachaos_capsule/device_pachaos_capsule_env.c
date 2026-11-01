@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static kb_status_t parse_fd_text(const char *text, int *out_fd)
+static kb_status_t parse_fd_text(const char *text, pacha_fd_t *out_fd)
 {
     if (text == NULL || text[0] == '\0' || out_fd == NULL) {
         return KB_ERR_INVALID;
@@ -20,20 +20,20 @@ static kb_status_t parse_fd_text(const char *text, int *out_fd)
     char *end = NULL;
     errno = 0;
     unsigned long long value = strtoull(text, &end, 0);
-    if (errno != 0 || end == text || *end != '\0' || value > INT32_MAX) {
+    if (errno != 0 || end == text || *end != '\0' || value >= PACHA_THREAD_SELF_FD) {
         return KB_ERR_INVALID;
     }
-    if (!pacha_capsule_is_fd((int)value)) {
+    if (!pacha_capsule_is_fd((pacha_fd_t)value)) {
         return KB_ERR_INVALID;
     }
 
-    *out_fd = (int)value;
+    *out_fd = (pacha_fd_t)value;
     return KB_OK;
 }
 
 kb_status_t kb_pachaos_capsule_parse_token(const char *text, uint64_t *out_token)
 {
-    int fd = -1;
+    pacha_fd_t fd = -1;
     const kb_status_t status = parse_fd_text(text, &fd);
     if (status != KB_OK) {
         return status;

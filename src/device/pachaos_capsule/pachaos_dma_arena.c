@@ -8,7 +8,7 @@
 
 void *kb_kvm_host_alloc_dma_arena(size_t bytes)
 {
-    const int vmo_fd = pacha_vmo_create_contiguous(bytes, 0, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create_contiguous(bytes, 0, 0);
     if (vmo_fd < 16) {
         fprintf(stderr, "kobox-kvm: dma arena fallback bytes=%zu\n", bytes);
         return NULL;
@@ -26,7 +26,7 @@ void *kb_kvm_host_alloc_dma_arena(size_t bytes)
         return NULL;
     }
 
-    fprintf(stderr, "kobox-kvm: dma arena vmo fd=%d bytes=%zu\n", vmo_fd, bytes);
+    fprintf(stderr, "kobox-kvm: dma arena vmo fd=%ld bytes=%zu\n", vmo_fd, bytes);
     return mapping;
 }
 

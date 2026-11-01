@@ -49,6 +49,7 @@ struct kb_pachaos_mmio_mapping {
 
 struct kb_pachaos_dma_mapping {
     struct pacha_capsule_dma dma;
+    kb_device_t *device;
     void *cpu_addr;
     void *mapped_cpu_addr;
     void *vmo_mapping;
@@ -56,7 +57,7 @@ struct kb_pachaos_dma_mapping {
     uint64_t vmo_mapping_size;
     uint64_t alloc_size;
     uint64_t size;
-    int vmo_fd;
+    pacha_fd_t vmo_fd;
     kb_dma_dir_t direction;
     int owns_cpu_addr;
     int owns_mapped_cpu_addr;
@@ -66,7 +67,7 @@ struct kb_pachaos_dma_mapping {
 
 struct kb_device {
     kb_pachaos_capsule_backend_t *backend;
-    int device_fd;
+    pacha_fd_t device_fd;
     struct pacha_capsule_info info;
     kb_pci_id_t pci_id;
     kb_pci_location_t location;
@@ -170,7 +171,7 @@ void kb_pachaos_capsule_irq_profile_snapshot(
 #endif
 }
 
-static kb_status_t status_from_pacha(int status)
+static kb_status_t status_from_pacha(pacha_fd_t status)
 {
     switch (status) {
     case 0:
@@ -452,15 +453,19 @@ static kb_status_t remember_mmio_mapping(kb_pachaos_capsule_backend_t *backend, 
     return KB_OK;
 }
 
-static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_pachaos_capsule_backend_t *backend, uint64_t iova)
+static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_device_t *device, uint64_t iova)
 {
+    kb_pachaos_capsule_backend_t *backend = device != NULL ? device->backend : NULL;
     kb_pachaos_dma_mapping_t **cursor = backend != NULL ? &backend->dma_mappings : NULL;
     while (cursor != NULL && *cursor != NULL) {
         kb_pachaos_dma_mapping_t *mapping = *cursor;
         const int matches = mapping->page_mapping ?
             iova == mapping->dma.iova :
             iova >= mapping->dma.iova && iova - mapping->dma.iova < mapping->dma.len;
-        if (matches) {
+        /* IOVAs are local to a device's translation domain. A shared backend
+         * can own equal ranges for keyboard and mouse; closing the wrong FD
+         * withdraws DMA permission while that other device still uses it. */
+        if (mapping->device == device && matches) {
             *cursor = mapping->next;
             mapping->next = NULL;
             return mapping;
@@ -472,11 +477,13 @@ static kb_pachaos_dma_mapping_t *take_dma_mapping(kb_pachaos_capsule_backend_t *
 
 static kb_status_t remember_dma_mapping(kb_pachaos_capsule_backend_t *backend, const kb_pachaos_dma_mapping_t *mapping)
 {
-    if (backend == NULL || mapping == NULL || !pacha_capsule_is_fd(mapping->dma.fd) || mapping->dma.len == 0)
+    if (backend == NULL || mapping == NULL || mapping->device == NULL ||
+        mapping->device->backend != backend ||
+        !pacha_capsule_is_fd(mapping->dma.fd) || mapping->dma.len == 0)
     {
         if (trace_pachaos_dma_enabled()) {
             fprintf(stderr,
-                "kobox pachaos_capsule: remember_dma_mapping reject backend=%p mapping=%p fd=%d iova=0x%llx len=%zu\n",
+                "kobox pachaos_capsule: remember_dma_mapping reject backend=%p mapping=%p fd=%ld iova=0x%llx len=%zu\n",
                 (void *)backend,
                 (const void *)mapping,
                 mapping != NULL ? mapping->dma.fd : -1,
@@ -778,7 +785,7 @@ static kb_status_t pachaos_capsule_dma_alloc(
     if (alloc_size == 0) {
         return KB_ERR_INVALID;
     }
-    const int vmo_fd = pacha_vmo_create_contiguous(alloc_size, 0, 0);
+    const pacha_fd_t vmo_fd = pacha_vmo_create_contiguous(alloc_size, 0, 0);
     if (vmo_fd < 16) {
         return KB_ERR_NOMEM;
     }
@@ -828,7 +835,7 @@ static kb_status_t pachaos_capsule_dma_alloc(
     }
     if (trace_pachaos_dma_enabled()) {
         fprintf(stderr,
-            "kobox pachaos_capsule: dma_alloc cpu=%p size=%llu align=%llu fd=%d iova=0x%llx len=%zu\n",
+            "kobox pachaos_capsule: dma_alloc cpu=%p size=%llu align=%llu fd=%ld iova=0x%llx len=%zu\n",
             ptr,
             (unsigned long long)alloc_size,
             (unsigned long long)effective_alignment,
@@ -839,6 +846,7 @@ static kb_status_t pachaos_capsule_dma_alloc(
 
     kb_pachaos_dma_mapping_t mapping = {
         .dma = dma,
+        .device = device,
         .cpu_addr = ptr,
         .mapped_cpu_addr = ptr,
 #if defined(__pachaos__)
@@ -860,7 +868,7 @@ static kb_status_t pachaos_capsule_dma_alloc(
     if (remember_status != KB_OK) {
         if (trace_pachaos_dma_enabled()) {
             fprintf(stderr,
-                "kobox pachaos_capsule: dma_alloc remember failed cpu=%p iova=0x%llx status=%d\n",
+                "kobox pachaos_capsule: dma_alloc remember failed cpu=%p iova=0x%llx status=%ld\n",
                 ptr,
                 (unsigned long long)dma.iova,
                 remember_status);
@@ -887,7 +895,7 @@ static void pachaos_capsule_dma_free(kb_device_t *device, kb_dma_buffer_t *buffe
     if (device == NULL || buffer == NULL) {
         return;
     }
-    kb_pachaos_dma_mapping_t *mapping = take_dma_mapping(device->backend, buffer->dma_addr);
+    kb_pachaos_dma_mapping_t *mapping = take_dma_mapping(device, buffer->dma_addr);
     if (mapping != NULL) {
         release_dma_mapping(mapping, 0);
     }
@@ -926,7 +934,7 @@ static kb_status_t pachaos_capsule_dma_map(
 #if defined(__pachaos__)
     void *vmo_mapping = NULL;
     uint64_t vmo_mapping_size = 0;
-    int vmo_fd = 0;
+    pacha_fd_t vmo_fd = 0;
     int needs_bounce = 0;
 
     /* The direct derive syscall still packs noncontiguous live pages. Probe
@@ -963,7 +971,7 @@ static kb_status_t pachaos_capsule_dma_map(
             return KB_OK;
         }
 
-        kb_pachaos_dma_mapping_t *probe = take_dma_mapping(device->backend, page_dma[0]);
+        kb_pachaos_dma_mapping_t *probe = take_dma_mapping(device, page_dma[0]);
         if (probe == NULL) {
             return KB_ERR_IO;
         }
@@ -1007,7 +1015,7 @@ static kb_status_t pachaos_capsule_dma_map(
                 have_expected_page_dma = 1;
             }
 
-            kb_pachaos_dma_mapping_t *probe = take_dma_mapping(device->backend, page_dma[0]);
+            kb_pachaos_dma_mapping_t *probe = take_dma_mapping(device, page_dma[0]);
             if (probe == NULL) {
                 return KB_ERR_IO;
             }
@@ -1055,7 +1063,7 @@ static kb_status_t pachaos_capsule_dma_map(
 #endif
 
     struct pacha_capsule_dma dma = {0};
-    const int status = pacha_capsule_derive_dma_mapping(
+    const pacha_fd_t status = pacha_capsule_derive_dma_mapping(
         device->device_fd,
         mapped,
         PACHA_CAPSULE_DMA_IOVA_KERNEL_CHOOSE,
@@ -1065,7 +1073,7 @@ static kb_status_t pachaos_capsule_dma_map(
     if (!pacha_capsule_is_fd(status)) {
         if (trace_pachaos_dma_enabled()) {
             fprintf(stderr,
-                "kobox pachaos_capsule: dma_map derive failed cpu=%p mapped=%p size=%llu map_size=%llu owns_mapped=%d status=%d\n",
+                "kobox pachaos_capsule: dma_map derive failed cpu=%p mapped=%p size=%llu map_size=%llu owns_mapped=%d status=%ld\n",
                 cpu_addr,
                 mapped,
                 (unsigned long long)size,
@@ -1098,7 +1106,7 @@ static kb_status_t pachaos_capsule_dma_map(
     }
     if (trace_pachaos_dma_enabled()) {
         fprintf(stderr,
-            "kobox pachaos_capsule: dma_map cpu=%p mapped=%p size=%llu map_size=%llu owns_mapped=%d fd=%d iova=0x%llx len=%zu dir=%d\n",
+            "kobox pachaos_capsule: dma_map cpu=%p mapped=%p size=%llu map_size=%llu owns_mapped=%d fd=%ld iova=0x%llx len=%zu dir=%d\n",
             cpu_addr,
             mapped,
             (unsigned long long)size,
@@ -1112,6 +1120,7 @@ static kb_status_t pachaos_capsule_dma_map(
 
     kb_pachaos_dma_mapping_t mapping = {
         .dma = dma,
+        .device = device,
         .cpu_addr = cpu_addr,
         .mapped_cpu_addr = mapped_cpu_addr,
 #if defined(__pachaos__)
@@ -1130,7 +1139,7 @@ static kb_status_t pachaos_capsule_dma_map(
     if (remember_status != KB_OK) {
         if (trace_pachaos_dma_enabled()) {
             fprintf(stderr,
-                "kobox pachaos_capsule: dma_map remember failed cpu=%p iova=0x%llx status=%d\n",
+                "kobox pachaos_capsule: dma_map remember failed cpu=%p iova=0x%llx status=%ld\n",
                 cpu_addr,
                 (unsigned long long)dma.iova,
                 remember_status);
@@ -1185,7 +1194,7 @@ static kb_status_t pachaos_capsule_dma_map_pages(
     const size_t page_count = (size_t)page_count_u64;
     memset(out_page_dma, 0, page_count * sizeof(*out_page_dma));
 
-    const int mapping_fd = pacha_capsule_derive_dma_mapping_pages(
+    const pacha_fd_t mapping_fd = pacha_capsule_derive_dma_mapping_pages(
         device->device_fd,
         cpu_addr,
         (size_t)size,
@@ -1195,7 +1204,7 @@ static kb_status_t pachaos_capsule_dma_map_pages(
     if (!pacha_capsule_is_fd(mapping_fd)) {
         if (trace_pachaos_dma_enabled()) {
             fprintf(stderr,
-                "kobox pachaos_capsule: dma_map_pages derive failed cpu=%p size=%llu pages=%zu status=%d\n",
+                "kobox pachaos_capsule: dma_map_pages derive failed cpu=%p size=%llu pages=%zu status=%ld\n",
                 cpu_addr,
                 (unsigned long long)size,
                 page_count,
@@ -1230,6 +1239,7 @@ static kb_status_t pachaos_capsule_dma_map_pages(
 
     kb_pachaos_dma_mapping_t mapping = {
         .dma = dma,
+        .device = device,
         .cpu_addr = cpu_addr,
         .mapped_cpu_addr = cpu_addr,
         .size = size,
@@ -1244,7 +1254,7 @@ static kb_status_t pachaos_capsule_dma_map_pages(
     }
     if (trace_pachaos_dma_enabled()) {
         fprintf(stderr,
-            "kobox pachaos_capsule: dma_map_pages cpu=%p size=%llu pages=%zu fd=%d first=0x%llx dir=%d\n",
+            "kobox pachaos_capsule: dma_map_pages cpu=%p size=%llu pages=%zu fd=%ld first=0x%llx dir=%d\n",
             cpu_addr,
             (unsigned long long)size,
             page_count,
@@ -1261,7 +1271,7 @@ static void pachaos_capsule_dma_unmap(kb_device_t *device, uint64_t dma_addr, ui
     if (device == NULL) {
         return;
     }
-    kb_pachaos_dma_mapping_t *mapping = take_dma_mapping(device->backend, dma_addr);
+    kb_pachaos_dma_mapping_t *mapping = take_dma_mapping(device, dma_addr);
     if (mapping != NULL) {
         const int copy_back = direction == KB_DMA_FROM_DEVICE || direction == KB_DMA_BIDIRECTIONAL ||
             mapping->direction == KB_DMA_FROM_DEVICE || mapping->direction == KB_DMA_BIDIRECTIONAL;
@@ -1281,7 +1291,7 @@ static kb_status_t pachaos_capsule_dma_map_fixed(
     }
 
     struct pacha_capsule_dma dma = {0};
-    const int status = pacha_capsule_derive_dma_mapping(
+    const pacha_fd_t status = pacha_capsule_derive_dma_mapping(
         device->device_fd,
         cpu_addr,
         dma_addr,
@@ -1291,7 +1301,7 @@ static kb_status_t pachaos_capsule_dma_map_fixed(
     if (!pacha_capsule_is_fd(status)) {
         if (trace_pachaos_dma_enabled()) {
             fprintf(stderr,
-                "kobox pachaos_capsule: dma_map_fixed derive failed cpu=%p size=%llu iova=0x%llx status=%d\n",
+                "kobox pachaos_capsule: dma_map_fixed derive failed cpu=%p size=%llu iova=0x%llx status=%ld\n",
                 cpu_addr,
                 (unsigned long long)size,
                 (unsigned long long)dma_addr,
@@ -1306,7 +1316,7 @@ static kb_status_t pachaos_capsule_dma_map_fixed(
     }
     if (trace_pachaos_dma_enabled()) {
         fprintf(stderr,
-            "kobox pachaos_capsule: dma_map_fixed cpu=%p size=%llu requested=0x%llx fd=%d iova=0x%llx len=%zu dir=%d\n",
+            "kobox pachaos_capsule: dma_map_fixed cpu=%p size=%llu requested=0x%llx fd=%ld iova=0x%llx len=%zu dir=%d\n",
             cpu_addr,
             (unsigned long long)size,
             (unsigned long long)dma_addr,
@@ -1322,6 +1332,7 @@ static kb_status_t pachaos_capsule_dma_map_fixed(
 
     kb_pachaos_dma_mapping_t mapping = {
         .dma = dma,
+        .device = device,
         .cpu_addr = cpu_addr,
         .mapped_cpu_addr = cpu_addr,
         .alloc_addr = NULL,
@@ -1712,14 +1723,14 @@ kb_status_t kb_pachaos_capsule_devices_create(
     *out_backend = NULL;
 
     struct pacha_capsule_info infos[KB_PACHAOS_DEVICE_MAX];
-    int device_fds[KB_PACHAOS_DEVICE_MAX];
+    pacha_fd_t device_fds[KB_PACHAOS_DEVICE_MAX];
     memset(infos, 0, sizeof(infos));
     memset(device_fds, 0, sizeof(device_fds));
     for (size_t i = 0; i < device_count; i++) {
-        if (device_capsules[i] > INT32_MAX) {
+        if (device_capsules[i] >= PACHA_THREAD_SELF_FD) {
             return KB_ERR_INVALID;
         }
-        device_fds[i] = (int)device_capsules[i];
+        device_fds[i] = (pacha_fd_t)device_capsules[i];
         if (!pacha_capsule_is_fd(device_fds[i])) {
             return KB_ERR_INVALID;
         }
